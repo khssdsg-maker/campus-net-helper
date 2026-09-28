@@ -80,7 +80,7 @@ if not exist "%~dp0SiteConfig.cs" (
 )
 
 set MISSINGSRC=
-for %%F in (SiteConfig.cs App.xaml.cs Logger.cs HealthCheckStep.cs AutostartHelper.cs ConfigStore.cs DialEngine.cs QualityMonitor.cs KeepAlive.cs SpeedTestEngine.cs PowGate.cs HealthReport.cs Theme.cs MainWindow.cs MainWindow.Logic.cs HealthWindow.cs SettingsWindow.cs SpeedTestWindow.cs WebAuthWindow.cs AccountWindow.cs) do (
+for %%F in (SiteConfig.cs App.xaml.cs Logger.cs HealthCheckStep.cs AutostartHelper.cs ConfigStore.cs DialEngine.cs QualityMonitor.cs KeepAlive.cs SpeedTestEngine.cs SpeedChart.cs PowGate.cs HealthReport.cs Theme.cs MainWindow.cs MainWindow.Logic.cs HealthWindow.cs SettingsWindow.cs SpeedTestWindow.cs WebAuthWindow.cs AccountWindow.cs) do (
   if exist "%%F" (
     >> build.rsp echo "%%F"
   ) else (

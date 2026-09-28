@@ -65,6 +65,20 @@ namespace CampusNetHelper
         public double UploadMbps = -1;
     }
 
+    /// <summary>
+    /// 一个瞬时速率采样点，供界面画实时波形。
+    ///
+    /// 为什么不用 Progress 里那个累计 Mbps 画图：累计值是"从头到现在平均多少"，
+    /// 画出来是一条缓缓爬升的斜线，根本看不出网络的抖动。
+    /// 波形要的是**这一瞬**跑了多少 —— 所以由独立的采样线程每隔一小段
+    /// 读一次累计字节数、和上一次做差。
+    /// </summary>
+    public sealed class SpeedSample
+    {
+        public SpeedPhase Phase;
+        public double Mbps;
+    }
+
     /// <summary>测速结果。任何一项测不出来就是 -1。</summary>
     public sealed class SpeedTestResult
     {
@@ -231,6 +245,15 @@ namespace CampusNetHelper
         private volatile bool _running;
         private DateTime _lastTick = DateTime.MinValue;
 
+        /// <summary>采样用：本阶段实际收发到的总字节数（含预热，只为画波形，不参与最终结果）。</summary>
+        private long _probeBytes;
+
+        /// <summary>采样线程的运行开关。</summary>
+        private volatile bool _sampling;
+
+        /// <summary>当前采样线程（用于换阶段时等它退出）。</summary>
+        private Thread _sampler;
+
         /// <summary>整个测速会话共用的 Cookie 容器 —— 人机校验拿到的凭据就存在这里。</summary>
         private readonly CookieContainer _cookies = new CookieContainer();
 
@@ -244,6 +267,9 @@ namespace CampusNetHelper
 
         /// <summary>结束通知（后台线程触发，正常完成和取消都会触发）。</summary>
         public event Action<SpeedTestResult> Finished;
+
+        /// <summary>瞬时速率采样（后台线程触发，界面自己切线程）。画实时波形用。</summary>
+        public event Action<SpeedSample> Sample;
 
         // ==================================================================
         // 对外接口
@@ -285,6 +311,7 @@ namespace CampusNetHelper
             finally
             {
                 _running = false;
+                StopSampler();   // 异常/取消时兜底，别把采样线程留下
 
                 // 结果落日志 —— 以后有人问"当时到底测出来多少"，翻日志就有。
                 Log.Info(string.Format(
@@ -568,6 +595,8 @@ namespace CampusNetHelper
             int[] hits = new int[sources.Count];
             object hitLock = new object();
 
+            StartSampler(SpeedPhase.Download);
+
             Thread[] workers = new Thread[Streams];
             for (int i = 0; i < workers.Length; i++)
             {
@@ -602,6 +631,10 @@ namespace CampusNetHelper
                                     while ((n = s.Read(buf, 0, buf.Length)) > 0)
                                     {
                                         if (_cancel) break;
+
+                                        // 画波形用：这里不管预热，收到字节就计数 ——
+                                        // 波形要的是"这一瞬跑了多少"，预热期那段爬升也得画出来
+                                        Interlocked.Add(ref _probeBytes, n);
 
                                         if (sw.Elapsed.TotalSeconds >= DownloadWarmupSeconds)
                                         {
@@ -657,6 +690,7 @@ namespace CampusNetHelper
                 catch { }
             }
 
+            StopSampler();
             sw.Stop();
 
             long got2 = Interlocked.Read(ref total);
@@ -704,6 +738,8 @@ namespace CampusNetHelper
             Stopwatch sw = Stopwatch.StartNew();
             _lastTick = DateTime.Now;
 
+            StartSampler(SpeedPhase.Download);
+
             Thread[] workers = new Thread[Streams];
             for (int i = 0; i < workers.Length; i++)
             {
@@ -727,6 +763,9 @@ namespace CampusNetHelper
                                 while ((n = s.Read(buf, 0, buf.Length)) > 0)
                                 {
                                     if (_cancel) break;
+
+                                    // 画波形用（不管预热，收到字节就计入）
+                                    Interlocked.Add(ref _probeBytes, n);
 
                                     // 预热期内只读不计数 —— 那一段是 TCP 慢启动的虚高
                                     if (sw.Elapsed.TotalSeconds >= DownloadWarmupSeconds)
@@ -766,6 +805,7 @@ namespace CampusNetHelper
                 catch { }
             }
 
+            StopSampler();
             sw.Stop();
 
             long got2 = Interlocked.Read(ref total);
@@ -835,6 +875,8 @@ namespace CampusNetHelper
             Stopwatch sw = Stopwatch.StartNew();
             _lastTick = DateTime.Now;
 
+            StartSampler(SpeedPhase.Upload);
+
             Thread[] workers = new Thread[UploadStreams];
             for (int i = 0; i < workers.Length; i++)
             {
@@ -871,6 +913,10 @@ namespace CampusNetHelper
                                     int n = (int)Math.Min(buf.Length, UploadChunkBytes - chunkSent);
                                     s.Write(buf, 0, n);
                                     chunkSent += n;
+
+                                    // 画波形用：上行是"边写边发"，只有在这里计数才能看到实时速率
+                                    // （total 要等到整片写完才算，画出来会是一格一格的台阶）
+                                    Interlocked.Add(ref _probeBytes, n);
 
                                     if ((DateTime.Now - _lastTick).TotalMilliseconds > 300)
                                     {
@@ -940,6 +986,7 @@ namespace CampusNetHelper
                 catch { }
             }
 
+            StopSampler();
             sw.Stop();
 
             long got = Interlocked.Read(ref total);
@@ -964,6 +1011,112 @@ namespace CampusNetHelper
             // 统一走 PowGate 的工厂：它会带上 Cookie（人机校验拿到的凭据就在里面），
             // 并且对测速强制直连（不走系统代理，否则测的是代理的速度）。
             return PowGate.MakeRequest(url, _cookies);
+        }
+
+        // ==================================================================
+        // 瞬时速率采样（给界面的实时波形用）
+        // ==================================================================
+
+        /// <summary>采样间隔。200ms 足够画出抖动，又不至于把界面刷爆（5 次/秒）。</summary>
+        private const int SampleIntervalMs = 200;
+
+        /// <summary>
+        /// 每个阶段开头跳过多少个采样窗口（5 × 200ms = 1 秒）。
+        ///
+        /// 这一秒的数字必然虚高，而且不是链路的错：
+        ///   · 上传 —— 16 条流每条先往发送缓冲区里塞 256KB（合计约 4MB），
+        ///     缓冲区是一次性吞下去的，统计到的"速度"能到真实带宽的两三倍
+        ///     （实测起步 250 Mbps，稳定后 60）；
+        ///   · 下载 —— 还在建连和 TCP 慢启动。
+        /// 跳掉这一秒，量程才不会被一个假峰顶到天上去、把后面的曲线压扁。
+        /// </summary>
+        private const int SettleIntervals = 5;
+
+        /// <summary>
+        /// 起一个采样线程：每隔 SampleIntervalMs 读一次累计字节数，和上次做差算出瞬时速率。
+        ///
+        /// 为什么不直接在 16 个工作线程里算：那些线程是"下完一片才报一次"，
+        /// 报的点不均匀（有时几百毫秒一个、有时连着来两三个），画出来的横轴疏密不一，
+        /// 波形看着会怪。单独一个线程定时采样，横轴才是等距的。
+        /// </summary>
+        private void StartSampler(SpeedPhase phase)
+        {
+            // 下载/上传都有多条实现路径（多源并发 + 兜底单源），
+            // 换路径时会再调一次 —— 必须先等上一个采样线程退出，
+            // 否则两个线程同时发点，波形会叠出锯齿。
+            StopSampler();
+
+            Interlocked.Exchange(ref _probeBytes, 0);
+            _sampling = true;
+
+            Thread t = new Thread(delegate()
+            {
+                long lastBytes = Interlocked.Read(ref _probeBytes);
+                DateTime lastAt = DateTime.Now;
+                double pending = -1;
+                int done = 0;
+
+                while (_sampling && !_cancel)
+                {
+                    Thread.Sleep(SampleIntervalMs);
+
+                    long nowBytes = Interlocked.Read(ref _probeBytes);
+                    DateTime nowAt = DateTime.Now;
+                    double dt = (nowAt - lastAt).TotalSeconds;
+
+                    // 发的是【上一拍】算出来的值，不是这一拍的 —— 故意慢一拍。
+                    //
+                    // 原因：一个阶段结束的那一刻，采样窗口一定是残缺的
+                    //（线程退出 / 连接收尾，那 200ms 里只跑了很少数据甚至没数据），
+                    // 直接发出去，波形尾部就会出现一条垂直砸到 0 的假低谷。
+                    // 慢一拍后，最后一个残缺窗口只算"待确认"，不再发出去。
+                    if (pending >= 0) FireSample(phase, pending);
+
+                    // 开头那几拍的失真见 SettleIntervals 的注释，直接不发布。
+                    done++;
+                    if (dt > 0.05 && done > SettleIntervals)
+                    {
+                        double mbps = (nowBytes - lastBytes) * 8.0 / dt / 1e6;
+                        if (mbps < 0) mbps = 0;
+                        pending = mbps;
+                    }
+                    lastBytes = nowBytes;
+                    lastAt = nowAt;
+                }
+            });
+
+            t.IsBackground = true;
+            t.Name = "sample";
+            _sampler = t;
+            t.Start();
+        }
+
+        private void StopSampler()
+        {
+            _sampling = false;
+
+            Thread t = _sampler;
+            if (t != null && t.IsAlive)
+            {
+                // 采样线程 200ms 一轮，等 400ms 足够它退出；
+                // 不等的话下一阶段的采样会和它重叠
+                try { t.Join(400); }
+                catch { }
+            }
+            _sampler = null;
+        }
+
+        private void FireSample(SpeedPhase phase, double mbps)
+        {
+            Action<SpeedSample> h = Sample;
+            if (h == null) return;
+
+            SpeedSample s = new SpeedSample();
+            s.Phase = phase;
+            s.Mbps = mbps;
+
+            try { h(s); }
+            catch { }   // 界面已关闭，不该让测速线程挂掉
         }
 
         private void Report(SpeedPhase phase, int percent, string msg, SpeedTestResult src = null)
