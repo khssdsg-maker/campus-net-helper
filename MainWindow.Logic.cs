@@ -172,9 +172,18 @@ namespace CampusNetHelper
             return ConfigStore.GetBool(_settings, "AutoReconnect", true);
         }
 
+        /// <summary>
+        /// 「开机自动启动（登录后静默运行）」是否生效。
+        ///
+        /// ⚠️ 判定依据是**「启动」文件夹里到底有没有副本**，不是配置里的布尔值。
+        /// 2026-09-28 发现：这个勾选框此前只往配置写了个 bool，从未真正创建任何自启项 ——
+        /// 用户勾了也白勾（配置是 true、开机并不启动），而 v1.1.0 的说明书还明确写了
+        /// "勾上开机就自动连上"，属于对外承诺与实现不符。改为读实际状态后，
+        /// 用户手动删掉副本、或装了计划任务（安装时会移除副本）这两种情况也能如实反映。
+        /// </summary>
         internal bool SilentEnabled()
         {
-            return ConfigStore.GetBool(_settings, "Silent", false);
+            return AutostartHelper.StartupCopyExists();
         }
 
         internal int ReconnectInterval()
@@ -227,12 +236,14 @@ namespace CampusNetHelper
             return ReconnectInterval();
         }
 
-        /// <summary>设置窗口保存后回调。</summary>
-        internal void ApplySettingsFromWindow(bool autoReconnect, bool silent, bool closeToTray,
+        /// <summary>
+        /// 设置窗口保存后回调。
+        /// 返回值是需要额外告知用户的一句话（一切正常则返回空串），由调用方贴到"设置已保存"后面。
+        /// </summary>
+        internal string ApplySettingsFromWindow(bool autoReconnect, bool silent, bool closeToTray,
             int interval, bool keepAlive, int keepAliveMinutes)
         {
             ConfigStore.SetBool(_settings, "AutoReconnect", autoReconnect);
-            ConfigStore.SetBool(_settings, "Silent", silent);
             ConfigStore.SetBool(_settings, "CloseToTray", closeToTray);
             _settings["ReconnectInterval"] = interval.ToString();
             ConfigStore.SetBool(_settings, "KeepAlive", keepAlive);
@@ -242,9 +253,71 @@ namespace CampusNetHelper
             // 开关可能刚被改掉，立刻生效，不用等下次连接状态变化
             _keepAlive.SetActive(_state == ConnState.Connected && keepAlive, keepAliveMinutes);
 
+            string note = ReconcileStartupCopy(silent);
+
             Log.Info("设置已更新: 自动重连=" + autoReconnect + " 开机自启=" + silent
                 + " 关闭到托盘=" + closeToTray + " 间隔=" + interval
                 + " 保活=" + keepAlive + " 保活间隔=" + keepAliveMinutes + "分钟");
+            return note;
+        }
+
+        /// <summary>
+        /// 按勾选状态落实（或撤销）「启动」文件夹里的自启副本，返回给用户看的说明（无需说明则返回空串）。
+        ///
+        /// 这么做是因为勾选框原先只是个空开关。撤销时若程序正从那份副本运行，文件被占用删不掉 ——
+        /// 必须如实报出来，否则用户以为关了、下次登录照样弹窗。
+        ///
+        /// ⚠️ 这里**不手写** Silent 标志，只在文件操作**之后**调 SaveAll()：
+        ///    SaveAll() 会用 SilentEnabled()（=「启动」文件夹里到底有没有副本）反推该标志。
+        ///    曾经写成"先 SetBool 再 SaveAll"，结果 SaveAll 立刻用旧的实际情况把它覆盖回去 ——
+        ///    取消自启时留下 Silent=1 却没副本的假状态。
+        /// </summary>
+        private string ReconcileStartupCopy(bool want)
+        {
+            string msg;
+            bool hasTask = AutostartHelper.IsTaskInstalled();
+
+            if (want)
+            {
+                if (hasTask)
+                {
+                    // 计划任务已在管开机自启。再放一份启动副本 = 登录时拉起两个实例、弹两次框，
+                    // 所以拒绝创建，并让 SaveAll 把标志同步成实际情况，不留"看着像开了"的假状态。
+                    SaveAll();
+                    Log.Warn("开机自启：已安装计划任务，拒绝再创建启动副本（避免登录时双实例）");
+                    return "「开机自启（管理员权限）」的计划任务已经装好了，开机自启本来就是生效的，"
+                        + "所以这次没有重复加到「启动」文件夹（两个一起会在登录时启动两次）。";
+                }
+
+                if (!AutostartHelper.EnsureStartupCopy(out msg))
+                {
+                    SaveAll();
+                    Log.Warn("开机自启：创建启动副本失败 — " + msg);
+                    return "开机自动启动没能设置成功：" + msg;
+                }
+
+                SaveAll();
+                Log.Info("开机自启：启动副本已就位 — " + msg);
+                return "";
+            }
+
+            if (!AutostartHelper.StartupCopyExists())
+            {
+                SaveAll();
+                return "";
+            }
+
+            if (AutostartHelper.RemoveStartupCopy(out msg))
+            {
+                SaveAll();
+                Log.Info("开机自启：启动副本已移除 — " + msg);
+                return "";
+            }
+
+            SaveAll();
+            Log.Warn("开机自启：移除启动副本失败 — " + msg);
+            return "开机自动启动没能取消：程序现在正从「启动」文件夹里那份副本运行，文件被占用删不掉。"
+                + "请右键托盘图标退出程序，改从桌面快捷方式（或安装目录里的 exe）打开后再取消一次。";
         }
 
         internal bool CloseToTrayEnabled()

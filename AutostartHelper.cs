@@ -287,6 +287,24 @@ namespace CampusNetHelper
             return (output ?? "").Trim();
         }
 
+        /// <summary>
+        /// 把自身复制到「启动」文件夹，实现**非提权**的开机自启。已有副本则视为成功（幂等）。
+        ///
+        /// 与计划任务的分工：
+        ///   · 本方法 = 普通用户档。登录时以普通权限静默启动，够日常上网用（不需要任何提权）；
+        ///   · 计划任务 = 需要改防火墙 / 重启网卡等提权功能时才装。
+        /// 两者**必须互斥** —— 并存会在登录时拉起两个实例、弹两次框，调用方负责把关。
+        /// </summary>
+        public static bool EnsureStartupCopy(out string message)
+        {
+            if (StartupCopyExists())
+            {
+                message = "启动副本已存在，无需重复创建";
+                return true;
+            }
+            return RestoreStartupCopy(out message);
+        }
+
         public static bool RemoveStartupCopy(out string message)
         {
             message = "";

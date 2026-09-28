@@ -310,7 +310,7 @@ namespace CampusNetHelper
                 return;
             }
 
-            owner.ApplySettingsFromWindow(
+            string note = owner.ApplySettingsFromWindow(
                 chkAutoReconnect.IsChecked == true,
                 chkSilent.IsChecked == true,
                 chkCloseToTray.IsChecked == true,
@@ -318,7 +318,13 @@ namespace CampusNetHelper
                 chkKeepAlive.IsChecked == true,
                 ka);
 
-            MessageBox.Show("设置已保存。", "设置", MessageBoxButton.OK, MessageBoxImage.Information);
+            // 勾选框以**实际结果**为准：装计划任务时会拒绝创建副本、从副本运行时删不掉，
+            // 这两种情况都得让界面如实回退，不能让用户看着是勾上的却其实没生效。
+            chkSilent.IsChecked = owner.SilentEnabled();
+
+            MessageBox.Show(
+                string.IsNullOrEmpty(note) ? "设置已保存。" : "设置已保存。\n\n" + note,
+                "设置", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
         private void RefreshAutostartState()
@@ -336,6 +342,10 @@ namespace CampusNetHelper
                     lblAutostart.Text = "当前状态：未安装";
                     btnAutostart.Content = "以管理员身份安装自启";
                 }
+
+                // 计划任务与「启动」文件夹副本互斥：安装任务时会移除副本、卸载时会恢复副本，
+                // 所以上面那个勾选框必须跟着一起刷新，否则界面会和实际状态对不上。
+                if (chkSilent != null) chkSilent.IsChecked = owner.SilentEnabled();
             }
             catch (Exception ex)
             {
