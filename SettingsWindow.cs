@@ -17,6 +17,9 @@ namespace CampusNetHelper
         private CheckBox chkSilent;
         private CheckBox chkCloseToTray;
         private TextBox txtInterval;
+        private CheckBox chkKeepAlive;
+        private TextBox txtKeepAlive;
+        private TextBlock lblKeepAliveHint;
         private ComboBox cmbTheme;
         private TextBlock lblThemeHint;
         private Button btnAutostart;
@@ -82,6 +85,49 @@ namespace CampusNetHelper
             };
             rowIv.Children.Add(txtInterval);
             stack.Children.Add(rowIv);
+
+            // ---------- 心跳保活 ----------
+            chkKeepAlive = MakeCheck("保持连接活跃（防学校空闲下线）", true);
+            stack.Children.Add(chkKeepAlive);
+
+            var rowKa = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(24, 8, 0, 0)
+            };
+            rowKa.Children.Add(new TextBlock
+            {
+                Text = "心跳间隔（分钟）",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                FontSize = 11
+            });
+            txtKeepAlive = new TextBox
+            {
+                Width = 70,
+                Margin = new Thickness(8, 0, 0, 0),
+                Background = new SolidColorBrush(Theme.FieldBg),
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                BorderBrush = new SolidColorBrush(Theme.GlassBorder),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(8, 5, 8, 5),
+                CaretBrush = new SolidColorBrush(Theme.TextPrimary)
+            };
+            rowKa.Children.Add(txtKeepAlive);
+            stack.Children.Add(rowKa);
+
+            lblKeepAliveHint = new TextBlock
+            {
+                Text = "很多学校会在「空闲 N 分钟」或「在线满 N 小时」时把连接踢掉。"
+                     + "开启后，程序在联网期间每隔一段时间发一个极小的请求，"
+                     + "让接入设备认为这条链路一直是活的（请求响应体为空，流量可以忽略）。",
+                FontSize = 11,
+                Foreground = new SolidColorBrush(Theme.TextFaint),
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 18,
+                Margin = new Thickness(24, 6, 0, 0)
+            };
+            stack.Children.Add(lblKeepAliveHint);
 
             chkSilent = MakeCheck("开机自动启动（登录后静默运行）", false);
             stack.Children.Add(chkSilent);
@@ -240,6 +286,8 @@ namespace CampusNetHelper
             chkSilent.IsChecked = owner.SilentEnabled();
             chkCloseToTray.IsChecked = owner.CloseToTrayEnabled();
             txtInterval.Text = owner.ReconnectInterval().ToString();
+            chkKeepAlive.IsChecked = owner.KeepAliveEnabled();
+            txtKeepAlive.Text = owner.KeepAliveIntervalMinutes().ToString();
         }
 
         private void SaveToOwner()
@@ -253,11 +301,22 @@ namespace CampusNetHelper
                 return;
             }
 
+            int ka;
+            if (!int.TryParse((txtKeepAlive.Text ?? "").Trim(), out ka) || ka < 1 || ka > 60)
+            {
+                MessageBox.Show("心跳间隔请填写 1 到 60 之间的整数（分钟）。", "设置",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                txtKeepAlive.Text = "3";
+                return;
+            }
+
             owner.ApplySettingsFromWindow(
                 chkAutoReconnect.IsChecked == true,
                 chkSilent.IsChecked == true,
                 chkCloseToTray.IsChecked == true,
-                iv);
+                iv,
+                chkKeepAlive.IsChecked == true,
+                ka);
 
             MessageBox.Show("设置已保存。", "设置", MessageBoxButton.OK, MessageBoxImage.Information);
         }

@@ -66,6 +66,7 @@ REM ---- response file ----
 >> build.rsp echo /reference:WindowsBase.dll
 >> build.rsp echo /reference:UIAutomationProvider.dll
 >> build.rsp echo /reference:UIAutomationTypes.dll
+>> build.rsp echo /reference:WindowsFormsIntegration.dll
 
 REM ---- local site config: create from the sample when missing ----
 REM      SiteConfig.cs holds school-specific addresses and is NOT committed.
@@ -79,7 +80,7 @@ if not exist "%~dp0SiteConfig.cs" (
 )
 
 set MISSINGSRC=
-for %%F in (SiteConfig.cs App.xaml.cs Logger.cs HealthCheckStep.cs AutostartHelper.cs ConfigStore.cs DialEngine.cs QualityMonitor.cs SpeedTestEngine.cs PowGate.cs HealthReport.cs Theme.cs MainWindow.cs MainWindow.Logic.cs HealthWindow.cs SettingsWindow.cs SpeedTestWindow.cs AccountWindow.cs) do (
+for %%F in (SiteConfig.cs App.xaml.cs Logger.cs HealthCheckStep.cs AutostartHelper.cs ConfigStore.cs DialEngine.cs QualityMonitor.cs KeepAlive.cs SpeedTestEngine.cs PowGate.cs HealthReport.cs Theme.cs MainWindow.cs MainWindow.Logic.cs HealthWindow.cs SettingsWindow.cs SpeedTestWindow.cs WebAuthWindow.cs AccountWindow.cs) do (
   if exist "%%F" (
     >> build.rsp echo "%%F"
   ) else (

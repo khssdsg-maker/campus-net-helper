@@ -1216,7 +1216,7 @@ namespace CampusNetHelper
 
             stack.Children.Add(MakeDivider());
 
-            stack.Children.Add(MakeLabel("官方入口"));
+            stack.Children.Add(MakeLabel("校园网认证"));
 
             // GUIT 标识：小徽标 + 校名。
             // 这一栏两个入口都是本校的服务，放上校名标识让学生一眼认出来，
@@ -1256,6 +1256,14 @@ namespace CampusNetHelper
             brandRow.Children.Add(schoolName);
 
             stack.Children.Add(brandRow);
+
+            // 网页认证入口：有些学校的校园网不是 PPPoE 拨号，
+            // 而是打开一个网页填账号密码点登录。这个按钮就是干那个的。
+            var btnAuth = MakeGhostButton("网页认证登录", delegate() { OpenWebAuthWindow(); });
+            btnAuth.HorizontalAlignment = HorizontalAlignment.Stretch;
+            btnAuth.Margin = new Thickness(0, 6, 0, 6);
+            btnAuth.FontSize = 11;
+            stack.Children.Add(btnAuth);
 
             var btnSite = MakeGhostButton("学校官网", delegate() { OpenUrl(UrlSchool); });
             btnSite.HorizontalAlignment = HorizontalAlignment.Stretch;

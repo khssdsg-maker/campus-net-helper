@@ -40,6 +40,12 @@ namespace CampusNetHelper
         private DateTime _lastAutoTry = DateTime.MinValue;
 
         /// <summary>
+        /// 本次掉线后已经自动重试了几次。连上（或用户手动断开）就归零。
+        /// 用来做重试退避：第一次别傻等 30 秒，先快速试 —— 见 NextRetryDelay()。
+        /// </summary>
+        private int _autoReconnectAttempts = 0;
+
+        /// <summary>
         /// 自动重连是否已"武装"。只有满足下面任一条才允许自动重连：
         ///   · 用户主动点过「立即连接」并成功过（之后断了才自动接回来）
         ///   · 程序是被开机自启（静默模式）拉起来的
@@ -50,9 +56,13 @@ namespace CampusNetHelper
         private HealthWindow _healthWindow = null;
         private SettingsWindow _settingsWindow = null;
         private SpeedTestWindow _speedTestWindow = null;
+        private WebAuthWindow _webAuthWindow = null;
 
         /// <summary>连接质量监测（丢包率 / 延迟）。后台线程采样，实现见 QualityMonitor.cs。</summary>
         private readonly QualityMonitor _quality = new QualityMonitor();
+
+        /// <summary>心跳保活（防学校设备"空闲下线"）。后台线程，实现见 KeepAlive.cs。</summary>
+        private readonly KeepAlive _keepAlive = new KeepAlive();
         private bool _closing = false;
 
         // ==================================================================
@@ -135,6 +145,8 @@ namespace CampusNetHelper
             ConfigStore.SetBool(_settings, "AutoReconnect", AutoReconnectEnabled());
             ConfigStore.SetBool(_settings, "Silent", SilentEnabled());
             _settings["ReconnectInterval"] = ReconnectInterval().ToString();
+            _settings["KeepAlive"] = KeepAliveEnabled() ? "1" : "0";
+            _settings["KeepAliveInterval"] = KeepAliveIntervalMinutes().ToString();
             _settings["LastAccount"] = _current != null ? _current.Name : "";
 
             var hb = new System.Text.StringBuilder();
@@ -178,22 +190,101 @@ namespace CampusNetHelper
             return 30;
         }
 
+        internal bool KeepAliveEnabled()
+        {
+            return ConfigStore.GetBool(_settings, "KeepAlive", true);
+        }
+
+        internal int KeepAliveIntervalMinutes()
+        {
+            string raw = ConfigStore.GetString(_settings, "KeepAliveInterval", "3");
+            int v;
+            if (int.TryParse((raw ?? "").Trim(), out v))
+            {
+                if (v < 1) v = 1;
+                if (v > 60) v = 60;
+                return v;
+            }
+            return 3;
+        }
+
+        /// <summary>
+        /// 掉线后等多久再重试。
+        ///
+        /// 原来是一上来就等 30 秒 —— 用户会实打实断半分钟，体验很差。
+        /// 改成先快速试两次：绝大多数掉线是瞬时抖动（交换机闪断、学校设备重载），
+        /// 3 秒内就能接回来。
+        ///
+        /// 但**不能一直快** —— 连续失败通常意味着不是抖动而是硬故障
+        /// （691 密码错、678 网线没插、或者拨号过于频繁被限速），
+        /// 这时候高频重试只会让情况更糟（学校的限速是越试越久的）。
+        /// 所以两次之后就退回用户设定的间隔。
+        /// </summary>
+        private int NextRetryDelay()
+        {
+            if (_autoReconnectAttempts == 0) return 3;
+            if (_autoReconnectAttempts == 1) return 10;
+            return ReconnectInterval();
+        }
+
         /// <summary>设置窗口保存后回调。</summary>
-        internal void ApplySettingsFromWindow(bool autoReconnect, bool silent, bool closeToTray, int interval)
+        internal void ApplySettingsFromWindow(bool autoReconnect, bool silent, bool closeToTray,
+            int interval, bool keepAlive, int keepAliveMinutes)
         {
             ConfigStore.SetBool(_settings, "AutoReconnect", autoReconnect);
             ConfigStore.SetBool(_settings, "Silent", silent);
             ConfigStore.SetBool(_settings, "CloseToTray", closeToTray);
             _settings["ReconnectInterval"] = interval.ToString();
+            ConfigStore.SetBool(_settings, "KeepAlive", keepAlive);
+            _settings["KeepAliveInterval"] = keepAliveMinutes.ToString();
             SaveAll();
 
+            // 开关可能刚被改掉，立刻生效，不用等下次连接状态变化
+            _keepAlive.SetActive(_state == ConnState.Connected && keepAlive, keepAliveMinutes);
+
             Log.Info("设置已更新: 自动重连=" + autoReconnect + " 开机自启=" + silent
-                + " 关闭到托盘=" + closeToTray + " 间隔=" + interval);
+                + " 关闭到托盘=" + closeToTray + " 间隔=" + interval
+                + " 保活=" + keepAlive + " 保活间隔=" + keepAliveMinutes + "分钟");
         }
 
         internal bool CloseToTrayEnabled()
         {
             return ConfigStore.GetBool(_settings, "CloseToTray", true);
+        }
+
+        // ==================================================================
+        // 网页认证
+        // ==================================================================
+
+        internal string WebAuthUrl()
+        {
+            return ConfigStore.GetString(_settings, "WebAuthUrl", "");
+        }
+
+        internal void SaveWebAuthUrl(string url)
+        {
+            _settings["WebAuthUrl"] = url ?? "";
+            SaveAll();
+        }
+
+        /// <summary>账号列表的快照 —— 给网页认证窗口填下拉框用（不直接把内部列表交出去）。</summary>
+        internal List<ConfigStore.Account> AccountsSnapshot()
+        {
+            return new List<ConfigStore.Account>(_accounts);
+        }
+
+        internal void OpenWebAuthWindow()
+        {
+            if (_webAuthWindow != null && _webAuthWindow.IsLoaded)
+            {
+                _webAuthWindow.Activate();
+                return;
+            }
+
+            _webAuthWindow = new WebAuthWindow(this);
+            _webAuthWindow.Owner = this;
+            _webAuthWindow.Closed += delegate(object s, EventArgs a) { _webAuthWindow = null; };
+            _webAuthWindow.Show();
         }
 
         // ==================================================================
@@ -246,9 +337,11 @@ namespace CampusNetHelper
 
         private void TryAutoReconnect()
         {
-            if ((DateTime.Now - _lastAutoTry).TotalSeconds < ReconnectInterval()) return;
+            if ((DateTime.Now - _lastAutoTry).TotalSeconds < NextRetryDelay()) return;
             _lastAutoTry = DateTime.Now;
-            Log.Info("自动重连：尝试恢复连接 " + (_current != null ? _current.Name : "(无)"));
+            _autoReconnectAttempts++;
+            Log.Info("自动重连：第 " + _autoReconnectAttempts + " 次尝试恢复连接 "
+                + (_current != null ? _current.Name : "(无)"));
             StartDial(false);
         }
 
@@ -606,6 +699,10 @@ namespace CampusNetHelper
             _quality.SetActive(state == ConnState.Connected);
             RefreshQualityUi();
 
+            // 心跳保活同理：只有连着网才需要发心跳，断开就该停
+            _keepAlive.SetActive(state == ConnState.Connected && KeepAliveEnabled(),
+                KeepAliveIntervalMinutes());
+
             RefreshStatusVisualWith(title, detail);
             UpdateTrayState(title);
         }
@@ -723,6 +820,7 @@ namespace CampusNetHelper
                         {
                             _connectedAt = DateTime.Now;
                             _autoReconnectArmed = true;
+                            _autoReconnectAttempts = 0;   // 连上了，重试计数归零
                             ApplyState(ConnState.Connected, "已连接",
                                 "已通过宽带拨号上网（" + entryName + "）");
                             AddHistory("连接成功 · " + entryName);
@@ -783,10 +881,11 @@ namespace CampusNetHelper
                         // 用户主动断开：解除自动重连，避免过一会儿自己又连上
                         _autoReconnectArmed = false;
                         _lastAutoTry = DateTime.MinValue;
+                        _autoReconnectAttempts = 0;
                     }
                     else
                     {
-                        _lastAutoTry = DateTime.Now.AddSeconds(ReconnectInterval());
+                        _lastAutoTry = DateTime.Now;
                     }
 
                     if (ok)
@@ -1117,6 +1216,7 @@ namespace CampusNetHelper
             {
                 _closing = true;
                 _quality.Shutdown();
+                _keepAlive.Shutdown();
                 SaveAll();
                 if (trayIcon != null)
                 {
