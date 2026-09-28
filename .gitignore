@@ -1,0 +1,29 @@
+# 构建产物
+bin/
+obj/
+dist/
+release/
+*.exe
+*.pdb
+*.dll
+*.user
+*.suo
+.vs/
+build.rsp
+
+# 内部文档（含校内信息，不要公开）
+HANDOVER.md
+交接提示词.md
+
+# 本机配置（绝不提交）
+settings.txt
+accounts.txt
+*.log
+
+# 本校专属地址（真实校内地址不进公开仓库；仓库里只留 SiteConfig.sample.cs 空模板）
+SiteConfig.cs
+
+# 系统
+Thumbs.db
+Desktop.ini
+desktop.ini

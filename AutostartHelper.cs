@@ -1,0 +1,438 @@
+﻿using System;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Principal;
+using System.Text;
+
+namespace CampusNetHelper
+{
+    /// <summary>
+    /// 提权开机自启（计划任务方案）。
+    ///
+    /// **为什么需要**：重启网卡、写入系统级网络配置等操作需要管理员权限，
+    /// 而从启动文件夹或桌面快捷方式启动的进程是非提权的，相关功能不会真正生效。
+    ///
+    /// **为什么用计划任务**：
+    ///   · exe 清单 requireAdministrator → 每次启动都弹 UAC，不可接受；
+    ///   · 启动文件夹里的 .lnk 勾"以管理员身份运行" → 每次登录都弹 UAC，同样不可接受；
+    ///   · 计划任务 /RL HIGHEST → 只有**创建时**需要一次提权，之后每次登录静默以管理员运行。
+    ///
+    /// ⚠️ **与启动文件夹副本互斥**：两者并存会在登录时启动第二个实例，导致重复弹窗。
+    /// 故 Install 时必须删除启动文件夹副本。
+    ///
+    /// 所有成败判定一律依据子进程**退出码**——schtasks 与 netsh 的输出都随系统语言本地化，
+    /// 解析文本在中文 Windows 上不可靠。
+    /// </summary>
+    public static class AutostartHelper
+    {
+        /// <summary>计划任务名。</summary>
+        public const string TaskName = "CampusNetHelper Logon";
+
+        /// <summary>提权子进程参数：装完即退，不建 UI。</summary>
+        public const string InstallArg = "/install-autostart";
+
+        /// <summary>提权子进程参数：卸完即退，不建 UI。</summary>
+        public const string UninstallArg = "/uninstall-autostart";
+
+        private const string ResultFileName = "autostart_result.txt";
+
+        public static string AppDataDir
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CampusNetHelper");
+            }
+        }
+
+        /// <summary>提权子进程把结果写到这里，非提权父进程读它来汇报（避免弹第二个对话框）。</summary>
+        public static string ResultFilePath
+        {
+            get { return Path.Combine(AppDataDir, ResultFileName); }
+        }
+
+        public static string CurrentExePath
+        {
+            get { return System.Reflection.Assembly.GetExecutingAssembly().Location; }
+        }
+
+        public static string StartupCopyPath
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    @"Microsoft\Windows\Start Menu\Programs\Startup",
+                    "CampusNetHelper.exe");
+            }
+        }
+
+        public static bool IsProcessElevated()
+        {
+            try
+            {
+                WindowsIdentity id = WindowsIdentity.GetCurrent();
+                WindowsPrincipal p = new WindowsPrincipal(id);
+                return p.IsInRole(WindowsBuiltInRole.Administrator);
+            }
+            catch { return false; }
+        }
+
+        public static bool StartupCopyExists()
+        {
+            try { return File.Exists(StartupCopyPath); }
+            catch { return false; }
+        }
+
+        private const int TaskStateCacheSeconds = 30;
+        private static bool taskStateKnown = false;
+        private static bool taskStateCached = false;
+        private static DateTime taskStateProbed = DateTime.MinValue;
+
+        /// <summary>
+        /// 计划任务是否已安装。依据 `schtasks /Query /TN` 的退出码（存在=0，不存在≠0）。
+        /// 带 30s TTL 缓存：每次真查都要 spawn 一个 schtasks 进程(约 100-300ms)，
+        /// 而 SaveSettings() 在每次点开关时都会走到这里，不缓存会让 UI 发卡。
+        /// </summary>
+        public static bool IsTaskInstalled()
+        {
+            if (taskStateKnown && (DateTime.Now - taskStateProbed).TotalSeconds < TaskStateCacheSeconds)
+                return taskStateCached;
+
+            string output;
+            int code = RunSchtasks("/Query /TN \"" + TaskName + "\"", out output);
+            taskStateCached = (code == 0);
+            taskStateProbed = DateTime.Now;
+            taskStateKnown = true;
+            return taskStateCached;
+        }
+
+        /// <summary>任务状态可能被外部改变（用户在任务计划程序里手动删了）时强制下次真查。</summary>
+        public static void InvalidateTaskState()
+        {
+            taskStateKnown = false;
+        }
+
+        /// <summary>
+        /// 取任务的关键配置供诊断展示（RunLevel / 触发器 / 动作）。读不到时返回说明文字，不抛异常。
+        /// </summary>
+        public static string GetTaskDetail()
+        {
+            string xml;
+            int code = RunSchtasks("/Query /TN \"" + TaskName + "\" /XML", out xml);
+            if (code != 0 || string.IsNullOrEmpty(xml)) return "(查询失败，退出码 " + code + ")";
+
+            string runLevel = TagValue(xml, "RunLevel");
+            string command = TagValue(xml, "Command");
+            string arguments = TagValue(xml, "Arguments");
+            string trigger = xml.IndexOf("<LogonTrigger", StringComparison.Ordinal) >= 0 ? "登录时" : "(非登录触发)";
+            return "触发=" + trigger + " · RunLevel=" + (runLevel == "" ? "(未取到)" : runLevel)
+                + " · 动作=" + (command == "" ? "(未取到)" : command)
+                + (arguments == "" ? "" : " " + arguments);
+        }
+
+        /// <summary>
+        /// 安装提权自启：建计划任务 → 校验 → 删除 Startup 副本（避免登录时双实例弹框）。
+        /// 必须在提权进程中调用。
+        /// </summary>
+        public static bool Install(out string message)
+        {
+            message = "";
+            if (!IsProcessElevated())
+            {
+                message = "当前进程非管理员，无法创建计划任务";
+                return false;
+            }
+
+            string exe = CurrentExePath;
+            if (string.IsNullOrEmpty(exe) || !File.Exists(exe))
+            {
+                message = "无法定位自身 exe 路径: " + (exe ?? "(空)");
+                return false;
+            }
+
+            // 前置守卫：若当前进程就是从 Startup 副本启动的，那份 exe 是正在运行的映像、
+            // Windows 不允许删除，任务建好后旧副本删不掉 → 登录时仍会双实例弹框，等于装了一半。
+            // 与其留下半成品状态，不如在创建任务之前就拒绝并给出可操作的指引。
+            if (string.Equals(exe, StartupCopyPath, StringComparison.OrdinalIgnoreCase))
+            {
+                message = "当前进程正是从 Startup 副本启动的，该文件正被占用无法删除，装了计划任务也会导致登录时双实例弹框。"
+                    + "请先从托盘退出程序，改由桌面快捷方式（或直接双击安装目录里的 exe）打开后再点一次本按钮。";
+                return false;
+            }
+
+            // /TR 的值本身要加引号，其中 exe 路径的引号需转义成 \" 才能被 schtasks 原样存下
+            string tr = "\"\\\"" + exe + "\\\" /silent\"";
+            string args = "/Create /TN \"" + TaskName + "\" /TR " + tr + " /SC ONLOGON /RL HIGHEST /F";
+
+            string output;
+            int code = RunSchtasks(args, out output);
+            if (code != 0)
+            {
+                message = "schtasks /Create 失败，退出码 " + code;
+                return false;
+            }
+
+            // 不轻信退出码，回查一次确认任务真的在了（缓存会读到操作前的旧值，必须先失效）
+            InvalidateTaskState();
+            if (!IsTaskInstalled())
+            {
+                message = "schtasks 返回成功但回查不到任务";
+                return false;
+            }
+
+            // ⚠️ schtasks /Create 的默认 ExecutionTimeLimit 是 **PT72H** —— 任务会在 72 小时后
+            // 强制终止程序，对 7x24 常驻的网络守护等于每 3 天静默死一次。必须改掉；
+            // 改不掉就回滚删除刚建的任务，不留"装了一半且会自杀"的状态。
+            string fixMsg;
+            if (!FixTaskSettings(out fixMsg))
+            {
+                string delOut;
+                RunSchtasks("/Delete /TN \"" + TaskName + "\" /F", out delOut);
+                InvalidateTaskState();
+                message = "已回滚（删除刚创建的计划任务），未留下会 72 小时自杀的半成品。原因：" + fixMsg;
+                return false;
+            }
+
+            string rmMsg;
+            if (StartupCopyExists() && !RemoveStartupCopy(out rmMsg))
+            {
+                // 任务已建好，只是旧副本没删掉 —— 这会导致登录时双实例，必须报失败让用户处理
+                message = "计划任务已创建，但删除 Startup 副本失败（会导致登录时双实例弹框）: " + rmMsg;
+                return false;
+            }
+
+            message = "已创建计划任务「" + TaskName + "」，指向 " + exe + " /silent；" + fixMsg + "；"
+                + (StartupCopyExists() ? "" : "Startup 副本已移除，")
+                + "下次登录起静默以管理员身份运行。" + GetTaskDetail();
+            return true;
+        }
+
+        /// <summary>
+        /// 卸载提权自启：删计划任务 → 恢复 Startup 副本，保证降级后仍有（非提权的）开机自启，
+        /// 不会让用户直接失去自启能力。必须在提权进程中调用。
+        /// </summary>
+        public static bool Uninstall(out string message)
+        {
+            message = "";
+            if (!IsProcessElevated())
+            {
+                message = "当前进程非管理员，无法删除计划任务";
+                return false;
+            }
+
+            string output;
+            int code = RunSchtasks("/Delete /TN \"" + TaskName + "\" /F", out output);
+            InvalidateTaskState();
+            if (code != 0 && IsTaskInstalled())
+            {
+                message = "schtasks /Delete 失败，退出码 " + code;
+                return false;
+            }
+
+            string restoreMsg;
+            bool restored = RestoreStartupCopy(out restoreMsg);
+            message = "已删除计划任务「" + TaskName + "」。"
+                + (restored ? "已恢复 Startup 副本（下次登录起为普通权限自启，防火墙类功能将不再生效）: " + restoreMsg
+                            : "⚠ 恢复 Startup 副本失败，开机自启已丢失，请手动处理: " + restoreMsg);
+            return restored;
+        }
+
+        /// <summary>
+        /// 修正 `schtasks /Create` 留下的危险默认值。
+        ///
+        /// ⚠️ 最关键的是 **ExecutionTimeLimit 默认 PT72H**：计划任务会在 72 小时后**强制终止**程序。
+        /// 对 7x24 常驻的网络守护来说，等于每 3 天静默死一次（2026-09-12 实测确认默认值就是 PT72H）。
+        /// `schtasks.exe` 没有关闭该限制的开关（`/ET` 是每日结束时刻，不是时长），只能用
+        /// Win8+ 自带的 ScheduledTasks 模块改。
+        ///
+        /// ⚠️ 实测踩坑：Windows PowerShell 5.1 的 `New-ScheduledTaskSettingsSet` **没有**
+        /// `-AllowStartOnDemand` 参数（只有反向的 `-DisallowDemandStart`），而 `AllowStartOnDemand`
+        /// 属性也不可写。误传该参数会让 `$s` 为 null，连带 `Set-ScheduledTask` 参数验证失败，
+        /// 修正静默无效而退出码仍可能是 0 —— 所以改完必须回查 ExecutionTimeLimit。
+        /// </summary>
+        private static bool FixTaskSettings(out string message)
+        {
+            string cmd = "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
+                + "-MultipleInstances IgnoreNew -StartWhenAvailable; "
+                + "Set-ScheduledTask -TaskName '" + TaskName + "' -Settings $s | Out-Null; "
+                + "Write-Output 'DONE'";
+
+            string output;
+            int code = RunProcess("powershell",
+                "-NoProfile -ExecutionPolicy Bypass -Command \"" + cmd + "\"", out output);
+
+            string limit = GetTaskExecutionTimeLimit();
+            if (limit == "PT0S")
+            {
+                message = "ExecutionTimeLimit 已设为 PT0S(无限制)";
+                return true;
+            }
+            message = "修正计划任务设置失败：ExecutionTimeLimit 仍为 " + (limit == "" ? "(取不到)" : limit)
+                + "，powershell 退出码 " + code + "。该值默认 PT72H 会在 72 小时后强制终止程序，必须修掉。输出: " + output;
+            return false;
+        }
+
+        /// <summary>
+        /// 查任务的 ExecutionTimeLimit。用 PowerShell 只输出 `PT0S` / `PT72H` 这类 ASCII 值，
+        /// 避开 `schtasks /Query /XML` 的 UTF-16 输出与 .NET 解码不一致问题。
+        /// </summary>
+        public static string GetTaskExecutionTimeLimit()
+        {
+            string output;
+            int code = RunProcess("powershell",
+                "-NoProfile -ExecutionPolicy Bypass -Command \"(Get-ScheduledTask -TaskName '" + TaskName
+                + "' -ErrorAction SilentlyContinue).Settings.ExecutionTimeLimit\"", out output);
+            if (code != 0) return "";
+            return (output ?? "").Trim();
+        }
+
+        public static bool RemoveStartupCopy(out string message)
+        {
+            message = "";
+            try
+            {
+                string p = StartupCopyPath;
+                if (!File.Exists(p)) { message = "Startup 副本本就不存在"; return true; }
+                File.Delete(p);
+                bool gone = !File.Exists(p);
+                message = gone ? "已删除 " + p : "删除后仍存在: " + p;
+                return gone;
+            }
+            catch (Exception ex)
+            {
+                message = "删除 Startup 副本异常: " + ex.Message;
+                return false;
+            }
+        }
+
+        public static bool RestoreStartupCopy(out string message)
+        {
+            message = "";
+            try
+            {
+                string src = CurrentExePath;
+                string dst = StartupCopyPath;
+                if (!File.Exists(src)) { message = "源 exe 不存在: " + src; return false; }
+                if (string.Equals(src, dst, StringComparison.OrdinalIgnoreCase))
+                {
+                    message = "自身就在 Startup 目录，无需复制";
+                    return true;
+                }
+                File.Copy(src, dst, true);
+                bool ok = File.Exists(dst);
+                message = ok ? "已复制 " + src + " → " + dst : "复制后目标不存在";
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                message = "恢复 Startup 副本异常: " + ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>提权子进程写结果；父进程读完即删，避免下次读到旧结果。</summary>
+        public static void WriteResult(bool ok, string message)
+        {
+            try
+            {
+                Directory.CreateDirectory(AppDataDir);
+                string path = ResultFilePath;
+                if (File.Exists(path)) File.Delete(path);
+                File.WriteAllText(path, (ok ? "OK" : "FAIL") + "\r\n" + (message ?? ""), Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        /// <summary>读取并删除结果文件。返回 false 表示没有结果（子进程可能没跑起来）。</summary>
+        public static bool TryReadResult(out bool ok, out string message)
+        {
+            ok = false;
+            message = "";
+            try
+            {
+                string path = ResultFilePath;
+                if (!File.Exists(path)) return false;
+                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+                try { File.Delete(path); } catch { }
+                if (lines.Length == 0) return false;
+                ok = lines[0].Trim() == "OK";
+                message = lines.Length > 1 ? lines[1] : "";
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>父进程调用前先清掉可能残留的旧结果，避免误读上一次的结论。</summary>
+        public static void ClearResult()
+        {
+            try
+            {
+                string path = ResultFilePath;
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch { }
+        }
+
+        private static int RunSchtasks(string args, out string output)
+        {
+            return RunProcess("schtasks", args, out output);
+        }
+
+        /// <summary>
+        /// 跑一个子进程并按**退出码**判定成败。
+        /// 输出只用于诊断记录，绝不用于判定——schtasks 与 netsh 的输出都随系统语言本地化，
+        /// 且中文 Windows 上还存在 GBK 与 .NET 解码不一致的问题（本会话已两次踩坑）。
+        /// </summary>
+        private static int RunProcess(string fileName, string args, out string output)
+        {
+            output = "";
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = fileName;
+                psi.Arguments = args;
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process proc = Process.Start(psi))
+                {
+                    if (proc == null) { output = "(进程启动失败)"; return -1; }
+                    string so = proc.StandardOutput.ReadToEnd();
+                    string se = proc.StandardError.ReadToEnd();
+                    if (!proc.WaitForExit(20000))
+                    {
+                        try { proc.Kill(); } catch { }
+                        output = "(超时 20s 已终止)";
+                        return -2;
+                    }
+                    output = ((so ?? "") + (se ?? "")).Trim();
+                    return proc.ExitCode;
+                }
+            }
+            catch (Exception ex)
+            {
+                output = "(异常: " + ex.Message + ")";
+                return -3;
+            }
+        }
+
+        /// <summary>从 XML 里取第一个指定元素的文本值，取不到返回空串。避免为一个值引入 XML 依赖。</summary>
+        private static string TagValue(string xml, string tag)
+        {
+            try
+            {
+                string open = "<" + tag + ">";
+                string close = "</" + tag + ">";
+                int i = xml.IndexOf(open, StringComparison.Ordinal);
+                if (i < 0) return "";
+                i += open.Length;
+                int j = xml.IndexOf(close, i, StringComparison.Ordinal);
+                if (j < 0) return "";
+                return xml.Substring(i, j - i).Trim();
+            }
+            catch { return ""; }
+        }
+    }
+}
