@@ -167,7 +167,7 @@ namespace CampusNetHelper
                     + "账号: " + (string.IsNullOrEmpty(accountName) ? "(未填写)" : accountName) + "\r\n\r\n";
                 string path = HealthReport.ExportDiagPackage(header + reportText.ToString());
                 MessageBox.Show("诊断包已生成到桌面：\n\n" + path
-                    + "\n\n诊断包不含账号密码，可安全外发用于求助。",
+                    + "\n\n诊断包不含密码，可安全外发用于求助。",
                     "导出成功", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)

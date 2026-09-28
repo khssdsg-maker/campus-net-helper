@@ -595,7 +595,8 @@ namespace CampusNetHelper
                     + "· health_report.txt  网络体检报告\r\n"
                     + "· logs_*.log         运行日志\r\n"
                     + "· system_info.txt    系统与网卡快照\r\n"
-                    + "本包不含任何账号密码，可安全外发用于求助。\r\n",
+                    + "本包不含任何密码，可安全外发用于求助。\r\n"
+                    + "（注意：日志里会包含连接名、账号显示名和内网地址，请发给信任的人，不要公开贴出。）\r\n",
                     Encoding.UTF8);
 
                 string zipPath = Path.Combine(
