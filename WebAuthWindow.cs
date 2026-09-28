@@ -493,6 +493,22 @@ namespace CampusNetHelper
                 SetValue(pw, pass);
 
                 WinForms.HtmlElement submit = FindSubmit(all);
+
+                // ⚠️ 有图形验证码就**只填不提交** —— 见 HasCaptcha 的注释。
+                // 验证码那格是空的，硬提交必然失败；而学校普遍对"连续登录失败"有次数限制，
+                // 反复失败可能直接把账号锁一段时间。宁可让用户自己点一下。
+                if (HasCaptcha(all))
+                {
+                    SetStatus("这个页面有图形验证码 —— 账号密码已经帮你填好了，"
+                        + "验证码需要你自己看一眼填进去，然后点页面上的「登录」按钮。");
+                    if (lblFound != null)
+                    {
+                        lblFound.Text = "识别结果：账号框「" + Describe(us) + "」 密码框「" + Describe(pw)
+                            + "」；页面有图形验证码 → 已填好，但不自动提交";
+                    }
+                    return true;
+                }
+
                 if (submit == null)
                 {
                     SetStatus("账号密码已填好，但没找到「登录」按钮 —— 请手动点一下页面上的登录。");
@@ -622,6 +638,52 @@ namespace CampusNetHelper
             }
             catch { }
             return list;
+        }
+
+        /// <summary>
+        /// 判断页面上有没有图形验证码。
+        ///
+        /// 为什么必须检测、而且检测到就**不能自动提交**：
+        ///   验证码的设计目的就是"证明这一步是人在操作"。
+        ///   程序把账号密码填好就提交 → 验证码那格是空的 → 提交必然失败。
+        ///   而学校普遍对"连续登录失败"有次数限制，反复失败可能把账号锁一段时间。
+        ///   所以宁可停手，让用户自己看一眼验证码、填进去、点登录。
+        ///
+        /// 这里**刻意不做验证码自动识别**：
+        ///   ① 识别验证码等于绕过它 —— 它的存在就是为了挡住自动化，这是它的设计意图；
+        ///   ② 现在学校多用滑块 / 点选 / 行为验证（极验、腾讯验证码那一类），
+        ///      根本不是图片字符，OCR 也认不出来。
+        ///   结论：这件事交给用户，只在界面上把话说明白。
+        /// </summary>
+        private static bool HasCaptcha(List<WinForms.HtmlElement> all)
+        {
+            string[] keys = new string[]
+            {
+                "captcha", "verifycode", "verify_code", "checkcode", "check_code",
+                "validatecode", "validate_code", "vcode", "authcode", "imgcode",
+                "randcode", "seccode", "verificationcode", "yzm", "yanzhengma",
+                "captchaimg", "codeimg"
+            };
+
+            foreach (WinForms.HtmlElement el in all)
+            {
+                string tag = TagOf(el);
+                if (tag != "img" && tag != "input" && tag != "canvas"
+                    && tag != "span" && tag != "div" && tag != "label" && tag != "a") continue;
+
+                string blob = (AttrOf(el, "id") + " " + AttrOf(el, "name") + " "
+                    + AttrOf(el, "src") + " " + AttrOf(el, "alt") + " "
+                    + AttrOf(el, "class") + " " + AttrOf(el, "title") + " "
+                    + AttrOf(el, "onclick")).ToLowerInvariant();
+
+                if (blob.IndexOf("验证码", StringComparison.Ordinal) >= 0) return true;
+
+                foreach (string k in keys)
+                {
+                    if (blob.IndexOf(k, StringComparison.Ordinal) >= 0) return true;
+                }
+            }
+            return false;
         }
 
         private static string DescribeDoc(List<WinForms.HtmlElement> all)

@@ -24,7 +24,7 @@ namespace CampusNetHelper
         /// 这样带来三个好处：
         ///   ① rasdial.exe 默认就读这个文件，创建完立即可拨；
         ///   ② 系统「网络和共享中心」里能看到同一个连接，两边始终一致；
-        ///   ③ 学校官方客户端建的连接（如 GUITISP）也能被本工具读到并直接使用。
+        ///   ③ 学校官方客户端建的连接也能被本工具读到并直接使用。
         /// </summary>
         public static string PhonebookPath
         {
@@ -405,7 +405,7 @@ namespace CampusNetHelper
         ///
         /// Windows 电话簿的条目里有两个字段：
         ///   ApnInfoUsername / ApnInfoPassword
-        /// 学校客户端建的连接通常会把真实宽带账号写在这里（实测本机 [GUIT-联通] 两项都有值），
+        /// 学校客户端建的连接通常会把真实宽带账号写在这里（实测本机两项都有值），
         /// 因此可以做到"选一个连接就把账号密码一起带进来"。
         /// 读不到的（例如凭据被存进凭据管理器、字段留空）就返回空串，让用户自己补。
         /// </summary>

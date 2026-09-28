@@ -69,7 +69,7 @@ REM ---- response file ----
 >> build.rsp echo /reference:WindowsFormsIntegration.dll
 
 REM ---- local site config: create from the sample when missing ----
-REM      SiteConfig.cs holds school-specific addresses and is NOT committed.
+REM      SiteConfig.cs holds school-specific defaults and is NOT committed.
 if not exist "%~dp0SiteConfig.cs" (
   if exist "%~dp0SiteConfig.sample.cs" (
     copy /y "%~dp0SiteConfig.sample.cs" "%~dp0SiteConfig.cs" >nul

@@ -91,28 +91,21 @@ namespace CampusNetHelper
         private Border _historyCard;
         private Border _accountCard;
         private Border _titleBarArea;
-        private Border _guitBadge;              // 「官方入口」里的 GUIT 徽标
-        private TextBlock _guitBadgeText;
 
         internal const string FontUi = "Microsoft YaHei UI, Microsoft YaHei, Segoe UI";
         internal const string FontMono = "Consolas, Microsoft YaHei UI";
         internal const string VersionText = "1.1.0";
 
         // ==================================================================
-        // 官方入口地址
+        // 本校专属默认值
         //
-        // 学校官网 —— 公网可访问，写在这里没有隐私问题。
+        // 这个项目刻意保持**通用** —— 源码里不放任何学校的具体信息。
+        // （校徽、校名、学校官网链接、校内自助服务地址，已于 2026-09-28 全部移除。）
         //
-        // 自助服务 —— 属于校内网地址（只有连着校园网才能打开），是"本校专属信息"，
-        // 所以**不硬编码在源码里**，改由 SiteConfig 提供：
-        //   · SiteConfig.cs         自己的真实地址，已被 .gitignore 排除
+        // 确实需要"本校专属"的默认值统一放 SiteConfig，好处是它不进公开仓库：
+        //   · SiteConfig.cs         自己填的真实值，已被 .gitignore 排除
         //   · SiteConfig.sample.cs  提交到仓库的空模板，首次构建时自动生成上面那个
-        // 留空时界面上不显示这个入口（不给死链）。
-        //
-        // 这两个地址都来自学校官方客户端界面本身，是学校公开给学生使用的。
-        // 本工具只提供"打开链接"，不调用其中的任何接口。
         // ==================================================================
-        internal const string UrlSchool = "https://www.guit.edu.cn";
 
         // ==================================================================
         // 按钮样式（缓存，避免每次创建都解析 XAML）
@@ -1218,73 +1211,20 @@ namespace CampusNetHelper
 
             stack.Children.Add(MakeLabel("校园网认证"));
 
-            // GUIT 标识：小徽标 + 校名。
-            // 这一栏两个入口都是本校的服务，放上校名标识让学生一眼认出来，
-            // 也免得"校园网自助服务"那个内网地址被当成来路不明的外链。
-            var brandRow = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Margin = new Thickness(0, 8, 0, 2)
-            };
-
-            _guitBadgeText = new TextBlock
-            {
-                Text = "GUIT",
-                FontSize = 10,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Theme.OnAccent)
-            };
-            _guitBadge = new Border
-            {
-                Background = new SolidColorBrush(Theme.Accent),
-                CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(6, 2, 6, 2),
-                VerticalAlignment = VerticalAlignment.Center,
-                Child = _guitBadgeText
-            };
-            brandRow.Children.Add(_guitBadge);
-
-            var schoolName = new TextBlock
-            {
-                Text = "桂林信息科技学院",
-                FontSize = 11,
-                Margin = new Thickness(7, 0, 0, 0),
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = new SolidColorBrush(Theme.TextMuted)
-            };
-            _mutedTexts.Add(schoolName);
-            brandRow.Children.Add(schoolName);
-
-            stack.Children.Add(brandRow);
-
-            // 网页认证入口：有些学校的校园网不是 PPPoE 拨号，
-            // 而是打开一个网页填账号密码点登录。这个按钮就是干那个的。
+            // 这张卡片现在只做一件事：网页认证登录。
+            //
+            // 原来这里放的是"本校专属"的几个入口（校徽 + 校名、学校官网、校园网自助服务）。
+            // 为了让整个项目保持**通用**、也为了公开仓库里不出现任何本校信息，已经全部移除。
+            // 学校相关的默认值统一放在 SiteConfig.cs 里（已被 .gitignore 排除，不进公开仓库）。
             var btnAuth = MakeGhostButton("网页认证登录", delegate() { OpenWebAuthWindow(); });
             btnAuth.HorizontalAlignment = HorizontalAlignment.Stretch;
-            btnAuth.Margin = new Thickness(0, 6, 0, 6);
+            btnAuth.Margin = new Thickness(0, 8, 0, 0);
             btnAuth.FontSize = 11;
             stack.Children.Add(btnAuth);
 
-            var btnSite = MakeGhostButton("学校官网", delegate() { OpenUrl(UrlSchool); });
-            btnSite.HorizontalAlignment = HorizontalAlignment.Stretch;
-            btnSite.Margin = new Thickness(0, 6, 0, 6);
-            btnSite.FontSize = 11;
-            stack.Children.Add(btnSite);
-
-            // 自助服务是校内专属入口，地址来自 SiteConfig（不在公开源码里）。
-            // 没配置就不显示 —— 免得给出一个点不开的死链。
-            if (SiteConfig.SelfServiceUrl.Length > 0)
-            {
-                var btnSelf = MakeGhostButton("校园网自助服务",
-                    delegate() { OpenUrl(SiteConfig.SelfServiceUrl); });
-                btnSelf.HorizontalAlignment = HorizontalAlignment.Stretch;
-                btnSelf.FontSize = 11;
-                stack.Children.Add(btnSelf);
-
-                var linkHint = MakeHint("自助服务需连在校园网内才能打开。");
-                linkHint.Margin = new Thickness(0, 8, 0, 0);
-                stack.Children.Add(linkHint);
-            }
+            var authHint = MakeHint("学校用网页认证的，在这里填认证网址，程序会自动填账号密码并提交。");
+            authHint.Margin = new Thickness(0, 8, 0, 0);
+            stack.Children.Add(authHint);
 
             card.Child = stack;
             return card;
@@ -1324,16 +1264,6 @@ namespace CampusNetHelper
             foreach (TextBlock t in _mutedTexts)
             {
                 t.Foreground = new SolidColorBrush(Theme.TextMuted);
-            }
-
-            // GUIT 徽标
-            if (_guitBadge != null)
-            {
-                _guitBadge.Background = new SolidColorBrush(Theme.Accent);
-            }
-            if (_guitBadgeText != null)
-            {
-                _guitBadgeText.Foreground = new SolidColorBrush(Theme.OnAccent);
             }
 
             // 顶栏按钮

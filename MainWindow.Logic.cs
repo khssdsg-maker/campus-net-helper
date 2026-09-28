@@ -258,7 +258,10 @@ namespace CampusNetHelper
 
         internal string WebAuthUrl()
         {
-            return ConfigStore.GetString(_settings, "WebAuthUrl", "");
+            string v = ConfigStore.GetString(_settings, "WebAuthUrl", "");
+            if (!string.IsNullOrEmpty(v)) return v;
+            // 没填过就用编译时的默认值（本校专属，放在 SiteConfig，不进公开仓库）
+            return SiteConfig.DefaultWebAuthUrl;
         }
 
         internal void SaveWebAuthUrl(string url)

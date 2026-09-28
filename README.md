@@ -228,15 +228,18 @@ build_check.bat
 
 双击即可编译，产物输出到 `dist\CampusNetHelper.exe`。
 
-### 本校专属配置
+### 本校专属默认值
 
-校内网地址（自助服务入口之类）**不硬编码在源码里**，以免公开仓库泄露学校内部地址：
+这个项目刻意保持**通用** —— 源码里不放任何学校的具体信息（校徽、校名、学校官网、校内地址都不在）。
+
+但你自己用的时候，会希望默认值已经填好（比如网页认证的网址），不用每次手输。所以：
 
 - 仓库里只有空模板 `SiteConfig.sample.cs`
 - 首次构建时，`build_check.bat` 会自动把它复制成 `SiteConfig.cs`
-- `SiteConfig.cs` 已被 `.gitignore` 排除 —— 你自己学校的地址不会进版本库
+- `SiteConfig.cs` 已被 `.gitignore` 排除 —— 你自己的学校信息不会进版本库
 
-想填自己的学校：编辑 `SiteConfig.cs` 里的 `SelfServiceUrl`，重新编译即可。**留空则界面上不显示该入口**（不会给出点不开的死链）。
+想预设自己学校的认证网址：编辑 `SiteConfig.cs` 里的 `DefaultWebAuthUrl`，重新编译即可。
+**留空则由使用者自己在界面上填**（公开仓库构建出来的就是这个状态）。
 
 > 注意：编译出来的 exe 里**必然**带着这个地址，否则功能没法用 —— 「源码不公开」不等于「exe 里没有」。
 
@@ -275,7 +278,7 @@ campus-net-helper/
 ├── AutostartHelper.cs     开机自启（计划任务）
 ├── Logger.cs              滚动日志（7 天自动清理）
 ├── HealthCheckStep.cs     体检结果数据结构
-├── SiteConfig.sample.cs   本校地址配置模板（空；真实值在 SiteConfig.cs，不入库）
+├── SiteConfig.sample.cs   本校默认值模板（空；真实值在 SiteConfig.cs，不入库）
 ├── assets/                图标（logo.ico / logo.png）
 ├── docs/                  README 用的界面截图
 └── build_check.bat        一键编译脚本
