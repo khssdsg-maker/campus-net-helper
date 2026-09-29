@@ -65,6 +65,9 @@ namespace CampusNetHelper
         private readonly KeepAlive _keepAlive = new KeepAlive();
         private bool _closing = false;
 
+        /// <summary>系统正在关机 / 注销（见 OnClosing 里的说明，这个标志是保命用的）。</summary>
+        private bool _sessionEnding = false;
+
         /// <summary>「第二个实例叫我出来」用的自定义窗口消息（由 App 注册并投递）。</summary>
         private uint _activateMsg;
 
@@ -101,6 +104,17 @@ namespace CampusNetHelper
             ShowInTaskbar = !silent;
             Closing += OnClosing;
 
+            // 关机/注销时先记一笔（这个事件一定发生在窗口关闭之前），
+            // OnClosing 才能分清"用户关窗口"和"系统要关机"——两者处理方式必须不同。
+            if (Application.Current != null)
+            {
+                Application.Current.SessionEnding +=
+                    delegate(object s, System.Windows.SessionEndingCancelEventArgs ev)
+                    {
+                        _sessionEnding = true;
+                    };
+            }
+
             RefreshAccountList();
             RefreshParamCards();
             RefreshHistoryUi();
@@ -122,7 +136,21 @@ namespace CampusNetHelper
             {
                 Log.Info("静默启动（开机自启）：进入托盘守护模式");
                 _autoReconnectArmed = true;
-                if (AutoReconnectEnabled() && string.IsNullOrEmpty(existing)) TryAutoReconnect();
+
+                // ⚠️ 没有账号就必须说出来。
+                //    2026-09-29 的真实教训：账号文件损坏后读到 0 个账号，
+                //    程序依旧"静默启动"，不拨号也不提示，用户第二天才发现没网。
+                if (_accounts.Count == 0)
+                {
+                    Log.Warn("静默启动：没有任何已保存的账号，无法自动连接");
+                    ShowBalloon("没有可用账号，没能自动连接",
+                        "开机自启已经启动了，但程序里没有任何已保存的账号。\n"
+                        + "双击托盘图标打开主界面 →「管理账号」添加一个即可。");
+                }
+                else if (AutoReconnectEnabled() && string.IsNullOrEmpty(existing))
+                {
+                    TryAutoReconnect();
+                }
             }
         }
 
@@ -1352,6 +1380,29 @@ namespace CampusNetHelper
 
         private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            // ⭐ 关机 / 注销时必须老实退出，不能像"关窗口"那样 cancel 掉。
+            //
+            // 2026-09-29 的事故根因就在这里：开机自启+关闭到托盘的用户点关机时，
+            // 程序 cancel 掉关闭、缩回托盘继续跑 → Windows 等超时后【强制结束】进程。
+            // 而那一刻它正在写配置文件 —— 内容是"先清空文件再写"，结果文件被清空后
+            // 只写出了 UTF-8 文件头，正文还在缓冲区里就随进程一起没了，
+            // 账号文件从此只剩 3 字节，第二天开机变成"没有账号"。
+            if (_sessionEnding)
+            {
+                Log.Info("系统正在关机/注销，立即保存并退出（不缩到托盘）");
+                _closing = true;
+                _quality.Shutdown();
+                _keepAlive.Shutdown();
+                SaveAll();
+                if (trayIcon != null)
+                {
+                    trayIcon.Visible = false;
+                    trayIcon.Dispose();
+                    trayIcon = null;
+                }
+                return;   // 不设 e.Cancel → 窗口正常关闭 → 程序干净退出
+            }
+
             if (!CloseToTrayEnabled())
             {
                 _closing = true;
