@@ -17,7 +17,12 @@ namespace CampusNetHelper
     /// </summary>
     public partial class MainWindow : Window
     {
-        internal enum ConnState { Idle, Connecting, Connected, Disconnecting, Error }
+        /// <summary>
+        /// 连接状态。WaitingLink = 网线没插好时的"待机"——
+        /// 它和 Idle 的区别在于：待机时程序**不会去尝试拨号**，只在等网线接回来。
+        /// （2026-09-29 海辰的需求："拔掉网线后程序别一直拉连接，插上网线再自动识别"）
+        /// </summary>
+        internal enum ConnState { Idle, Connecting, Connected, Disconnecting, Error, WaitingLink }
 
         private ConnState _state = ConnState.Idle;
 
@@ -149,7 +154,10 @@ namespace CampusNetHelper
                 }
                 else if (AutoReconnectEnabled() && string.IsNullOrEmpty(existing))
                 {
-                    TryAutoReconnect();
+                    // 开机时先确认网线接着再拨 —— 否则刚开机就白试一次，
+                    // 网线没插好时应该直接待机等它
+                    if (CheckLinkNow()) TryAutoReconnect();
+                    else EnterWaitingLink();
                 }
             }
         }
@@ -432,7 +440,10 @@ namespace CampusNetHelper
                     AddHistory("连接断开");
                     _connectedAt = DateTime.MinValue;
                     if (lblOnlineTime != null) lblOnlineTime.Text = "";
-                    ApplyState(ConnState.Idle, "连接已断开", "拨号连接已中断");
+                    // 顺便看一眼是不是网线被拔了 —— 是的话直接进待机，
+                    // 别在"连接已断开 → 重试 → 又断开"之间来回跳
+                    if (CheckLinkNow()) ApplyState(ConnState.Idle, "连接已断开", "拨号连接已中断");
+                    else EnterWaitingLink();
                     RefreshParamCards();
                     return;
                 }
@@ -441,10 +452,32 @@ namespace CampusNetHelper
             }
 
             if (_autoReconnectArmed
-                && (_state == ConnState.Idle || _state == ConnState.Error)
+                && (_state == ConnState.Idle || _state == ConnState.Error
+                    || _state == ConnState.WaitingLink)
                 && AutoReconnectEnabled() && _current != null)
             {
-                if (!DialEngine.IsDialConnected()) TryAutoReconnect();
+                if (!DialEngine.IsDialConnected())
+                {
+                    RefreshLinkState();   // 后台刷（有 2 秒缓存，不会每秒都查 WMI）
+
+                    // 网线没插好：不重试。重试必然失败，还平白给学校攒失败次数。
+                    if (!_linkOk)
+                    {
+                        EnterWaitingLink();
+                        return;
+                    }
+
+                    // 刚从"等网线"恢复过来：不等退避，立刻连
+                    if (_state == ConnState.WaitingLink)
+                    {
+                        _waitingSince = DateTime.MinValue;
+                        Log.Info("检测到网线已接入，开始自动连接");
+                        _autoReconnectAttempts = 0;
+                        _lastAutoTry = DateTime.MinValue;
+                    }
+
+                    TryAutoReconnect();
+                }
             }
         }
 
@@ -456,6 +489,99 @@ namespace CampusNetHelper
             Log.Info("自动重连：第 " + _autoReconnectAttempts + " 次尝试恢复连接 "
                 + (_current != null ? _current.Name : "(无)"));
             StartDial(false);
+        }
+
+        // ==================================================================
+        // 网线链路状态：拔掉 → 待机；插回 → 立刻连
+        //
+        // 为什么要单独看"网线"而不是只看拨号结果：
+        //   网线拔了之后再怎么重试都必然失败，白白给学校攒失败次数
+        //   （学校对频繁拨号是会限速的），日志也刷得没法看。
+        //   判定用 HealthReport.IsWiredMediaConnected()：它用 WMI 只看
+        //   **物理**有线网卡（PCI\/USB\ 开头，排除虚拟网卡、Wi-Fi），
+        //   载波在不在即"网线插好没有"；探测失败时按"插好"处理，绝不误拦。
+        // ==================================================================
+
+        /// <summary>有线网卡是否接着（有载波）。默认 true —— 宁可多试一次，不可误拦。</summary>
+        private volatile bool _linkOk = true;
+        private string _linkDetail = "";
+        private DateTime _linkCheckedAt = DateTime.MinValue;
+        private int _linkChecking = 0;
+
+        /// <summary>进入"等待网线"的时刻（只用来判断要不要把探测降频）。</summary>
+        private DateTime _waitingSince = DateTime.MinValue;
+
+        /// <summary>链路状态缓存有效期。WMI 查询不便宜，别每秒都查。</summary>
+        private const int LinkCacheSeconds = 3;
+
+        /// <summary>同步查一次（只在"刚断开""开机""用户点连接"这类一次性场景用，几十毫秒）。</summary>
+        private bool CheckLinkNow()
+        {
+            try
+            {
+                string detail;
+                bool ok = HealthReport.IsWiredMediaConnected(out detail);
+                _linkOk = ok;
+                _linkDetail = detail ?? "";
+                _linkCheckedAt = DateTime.Now;
+                return ok;
+            }
+            catch
+            {
+                _linkOk = true;
+                _linkCheckedAt = DateTime.Now;
+                return true;
+            }
+        }
+
+        /// <summary>后台刷新链路状态，不阻塞界面；缓存没过期就跳过。</summary>
+        private void RefreshLinkState()
+        {
+            // 采样间隔：平时 3 秒（插网线后反应快）；
+            // 但如果"待机等网线"已经持续好几分钟（比如放假把网线收了），
+            // 就放宽到 10 秒 —— 没必要让 WMI 一直空转。
+            // （这个自适应是看了 AutoDial-GUIT 的做法后加的，它用固定 10 秒。）
+            double ttl = LinkCacheSeconds;
+            if (_state == ConnState.WaitingLink && _waitingSince != DateTime.MinValue
+                && (DateTime.Now - _waitingSince).TotalMinutes >= 3)
+            {
+                ttl = 10;
+            }
+            if ((DateTime.Now - _linkCheckedAt).TotalSeconds < ttl) return;
+            if (System.Threading.Interlocked.CompareExchange(ref _linkChecking, 1, 0) != 0) return;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate(object state)
+            {
+                try
+                {
+                    string detail;
+                    bool ok = HealthReport.IsWiredMediaConnected(out detail);
+                    _linkOk = ok;
+                    _linkDetail = detail ?? "";
+                    _linkCheckedAt = DateTime.Now;
+                }
+                catch
+                {
+                    _linkOk = true;
+                    _linkCheckedAt = DateTime.Now;
+                }
+                finally
+                {
+                    System.Threading.Interlocked.Exchange(ref _linkChecking, 0);
+                }
+            });
+        }
+
+        /// <summary>切到"待机 · 等待网线"。已经在待机就不重复刷界面、不重复写日志。</summary>
+        private void EnterWaitingLink()
+        {
+            if (_state == ConnState.WaitingLink) return;
+
+            _waitingSince = DateTime.Now;
+            Log.Info("网线没接好（" + (_linkDetail ?? "") + "），进入待机等网线；插好后会自动连接");
+            // 文案要短：状态条那行是单行省略号截断的，写长了关键承诺会被吃掉一半
+            ApplyState(ConnState.WaitingLink, "待机中 · 等待网线",
+                "网线没插好（或另一头没通电）。插好后会自动连接。");
         }
 
         // ==================================================================
@@ -897,6 +1023,21 @@ namespace CampusNetHelper
             if (_current == null || string.IsNullOrEmpty(_current.Name))
             {
                 MessageBox.Show("请先添加一个账号。\n\n点击右侧「管理账号」，填写连接名称、宽带账号与密码。",
+                    "校园网助手", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            // 网线没插好就别拨了 —— 只会得到一条看不懂的拨号错误码，
+            // 还平白给学校攒一次失败记录（学校对频繁拨号是会限速的）。
+            // 直接告诉他，并把"自动连接"武装上：网线插回去会自动连（见 OnTick）。
+            if (!CheckLinkNow())
+            {
+                bool auto = AutoReconnectEnabled();
+                if (auto) _autoReconnectArmed = true;
+                EnterWaitingLink();
+                MessageBox.Show("网线没有插好（或者另一头的设备没通电）。\n\n"
+                    + (auto ? "插好网线后不用点任何按钮，程序会自动连接。"
+                            : "插好网线后再点一次「立即连接」。"),
                     "校园网助手", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }

@@ -55,6 +55,7 @@ REM ---- response file ----
 >> build.rsp echo /lib:"%WPF%"
 >> build.rsp echo /reference:System.dll
 >> build.rsp echo /reference:System.Core.dll
+>> build.rsp echo /reference:System.Security.dll
 >> build.rsp echo /reference:System.Windows.Forms.dll
 >> build.rsp echo /reference:System.Drawing.dll
 >> build.rsp echo /reference:System.Management.dll
@@ -80,7 +81,7 @@ if not exist "%~dp0SiteConfig.cs" (
 )
 
 set MISSINGSRC=
-for %%F in (SiteConfig.cs App.xaml.cs Logger.cs SafeFile.cs HealthCheckStep.cs AutostartHelper.cs ConfigStore.cs DialEngine.cs QualityMonitor.cs KeepAlive.cs SpeedTestEngine.cs SpeedChart.cs PowGate.cs HealthReport.cs Theme.cs MainWindow.cs MainWindow.Logic.cs HealthWindow.cs SettingsWindow.cs SpeedTestWindow.cs WebAuthWindow.cs AccountWindow.cs) do (
+for %%F in (SiteConfig.cs App.xaml.cs Logger.cs SafeFile.cs SecureStore.cs HealthCheckStep.cs AutostartHelper.cs ConfigStore.cs DialEngine.cs QualityMonitor.cs KeepAlive.cs SpeedTestEngine.cs SpeedChart.cs PowGate.cs HealthReport.cs Theme.cs MainWindow.cs MainWindow.Logic.cs HealthWindow.cs SettingsWindow.cs SpeedTestWindow.cs WebAuthWindow.cs AccountWindow.cs) do (
   if exist "%%F" (
     >> build.rsp echo "%%F"
   ) else (

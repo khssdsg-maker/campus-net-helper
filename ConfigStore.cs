@@ -98,7 +98,8 @@ namespace CampusNetHelper
         {
             if (File.Exists(AccountsPath))
             {
-                List<Account> list = ParseAccounts(AccountsPath);
+                bool plainFound;
+                List<Account> list = ParseAccounts(AccountsPath, out plainFound);
 
                 // 主文件一条都读不出来，但备份里有 —— 说明主文件坏了，用备份救回来。
                 // （典型坏法：只剩一个 UTF-8 文件头，就是被"写一半杀进程"搞出来的）
@@ -132,6 +133,15 @@ namespace CampusNetHelper
                     Log.Warn("账号文件内容无法解析（" + new FileInfo(AccountsPath).Length + " 字节），已原样留档为 accounts.txt.bad");
                     try { File.Copy(AccountsPath, AccountsPath + ".bad", true); } catch { }
                 }
+
+                // 老版本存的是明文密码 —— 读进来了就顺手加密写回去（一次性迁移）。
+                // 包 try/catch：失败也不影响本次使用，下次保存还会再试。
+                if (plainFound && list.Count > 0)
+                {
+                    Log.Info("检测到明文密码，已改为加密保存（Windows DPAPI，仅本机本账户可解）");
+                    try { KeepBackup(AccountsPath); WriteAtomic(AccountsPath, BuildAccountsText(list)); }
+                    catch (Exception ex) { Log.Warn("明文密码迁移为密文失败（不影响使用）: " + ex.Message); }
+                }
                 return list;
             }
             return new List<Account>();
@@ -139,6 +149,13 @@ namespace CampusNetHelper
 
         private static List<Account> ParseAccounts(string path)
         {
+            bool ignored;
+            return ParseAccounts(path, out ignored);
+        }
+
+        private static List<Account> ParseAccounts(string path, out bool plainFound)
+        {
+            plainFound = false;
             var list = new List<Account>();
             try
             {
@@ -151,7 +168,11 @@ namespace CampusNetHelper
                     var a = new Account();
                     a.Name = parts[0];
                     a.User = parts[1];
-                    a.Password = parts.Length > 2 ? parts[2] : "";
+                    // 密码：密文解开，老版本的明文原样返回（下次保存会自动加密）
+                    a.Password = parts.Length > 2 ? SecureStore.Unprotect(parts[2]) : "";
+                    bool wasPlain = parts.Length > 2 && !string.IsNullOrEmpty(parts[2])
+                        && !SecureStore.IsProtected(parts[2]);
+                    if (wasPlain) plainFound = true;
                     if (a.Name.Length > 0) list.Add(a);
                 }
             }
@@ -167,7 +188,8 @@ namespace CampusNetHelper
                 foreach (Account a in accounts)
                 {
                     if (a == null || string.IsNullOrEmpty(a.Name)) continue;
-                    sb.AppendLine(a.Name + "|" + a.User + "|" + a.Password);
+                    // 落盘一律加密（DPAPI，只有本机本用户能解）
+                    sb.AppendLine(a.Name + "|" + a.User + "|" + SecureStore.Protect(a.Password));
                 }
             }
             return sb.ToString();
