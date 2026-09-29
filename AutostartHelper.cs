@@ -357,7 +357,9 @@ namespace CampusNetHelper
                 Directory.CreateDirectory(AppDataDir);
                 string path = ResultFilePath;
                 if (File.Exists(path)) File.Delete(path);
-                File.WriteAllText(path, (ok ? "OK" : "FAIL") + "\r\n" + (message ?? ""), Encoding.UTF8);
+                // 原子写：父进程会立刻读这个文件，别让它读到半截
+                SafeFile.WriteAtomic(path, (ok ? "OK" : "FAIL") + "\r\n" + (message ?? ""),
+                    new UTF8Encoding(false));
             }
             catch { }
         }

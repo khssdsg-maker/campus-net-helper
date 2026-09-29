@@ -1389,18 +1389,31 @@ namespace CampusNetHelper
             // 账号文件从此只剩 3 字节，第二天开机变成"没有账号"。
             if (_sessionEnding)
             {
-                Log.Info("系统正在关机/注销，立即保存并退出（不缩到托盘）");
-                _closing = true;
-                _quality.Shutdown();
-                _keepAlive.Shutdown();
-                SaveAll();
-                if (trayIcon != null)
+                if (!_closing)
                 {
-                    trayIcon.Visible = false;
-                    trayIcon.Dispose();
-                    trayIcon = null;
+                    _closing = true;
+                    Log.Info("系统正在关机/注销，立即保存并退出（不缩到托盘）");
+                    _quality.Shutdown();
+                    _keepAlive.Shutdown();
+                    SaveAll();
+                    if (trayIcon != null)
+                    {
+                        trayIcon.Visible = false;
+                        trayIcon.Dispose();
+                        trayIcon = null;
+                    }
+
+                    // ⚠️ 只"不 cancel"还不够：App 里设的是 ShutdownMode.OnExplicitShutdown，
+                    //    关掉唯一的窗口进程并不会退出，会留一个没有窗口的进程等着被系统杀掉 ——
+                    //    那就又变成"被强制结束"了，白修。
+                    //    这里必须显式 Shutdown；用 BeginInvoke 排队执行，避免在 Closing 里重入。
+                    Dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(delegate()
+                    {
+                        try { Application.Current.Shutdown(); }
+                        catch { }
+                    }));
                 }
-                return;   // 不设 e.Cancel → 窗口正常关闭 → 程序干净退出
+                return;   // 不设 e.Cancel → 窗口正常关闭
             }
 
             if (!CloseToTrayEnabled())

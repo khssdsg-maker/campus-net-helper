@@ -61,55 +61,24 @@ namespace CampusNetHelper
         //      读取时若主文件废了但备份是好的，自动从备份恢复。
         // ==================================================================
 
-        private const string BackupSuffix = ".bak";
+        private const string BackupSuffix = SafeFile.BackupSuffix;
 
-        /// <summary>原子替换写入：写临时文件 → 整体替换目标。失败不会破坏原文件。</summary>
+        /// <summary>原子替换写入（实现见 SafeFile，电话簿/设置共用同一套）。</summary>
         private static void WriteAtomic(string path, string text)
         {
-            string tmp = path + ".tmp";
-            File.WriteAllText(tmp, text, Encoding.UTF8);
-
-            if (File.Exists(path))
-            {
-                try
-                {
-                    // File.Replace 是原子的（NTFS 上走 ReplaceFile / MoveFileEx）
-                    File.Replace(tmp, path, null);
-                    return;
-                }
-                catch
-                {
-                    // 个别文件系统不支持 Replace，退化成"复制 + 删临时"
-                    File.Copy(tmp, path, true);
-                    try { File.Delete(tmp); } catch { }
-                    return;
-                }
-            }
-
-            File.Move(tmp, path);
+            SafeFile.WriteAtomic(path, text, Encoding.UTF8);
         }
 
-        /// <summary>把当前内容存一份为 .bak（作为"上一版留档"）。</summary>
+        /// <summary>把当前内容存一份为 .bak。</summary>
         private static void KeepBackup(string path)
         {
-            try
-            {
-                if (!File.Exists(path)) return;
-                File.Copy(path, path + BackupSuffix, true);
-            }
-            catch { }
+            SafeFile.KeepBackup(path);
         }
 
         /// <summary>文件里到底有没有"真内容"（只有 BOM 或空文件都算没有）。</summary>
         private static bool HasRealContent(string path)
         {
-            try
-            {
-                if (!File.Exists(path)) return false;
-                long len = new FileInfo(path).Length;
-                return len > 3;      // UTF-8 BOM 是 3 字节
-            }
-            catch { return false; }
+            return SafeFile.HasRealContent(path);
         }
 
         // ==================================================================
@@ -141,7 +110,19 @@ namespace CampusNetHelper
                     {
                         Log.Warn("账号文件疑似损坏（当前读到 0 条），已从备份恢复 " + fromBak.Count + " 个账号");
                         try { File.Copy(AccountsPath, AccountsPath + ".bad", true); } catch { }
-                        WriteAtomic(AccountsPath, BuildAccountsText(fromBak));
+
+                        // ⚠️ 恢复写入必须兜异常：这个函数是在主窗口构造函数里被调用的，
+                        //    一旦抛出去就是"程序启动直接失败"。
+                        //    文件只读 / 被占用 / 磁盘满 都可能失败 —— 那种情况下
+                        //    也要把从备份读到的账号返回给界面，不能在启动阶段崩。
+                        try
+                        {
+                            WriteAtomic(AccountsPath, BuildAccountsText(fromBak));
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Warn("从备份恢复账号时写回失败（不影响本次使用）: " + ex.Message);
+                        }
                         return fromBak;
                     }
                 }

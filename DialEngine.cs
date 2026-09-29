@@ -78,7 +78,15 @@ namespace CampusNetHelper
             }
         }
 
-        /// <summary>写回电话簿全文（沿用原文件编码；文件不存在则用 UTF-8 无 BOM）。</summary>
+        /// <summary>
+        /// 写回电话簿全文（沿用原文件编码；文件不存在则用 UTF-8 无 BOM）。
+        ///
+        /// ⚠️ 这个文件是**系统级的** —— rasphone.pbk 里装着这台机器上所有的宽带连接，
+        /// 不只是本程序建的。写坏了别的东西也一起坏。
+        /// 所以这里必须用 SafeFile：先留一份 .bak（万一出事能对照/恢复），
+        /// 再走"写临时文件 → 整体替换"的原子写 —— 不会再出现"清空之后写了一半"的半截文件。
+        /// （2026-09-29 自查时发现：原来用的是 File.WriteAllText，和把账号写丢的是同一套危险写法。）
+        /// </summary>
         private static bool WritePhonebook(string text, out string message)
         {
             message = "";
@@ -93,7 +101,9 @@ namespace CampusNetHelper
                     byte[] old = File.ReadAllBytes(p);
                     if (old.Length > 0) enc = DetectEncoding(old);
                 }
-                File.WriteAllText(p, text, enc);
+
+                SafeFile.KeepBackup(p);
+                SafeFile.WriteAtomic(p, text, enc);
                 return true;
             }
             catch (Exception ex)
