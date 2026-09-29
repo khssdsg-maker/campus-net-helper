@@ -65,6 +65,9 @@ namespace CampusNetHelper
         private readonly KeepAlive _keepAlive = new KeepAlive();
         private bool _closing = false;
 
+        /// <summary>「第二个实例叫我出来」用的自定义窗口消息（由 App 注册并投递）。</summary>
+        private uint _activateMsg;
+
         // ==================================================================
         // 构造
         // ==================================================================
@@ -78,7 +81,13 @@ namespace CampusNetHelper
             BuildUi();
 
             // 窗口圆角要等 hwnd 建好之后才能设
-            SourceInitialized += delegate(object s, EventArgs e) { ApplyRoundedCorners(); };
+            // 顺便装窗口消息钩子：静默启动时 hwnd 是 App 用 EnsureHandle() 建的，
+            // 这个事件同样会触发，钩子不会漏装。
+            SourceInitialized += delegate(object s, EventArgs e)
+            {
+                ApplyRoundedCorners();
+                HookActivateMessage();
+            };
 
             // 最大化/还原时同步顶栏那个按钮的图标
             StateChanged += delegate(object s, EventArgs e) { UpdateMaximizeGlyph(); };
@@ -1247,14 +1256,69 @@ namespace CampusNetHelper
             }
         }
 
+        /// <summary>
+        /// 接住「第二个实例叫我出来」的自定义消息，转到自己的显示流程。
+        ///
+        /// 为什么非要自己接：App 那边找不到窗口时是用 Win32 的 ShowWindow(SW_SHOW)
+        /// 硬把句柄点亮的。句柄是亮了，但 WPF 自己并不知道窗口"已经显示"，
+        /// 于是之后用户一点托盘图标（走 ShowMainWindow → Activate）就抛
+        /// 「显示 Window 之前，无法调用 DragMove 或 Activate()」。
+        /// 接住这条消息走正常显示流程，两边状态才一致。
+        /// </summary>
+        private void HookActivateMessage()
+        {
+            try
+            {
+                _activateMsg = WinApi.RegisterWindowMessage("CampusNetHelper_Activate");
+                if (_activateMsg == 0) return;
+
+                System.Windows.Interop.HwndSource src =
+                    System.Windows.Interop.HwndSource.FromHwnd(
+                        new System.Windows.Interop.WindowInteropHelper(this).Handle);
+                if (src != null) src.AddHook(OnWindowMessage);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("装激活消息钩子失败: " + ex.Message);
+            }
+        }
+
+        private IntPtr OnWindowMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (_activateMsg != 0 && msg == (int)_activateMsg)
+            {
+                handled = true;
+                ShowMainWindow();
+            }
+            return IntPtr.Zero;
+        }
+
         internal void ShowMainWindow()
         {
             Dispatcher.Invoke(delegate()
             {
-                Visibility = Visibility.Visible;
-                ShowInTaskbar = true;
-                if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-                Activate();
+                try
+                {
+                    ShowInTaskbar = true;
+                    if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+                    Visibility = Visibility.Visible;
+
+                    // ⭐ 开机自启用的是「计划任务」档，它带 /silent 启动 ——
+                    //    那种启动方式下 App 从头到尾没调用过 Show()，只 EnsureHandle() 建了个句柄。
+                    //    这种状态下 WPF 认为窗口"还没显示"，而且【只把 Visibility 设成 Visible 不算数】：
+                    //    实测 IsLoaded 依旧是 false，连系统层面 IsWindowVisible 都还是 false。
+                    //    此时调用 Activate() 会抛「显示 Window 之前，无法调用 DragMove 或 Activate()」，
+                    //    用户看到的就是一个吓人的 .NET 报错框。
+                    //    所以这里补一次 Show()；显示过的话跳过（Show() 幂等，重复调用无害）。
+                    if (!IsLoaded) Show();
+
+                    Activate();
+                }
+                catch (Exception ex)
+                {
+                    // 显示窗口失败不该让整个程序崩掉 —— 记日志，继续在托盘里干活
+                    Log.Warn("显示主窗口失败: " + ex.Message);
+                }
             });
         }
 
