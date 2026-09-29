@@ -94,7 +94,7 @@ namespace CampusNetHelper
 
         internal const string FontUi = "Microsoft YaHei UI, Microsoft YaHei, Segoe UI";
         internal const string FontMono = "Consolas, Microsoft YaHei UI";
-        internal const string VersionText = "1.3.4";
+        internal const string VersionText = "1.3.5";
 
         // ==================================================================
         // 本校专属默认值

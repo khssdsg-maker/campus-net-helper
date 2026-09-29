@@ -16,6 +16,9 @@ namespace CampusNetHelper
         private CheckBox chkAutoReconnect;
         private CheckBox chkSilent;
         private CheckBox chkCloseToTray;
+        private CheckBox chkNightQuiet;
+        private TextBox txtQuietStart;
+        private TextBox txtQuietEnd;
         private TextBox txtInterval;
         private CheckBox chkKeepAlive;
         private TextBox txtKeepAlive;
@@ -134,6 +137,56 @@ namespace CampusNetHelper
 
             chkCloseToTray = MakeCheck("关闭窗口时最小化到托盘", true);
             stack.Children.Add(chkCloseToTray);
+
+            // ---------- 夜间免打扰 ----------
+            chkNightQuiet = MakeCheck("夜间免打扰（时段内不检测、不重连、不弹提示）", false);
+            stack.Children.Add(chkNightQuiet);
+
+            var rowQuiet = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(24, 8, 0, 0)
+            };
+            rowQuiet.Children.Add(new TextBlock
+            {
+                Text = "免打扰时段",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                FontSize = 11
+            });
+            txtQuietStart = MakeTimeBox("23:30");
+            rowQuiet.Children.Add(txtQuietStart);
+            rowQuiet.Children.Add(new TextBlock
+            {
+                Text = "到",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                FontSize = 11,
+                Margin = new Thickness(8, 0, 8, 0)
+            });
+            txtQuietEnd = MakeTimeBox("07:00");
+            rowQuiet.Children.Add(txtQuietEnd);
+            rowQuiet.Children.Add(new TextBlock
+            {
+                Text = "（可跨零点，比如 23:30 → 07:00）",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Theme.TextFaint),
+                FontSize = 11,
+                Margin = new Thickness(8, 0, 0, 0)
+            });
+            stack.Children.Add(rowQuiet);
+
+            stack.Children.Add(new TextBlock
+            {
+                Text = "这段时间里程序完全不打扰：不检测网络、不重试拨号、不弹任何提示。"
+                     + "宿舍夜里会断电断网，开着它最省心 —— 通电通网后（或时段结束时）会自动连上。"
+                     + "已经连着的网络不会因此被断开。",
+                FontSize = 11,
+                Foreground = new SolidColorBrush(Theme.TextFaint),
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 18,
+                Margin = new Thickness(24, 6, 0, 0)
+            });
 
             stack.Children.Add(Divider());
 
@@ -288,6 +341,10 @@ namespace CampusNetHelper
             txtInterval.Text = owner.ReconnectInterval().ToString();
             chkKeepAlive.IsChecked = owner.KeepAliveEnabled();
             txtKeepAlive.Text = owner.KeepAliveIntervalMinutes().ToString();
+
+            chkNightQuiet.IsChecked = owner.NightQuietEnabled();
+            txtQuietStart.Text = owner.NightQuietStart();
+            txtQuietEnd.Text = owner.NightQuietEnd();
         }
 
         private void SaveToOwner()
@@ -310,13 +367,35 @@ namespace CampusNetHelper
                 return;
             }
 
+            // 免打扰时段：只在勾选时校验格式（没勾就不用管填了什么）
+            string qs = (txtQuietStart.Text ?? "").Trim();
+            string qe = (txtQuietEnd.Text ?? "").Trim();
+            if (chkNightQuiet.IsChecked == true)
+            {
+                if (!MainWindow.IsValidHm(qs) || !MainWindow.IsValidHm(qe))
+                {
+                    MessageBox.Show("免打扰时段请按 24 小时制填写，形如 23:30。",
+                        "设置", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                if (qs == qe)
+                {
+                    MessageBox.Show("免打扰的开始和结束时间不能一样。",
+                        "设置", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+            }
+
             string note = owner.ApplySettingsFromWindow(
                 chkAutoReconnect.IsChecked == true,
                 chkSilent.IsChecked == true,
                 chkCloseToTray.IsChecked == true,
                 iv,
                 chkKeepAlive.IsChecked == true,
-                ka);
+                ka,
+                chkNightQuiet.IsChecked == true,
+                qs,
+                qe);
 
             // 勾选框以**实际结果**为准：装计划任务时会拒绝创建副本、从副本运行时删不掉，
             // 这两种情况都得让界面如实回退，不能让用户看着是勾上的却其实没生效。
@@ -325,6 +404,23 @@ namespace CampusNetHelper
             MessageBox.Show(
                 string.IsNullOrEmpty(note) ? "设置已保存。" : "设置已保存。\n\n" + note,
                 "设置", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        /// <summary>时间输入框（HH:mm）。样式跟其它输入框保持一致。</summary>
+        private static TextBox MakeTimeBox(string def)
+        {
+            return new TextBox
+            {
+                Width = 62,
+                Text = def,
+                TextAlignment = TextAlignment.Center,
+                Background = new SolidColorBrush(Theme.FieldBg),
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                BorderBrush = new SolidColorBrush(Theme.GlassBorder),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(6, 4, 6, 4),
+                CaretBrush = new SolidColorBrush(Theme.TextPrimary)
+            };
         }
 
         private void RefreshAutostartState()

@@ -22,7 +22,7 @@ namespace CampusNetHelper
         /// 它和 Idle 的区别在于：待机时程序**不会去尝试拨号**，只在等网线接回来。
         /// （2026-09-29 海辰的需求："拔掉网线后程序别一直拉连接，插上网线再自动识别"）
         /// </summary>
-        internal enum ConnState { Idle, Connecting, Connected, Disconnecting, Error, WaitingLink }
+        internal enum ConnState { Idle, Connecting, Connected, Disconnecting, Error, WaitingLink, Quiet }
 
         private ConnState _state = ConnState.Idle;
 
@@ -286,14 +286,21 @@ namespace CampusNetHelper
         /// 返回值是需要额外告知用户的一句话（一切正常则返回空串），由调用方贴到"设置已保存"后面。
         /// </summary>
         internal string ApplySettingsFromWindow(bool autoReconnect, bool silent, bool closeToTray,
-            int interval, bool keepAlive, int keepAliveMinutes)
+            int interval, bool keepAlive, int keepAliveMinutes,
+            bool nightQuiet, string quietStart, string quietEnd)
         {
             ConfigStore.SetBool(_settings, "AutoReconnect", autoReconnect);
             ConfigStore.SetBool(_settings, "CloseToTray", closeToTray);
             _settings["ReconnectInterval"] = interval.ToString();
             ConfigStore.SetBool(_settings, "KeepAlive", keepAlive);
             _settings["KeepAliveInterval"] = keepAliveMinutes.ToString();
+            ConfigStore.SetBool(_settings, "NightQuiet", nightQuiet);
+            _settings["NightQuietStart"] = quietStart ?? "23:30";
+            _settings["NightQuietEnd"] = quietEnd ?? "07:00";
             SaveAll();
+
+            // 开关改了立刻生效：如果刚打开免打扰且当前就在时段内，让下一次 tick 处理
+            // （_quietActive 会被 tick 里的差异判断接上，不用额外通知）
 
             // 开关可能刚被改掉，立刻生效，不用等下次连接状态变化
             _keepAlive.SetActive(_state == ConnState.Connected && keepAlive, keepAliveMinutes);
@@ -302,7 +309,8 @@ namespace CampusNetHelper
 
             Log.Info("设置已更新: 自动重连=" + autoReconnect + " 开机自启=" + silent
                 + " 关闭到托盘=" + closeToTray + " 间隔=" + interval
-                + " 保活=" + keepAlive + " 保活间隔=" + keepAliveMinutes + "分钟");
+                + " 保活=" + keepAlive + " 保活间隔=" + keepAliveMinutes + "分钟"
+                + " 免打扰=" + (nightQuiet ? (quietStart + "-" + quietEnd) : "关"));
             return note;
         }
 
@@ -425,6 +433,28 @@ namespace CampusNetHelper
 
         private void OnTick()
         {
+            bool quiet = InNightQuiet();
+
+            // 免打扰时段的进出：只在状态变化时处理一次（否则每秒都要动检测开关）
+            if (quiet != _quietActive)
+            {
+                _quietActive = quiet;
+                if (quiet)
+                {
+                    // 暂停质量检测（不再 ping）—— 进入的日志由 EnterQuiet 写，这里不重复
+                    _quality.SetActive(false);
+                }
+                else
+                {
+                    Log.Info("夜间免打扰时段结束，恢复检测与自动连接");
+                    if (_state == ConnState.Quiet)
+                    {
+                        ApplyState(ConnState.Idle, "尚未连接", "免打扰时段已结束，正在恢复…");
+                    }
+                    _quality.SetActive(_state == ConnState.Connected);
+                }
+            }
+
             if (_state == ConnState.Connected)
             {
                 if (_connectedAt != DateTime.MinValue && lblOnlineTime != null)
@@ -436,19 +466,37 @@ namespace CampusNetHelper
 
                 if (!DialEngine.IsDialConnected())
                 {
-                    Log.Warn("检测到拨号连接已断开");
+                    Log.Warn("检测到拨号连接已断开" + (quiet ? "（夜间免打扰中，暂不重连）" : ""));
                     AddHistory("连接断开");
                     _connectedAt = DateTime.MinValue;
                     if (lblOnlineTime != null) lblOnlineTime.Text = "";
-                    // 顺便看一眼是不是网线被拔了 —— 是的话直接进待机，
-                    // 别在"连接已断开 → 重试 → 又断开"之间来回跳
-                    if (CheckLinkNow()) ApplyState(ConnState.Idle, "连接已断开", "拨号连接已中断");
-                    else EnterWaitingLink();
+                    if (quiet)
+                    {
+                        // 免打扰时段：不重连，安静等着时段结束
+                        EnterQuiet();
+                    }
+                    else if (CheckLinkNow())
+                    {
+                        // 顺便看一眼是不是网线被拔了 —— 是的话直接进待机，
+                        // 别在"连接已断开 → 重试 → 又断开"之间来回跳
+                        ApplyState(ConnState.Idle, "连接已断开", "拨号连接已中断");
+                    }
+                    else
+                    {
+                        EnterWaitingLink();
+                    }
                     RefreshParamCards();
                     return;
                 }
 
                 RefreshParamCards();
+            }
+
+            // 免打扰时段：不检测、不重试、不弹提示（已经连着的网络保持不断）
+            if (quiet)
+            {
+                if (_state != ConnState.Connected) EnterQuiet();
+                return;
             }
 
             if (_autoReconnectArmed
@@ -489,6 +537,83 @@ namespace CampusNetHelper
             Log.Info("自动重连：第 " + _autoReconnectAttempts + " 次尝试恢复连接 "
                 + (_current != null ? _current.Name : "(无)"));
             StartDial(false);
+        }
+
+        // ==================================================================
+        // 夜间免打扰
+        //
+        // 海辰的需求（从 AutoDial-GUIT 搬过来的能力）：
+        //   宿舍夜里断电/断网时程序别一直干活、别弹提示 —— 到了设定时段完全静默，
+        //   时段结束后立刻恢复检测，通网瞬间自动连上。
+        //
+        // 时段内做什么 / 不做什么：
+        //   · 不重试拨号        —— 这是主要目的（省得白试、白给学校攒失败次数）
+        //   · 暂停连接质量检测  —— 不再 ping，真的零打扰
+        //   · 不弹任何气泡提示
+        //   · 【但不断开已连着的网络】也不停心跳保活 —— 免打扰不该把人搞掉线
+        // ==================================================================
+
+        private bool _quietActive = false;
+
+        internal bool NightQuietEnabled()
+        {
+            return ConfigStore.GetBool(_settings, "NightQuiet", false);
+        }
+
+        internal string NightQuietStart()
+        {
+            return ConfigStore.GetString(_settings, "NightQuietStart", "23:30");
+        }
+
+        internal string NightQuietEnd()
+        {
+            return ConfigStore.GetString(_settings, "NightQuietEnd", "07:00");
+        }
+
+        /// <summary>"HH:mm" → 当天的分钟数；格式不对返回 -1。</summary>
+        private static int ParseHm(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return -1;
+            string[] parts = text.Trim().Split(':');
+            if (parts.Length != 2) return -1;
+            int h, m;
+            if (!int.TryParse(parts[0].Trim(), out h)) return -1;
+            if (!int.TryParse(parts[1].Trim(), out m)) return -1;
+            if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+            return h * 60 + m;
+        }
+
+        /// <summary>给设置界面用的格式校验（HH:mm，24 小时制）。</summary>
+        internal static bool IsValidHm(string text)
+        {
+            return ParseHm(text) >= 0;
+        }
+
+        /// <summary>现在是否处于免打扰时段。支持跨零点（比如 23:30 → 07:00）。</summary>
+        internal bool InNightQuiet()
+        {
+            if (!NightQuietEnabled()) return false;
+
+            int s = ParseHm(NightQuietStart());
+            int e = ParseHm(NightQuietEnd());
+            if (s < 0 || e < 0 || s == e) return false;   // 配置不合法就当没开
+
+            DateTime now = DateTime.Now;
+            int cur = now.Hour * 60 + now.Minute;
+
+            if (s < e) return cur >= s && cur < e;        // 同一天内
+            return cur >= s || cur < e;                   // 跨零点
+        }
+
+        /// <summary>切到"夜间免打扰"。</summary>
+        private void EnterQuiet()
+        {
+            if (_state == ConnState.Quiet) return;
+
+            Log.Info("进入夜间免打扰时段（" + NightQuietStart() + " - " + NightQuietEnd()
+                + "）：暂停检测与自动连接");
+            ApplyState(ConnState.Quiet, "夜间免打扰中",
+                "此时段不检测、不重连；到 " + NightQuietEnd() + " 自动恢复。");
         }
 
         // ==================================================================
@@ -1495,6 +1620,13 @@ namespace CampusNetHelper
         {
             try
             {
+                // 免打扰时段内不弹任何提示 —— 只说给日志听，不打扰人
+                if (InNightQuiet())
+                {
+                    Log.Info("（免打扰时段内不弹提示）" + title + "：" + (msg ?? "").Replace("\n", " "));
+                    return;
+                }
+
                 if (trayIcon != null)
                 {
                     trayIcon.ShowBalloonTip(3000, title, msg, System.Windows.Forms.ToolTipIcon.Info);

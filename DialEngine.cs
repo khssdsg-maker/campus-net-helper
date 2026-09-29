@@ -513,6 +513,26 @@ namespace CampusNetHelper
                     Add(hints, "如果手机 / 路由器上有同名账号在线，先退出那边再重试");
                     Add(hints, "部分校园网同一账号只允许一台设备在线，等待几分钟后再拨");
                     break;
+                case 676:
+                    desc = "电话线占线 / 线路忙";
+                    Add(hints, "网口或上联设备忙，稍等一会儿再拨");
+                    break;
+                case 721:
+                    desc = "对方无应答";
+                    Add(hints, "服务器没响应，多半是临时故障，过几分钟再试");
+                    break;
+                case 735:
+                    desc = "服务器拒绝分配地址";
+                    Add(hints, "账号可能已达在线数量上限，先在别的设备上退出登录");
+                    break;
+                case 797:
+                    desc = "找不到调制解调器 / 宽带设备";
+                    Add(hints, "网卡驱动或宽带设备异常：检查设备管理器里的网络适配器");
+                    break;
+                case 815:
+                    desc = "宽带连接不可用（协议不匹配）";
+                    Add(hints, "连接的协议设置被改动过，可在「网络和共享中心」里重新创建一次宽带连接");
+                    break;
                 case 692:
                     desc = "调制解调器或端口故障";
                     Add(hints, "可能是网口或线路问题，尝试换一个网口 / 重新插拔网线");
@@ -569,18 +589,106 @@ namespace CampusNetHelper
                     break;
             }
 
-            // 部分场景下 rasdial 会把具体原因写在输出里（例如"过于频繁"），
-            // 这里做一次温和补充，不作为判定依据。
+            // 691 是个"大类"：服务器其实会在输出里写明具体原因（密码错、并发超限、
+            // 欠费、终端绑定不符……），但 rasdial 只给一个 691。这里按关键词细分，
+            // 把"该等 10 分钟"和"该去改密码"分开 —— 否则用户只能一股脑重试。
+            //
+            // 词条来自公开可查的运营商/BRAS 返回文案（配合本机实测整理），
+            // 只做**原因解释与处置建议**，不涉及任何绕过手段。
             if (code == 691)
             {
-                string low = (rawOutput ?? "").ToLowerInvariant();
-                if (low.IndexOf("so soon") >= 0 || (rawOutput ?? "").IndexOf("频繁", StringComparison.Ordinal) >= 0)
-                {
-                    desc = "拨号过于频繁，请静置约 10 分钟后再试";
-                }
+                desc = DetailOf691(rawOutput, hints) ?? desc;
             }
 
             return desc;
+        }
+
+        /// <summary>
+        /// 把 691 拆细，返回更贴切的说明；匹配不到关键词时返回 null（沿用通用说明）。
+        ///
+        /// 命中后**替换**掉通用建议：既然已经判成"被限速了"，再让人核对密码只会把人带偏。
+        /// ⚠️ 关键词一律转小写后用 IndexOf 匹配，不用正则（BRAS 文案里符号五花八门）。
+        /// </summary>
+        private static string DetailOf691(string rawOutput, List<string> hints)
+        {
+            string low = (rawOutput ?? "").ToLowerInvariant();
+            if (low.Length == 0) return null;
+
+            var mine = new List<string>();
+
+            // 顺序有讲究：先"限速 / 并发"这类有明确处置动作的，
+            // 最后才是"密码 / 认证失败"这种通用的兜底
+            if (Has(low, "so soon", "频繁"))
+            {
+                Add(mine, "这是学校/运营商的限速风控：别连续重试，静置约 10 分钟再拨");
+                Add(mine, "越急着重试，等待时间越长 —— 所以程序也不会自动帮你狂试");
+                return Swap(hints, mine, "拨号过于频繁，被服务器限速了");
+            }
+            if (Has(low, "too many connections", "limit users", "concurrency",
+                    "access number is exceed", "并发", "已在线"))
+            {
+                Add(mine, "同一账号同时在线的设备数超了：把手机 / 路由器 / 别的电脑上的同名连接退掉");
+                Add(mine, "有些运营商不允许「WiFi 与宽带同时在线」，先断开手机上的校园 WiFi 再拨");
+                Add(mine, "退掉之后等一会儿再试（并发类通常要等 10 到 30 分钟）");
+                return Swap(hints, mine, "账号已在别处在线（并发数超限）");
+            }
+            if (Has(low, "overdue", "charge", "过期", "欠费"))
+            {
+                Add(mine, "到校园网自助服务 / 计费中心确认账号状态：是否欠费、上网密码是否已过期");
+                return Swap(hints, mine, "账号欠费或密码已过期");
+            }
+            if (Has(low, "suspended", "account pause", "暂停", "锁定"))
+            {
+                Add(mine, "账号被暂停了，需要联系运营商营业厅或学校网络中心处理");
+                return Swap(hints, mine, "宽带账号已被暂停");
+            }
+            if (Has(low, "can't find user", "user not exist", "username", "invalid",
+                    "不存在", "未登记"))
+            {
+                Add(mine, "账号名可能写错了，或这台设备还没在学校登记");
+                Add(mine, "确认填的是运营商给的宽带账号，不是学号 / 门户账号");
+                return Swap(hints, mine, "账号不存在 / 未登记");
+            }
+            if (Has(low, "terminal", "nas-port-id", "bindattr", "invalid location", "绑定", "地点"))
+            {
+                Add(mine, "学校把账号和登记的设备（MAC）或网口绑定在一起了");
+                Add(mine, "换过电脑、换过网口就会出现这个错 —— 换回原来那台设备 / 那个网口拨号即可");
+                Add(mine, "确实需要长期换，联系学校网络中心改一次绑定");
+                return Swap(hints, mine, "终端 / 上网地点绑定校验没通过");
+            }
+            if (Has(low, "password", "密码"))
+            {
+                Add(mine, "密码不对或已过期：到校园网自助服务重置一次上网密码");
+                Add(mine, "注意区分「上网密码」和「校园门户密码」，两者通常不一样");
+                return Swap(hints, mine, "密码错误");
+            }
+            if (Has(low, "auth failed", "authentication fail", "认证失败"))
+            {
+                Add(mine, "认证被拒：优先核对账号本身（别把学号 / 门户号当成宽带账号）");
+                Add(mine, "如果账号确认没错，稍后重试或联系学校网络中心");
+                return Swap(hints, mine, "认证失败");
+            }
+            return null;
+        }
+
+        /// <summary>用更贴切的建议替换掉通用建议。</summary>
+        private static string Swap(List<string> hints, List<string> mine, string desc)
+        {
+            if (hints != null)
+            {
+                hints.Clear();
+                for (int i = 0; i < mine.Count; i++) hints.Add(mine[i]);
+            }
+            return desc;
+        }
+
+        private static bool Has(string lowText, params string[] keys)
+        {
+            for (int i = 0; i < keys.Length; i++)
+            {
+                if (lowText.IndexOf(keys[i], StringComparison.Ordinal) >= 0) return true;
+            }
+            return false;
         }
 
         private static void Add(List<string> list, string item)
