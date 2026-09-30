@@ -19,6 +19,7 @@ namespace CampusNetHelper
         private ListBox lst;
         private TextBox txtName;
         private TextBox txtUser;
+        private TextBox txtUser2;
         private PasswordBox txtPass;
         private TextBox txtPassPlain;
         private CheckBox chkShowPass;
@@ -32,7 +33,7 @@ namespace CampusNetHelper
             accounts = new List<ConfigStore.Account>();
             foreach (ConfigStore.Account a in source)
             {
-                accounts.Add(new ConfigStore.Account { Name = a.Name, User = a.User, Password = a.Password });
+                accounts.Add(new ConfigStore.Account { Name = a.Name, User = a.User, Password = a.Password, User2 = a.User2 });
             }
 
             Title = "管理账号";
@@ -125,6 +126,21 @@ namespace CampusNetHelper
             right.Children.Add(Label("宽带账号"));
             txtUser = Field(false);
             right.Children.Add(txtUser);
+
+            right.Children.Add(Label("附加账号（可空）"));
+            txtUser2 = Field(false);
+            right.Children.Add(txtUser2);
+
+            right.Children.Add(new TextBlock
+            {
+                Text = "有些学校的网页认证要填两个号：一个身份号（学工号）＋一个上网账号（常是手机号）。"
+                     + "上面「宽带账号」填上网账号，「附加账号」填学工号。拨号用不到这一项，留空即可。",
+                FontSize = 11,
+                Foreground = new SolidColorBrush(Theme.TextFaint),
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 17,
+                Margin = new Thickness(0, 6, 0, 0)
+            });
 
             right.Children.Add(Label("上网密码"));
             txtPass = new PasswordBox
@@ -347,6 +363,7 @@ namespace CampusNetHelper
             {
                 txtName.Text = a.Name;
                 txtUser.Text = a.User;
+                txtUser2.Text = a.User2;
                 txtPass.Password = a.Password;
                 txtPassPlain.Text = a.Password;
             }
@@ -360,6 +377,7 @@ namespace CampusNetHelper
             {
                 txtName.Text = "";
                 txtUser.Text = "";
+                txtUser2.Text = "";
                 txtPass.Password = "";
                 txtPassPlain.Text = "";
             }
@@ -377,6 +395,7 @@ namespace CampusNetHelper
         {
             string name = (txtName.Text ?? "").Trim();
             string user = (txtUser.Text ?? "").Trim();
+            string user2 = (txtUser2.Text ?? "").Trim();
             string pass = CurrentPassword() ?? "";
 
             if (name.Length == 0)
@@ -403,7 +422,7 @@ namespace CampusNetHelper
                 return;
             }
 
-            var item = new ConfigStore.Account { Name = name, User = user, Password = pass };
+            var item = new ConfigStore.Account { Name = name, User = user, Password = pass, User2 = user2 };
 
             if (sel >= 0 && sel < accounts.Count) accounts[sel] = item;
             else accounts.Add(item);

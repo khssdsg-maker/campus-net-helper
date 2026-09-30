@@ -91,6 +91,18 @@ namespace CampusNetHelper
             public string Name = "";
             public string User = "";
             public string Password = "";
+
+            /// <summary>
+            /// 附加账号（可空）。
+            ///
+            /// 有些学校的网页认证要**两个号**：一个身份号（学工号）＋一个上网账号（常见是手机号）。
+            /// 拨号只用得到 User，所以这个字段对拨号无影响；
+            /// 网页认证填表时如果门户上有第二个输入框，就往这里取。
+            ///
+            /// ⚠️ 落盘格式是 accounts.txt 的**第 4 段**（Name|User|Password|User2）。
+            ///    老文件没有第 4 段 → 读出来是空串，属正常，不要当成损坏。
+            /// </summary>
+            public string User2 = "";
         }
 
         /// <summary>读取全部账号。主文件废了会尝试从 .bak 恢复。</summary>
@@ -170,6 +182,8 @@ namespace CampusNetHelper
                     a.User = parts[1];
                     // 密码：密文解开，老版本的明文原样返回（下次保存会自动加密）
                     a.Password = parts.Length > 2 ? SecureStore.Unprotect(parts[2]) : "";
+                    // 附加账号（学工号等）：老文件没有第 4 段 → 空串，属正常
+                    a.User2 = parts.Length > 3 ? parts[3] : "";
                     bool wasPlain = parts.Length > 2 && !string.IsNullOrEmpty(parts[2])
                         && !SecureStore.IsProtected(parts[2]);
                     if (wasPlain) plainFound = true;
@@ -189,7 +203,9 @@ namespace CampusNetHelper
                 {
                     if (a == null || string.IsNullOrEmpty(a.Name)) continue;
                     // 落盘一律加密（DPAPI，只有本机本用户能解）
-                    sb.AppendLine(a.Name + "|" + a.User + "|" + SecureStore.Protect(a.Password));
+                    // 第 4 段是附加账号，明文存（它就是学工号一类的标识，不是密码）
+                    sb.AppendLine(a.Name + "|" + a.User + "|" + SecureStore.Protect(a.Password)
+                        + "|" + (a.User2 ?? ""));
                 }
             }
             return sb.ToString();

@@ -48,29 +48,128 @@ namespace CampusNetHelper
         private WindowsFormsHost host;
 
         private TextBox txtUrl;
+        /// <summary>已保存的认证网址下拉框。</summary>
+        private ComboBox cmbUrl;
+        /// <summary>装载下拉项期间为 true —— 用来区分"程序在填"和"用户选了"。</summary>
+        private bool _loadingUrlList = false;
         private ComboBox cmbAccount;
         private PasswordBox txtPass;
         private CheckBox chkAuto;
+        private CheckBox chkAutoClose;
         private Button btnLogin;
         private TextBlock lblStatus;
         private TextBlock lblFound;
 
         private bool _autoDoneThisLoad = false;
         private int _loadToken = 0;
+
+        /// <summary>
+        /// 「这个文档里没有密码框」这条诊断日志，最后一轮是第几轮加载时写的。
+        /// 
+        /// ⚠️ 存在的理由：补填定时器每 1.2 秒重试一次、一轮最多 12 次，加上
+        ///    DocumentCompleted 也会调一次 —— 这条日志曾经是无条件写的，实测
+        ///    一天下来占了整个日志的 17.9%（108/604 行），把真正的线索全淹了。
+        ///    同一轮加载里记一遍就够了。
+        /// </summary>
+        private int _noPwdLoggedToken = -1;
+
+        /// <summary>本轮页面里是否已经"填好并提交过"一次（用来避免反复提交）。导航新页面时复位。</summary>
+        private bool _submittedThisLoad = false;
         private DispatcherTimer _retryTimer;
         private int _retryLeft = 0;
 
         /// <summary>下拉框里放的是账号名（字符串），这里按同一下标反查完整的账号对象。</summary>
         private List<ConfigStore.Account> _accounts = new List<ConfigStore.Account>();
 
+        /// <summary>
+        /// 开机自启弹出时，登录成功后是否自动关闭本窗口。
+        /// 由 SettingsWindow 的「网页认证开机行为」决定；手动打开时恒为 false。
+        /// </summary>
+        private bool _startupAutoClose = false;
+
+        /// <summary>由 MainWindow 在开机自启场景调用，设置"登录成功后自动关闭"。</summary>
+        internal void SetStartupAutoClose(bool autoClose)
+        {
+            _startupAutoClose = autoClose;
+            if (chkAutoClose != null) chkAutoClose.IsChecked = autoClose;
+            if (autoClose)
+            {
+                SetStatus("开机自启：账号密码已自动填好，填完验证码点登录即可（成功后本窗口会自动关闭）。");
+                StartAutoCloseGuard();
+            }
+        }
+
+        /// <summary>本窗口是否是"自动重连"拉起来的（判断要不要自动填表）。</summary>
+        private bool _reauthMode = false;
+
+        /// <summary>
+        /// 由 MainWindow 在**自动重连**场景调用：这个窗口是程序自己因为掉线开的，
+        /// 不是用户点开的。
+        ///
+        /// 与开机自启的区别：
+        ///   · 开机自启是"刚开机，还没连过"，用户坐在电脑前等
+        ///   · 自动重连是"本来好好的，突然断了" —— 用户可能正在打游戏/看视频，
+        ///     所以这个窗口**不抢焦点**（由调用方设 ShowActivated=false），
+        ///     并且状态文案要说清"是掉线了才自动弹出来的"，不然用户会莫名其妙。
+        ///
+        /// ⚠️ 这个模式下同样**绝不自动填验证码** —— 那是用户的活。
+        /// </summary>
+        internal void SetReauthMode(bool reauth)
+        {
+            _reauthMode = reauth;
+            if (reauth)
+            {
+                SetStatus("检测到掉线，已自动打开认证页。账号密码已帮你填好，"
+                    + "填一下验证码再点登录即可。");
+                // 连通后自己也关掉 —— 和开机自启同样的道理：
+                // 任务完成了就不该留个窗口杵在那儿。用户在打游戏时尤其明显。
+                StartAutoCloseGuard();
+            }
+        }
+
+        /// <summary>用户手动勾/取消「登录成功后自动关闭」时调用。</summary>
+        private void ApplyAutoCloseToggle(bool on)
+        {
+            _startupAutoClose = on;
+            if (on)
+            {
+                SetStatus("已开启：检测到网络真的连通后，本窗口会自动关闭。");
+                StartAutoCloseGuard();
+            }
+            else
+            {
+                SetStatus("已关闭自动关闭。");
+            }
+        }
+
+        /// <summary>把界面上的勾选框状态同步成当前配置（防止界面与实际不一致）。</summary>
+        private void SyncAutoCloseCheckbox()
+        {
+            if (chkAutoClose == null) return;
+            try
+            {
+                if (chkAutoClose.IsChecked != _startupAutoClose)
+                {
+                    // 用 suppress 思路：直接设值会触发 Checked/Unchecked 事件，
+                    // 那次事件里又会去 StartAutoCloseGuard —— 这里只想同步显示。
+                    // 为简单起见，只在确实不一致时才写，且写之前把标记设好，事件里会走同一条路径。
+                    chkAutoClose.IsChecked = _startupAutoClose;
+                }
+            }
+            catch { }
+        }
+
         public WebAuthWindow(MainWindow owner)
         {
             this.owner = owner;
 
             Title = "校园网网页认证";
-            Width = 900;
+            Width = 1040;
             Height = 740;
-            MinWidth = 720;
+            // ⚠️ MinWidth 必须 >= 最宽那一行控件的固有宽度，否则用户把窗口拉窄时
+            //    右边会被切掉（这是踩过的坑：网址那一行曾经固定要 1062px，
+            //    而窗口默认只有 900px，「导出页面结构」「字段档案」直接被裁掉）。
+            MinWidth = 760;
             MinHeight = 560;
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
             Background = new SolidColorBrush(Theme.WindowBg);
@@ -143,17 +242,51 @@ namespace CampusNetHelper
         private void BuildUi()
         {
             var root = new Grid { Margin = new Thickness(16, 14, 16, 14) };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 0 网址
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 1 功能按钮
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 2 账号/密码
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 3 自动关闭
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 4 状态
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });  // 5 浏览器
 
             // ---------- 第 1 行：认证网址 ----------
+            // ⚠️ 这一行只放"下拉框 + 输入框 + 打开 + 存"。
+            //    曾经把 4 个按钮全塞在这行，固定宽度要 1062px，比窗口还宽 ——
+            //    结果「导出页面结构」「字段档案」在正常窗口大小下直接被切掉。
+            //    教训：多一行能解决的事，不要靠撑宽窗口。
             var rowUrl = new StackPanel { Orientation = Orientation.Horizontal };
             rowUrl.Children.Add(MakeLabel("认证网址"));
+
+            // 已保存的网址，下拉选。像账号下拉那样 ——
+            // 学校认证页不止一个（宿舍/教学楼入口不同、运营商跳转目标不同），
+            // 存下来就不用每次手打完整 IP。
+            cmbUrl = new ComboBox
+            {
+                Width = 168,
+                Margin = new Thickness(0, 0, 8, 0),
+                Background = new SolidColorBrush(Theme.FieldBg),
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                BorderBrush = new SolidColorBrush(Theme.GlassBorder),
+                ToolTip = "选一个存过的认证网址。选完会自动填进右边的框并打开"
+            };
+            cmbUrl.SelectionChanged += delegate(object s, SelectionChangedEventArgs e)
+            {
+                if (_loadingUrlList) return;      // 装载下拉项时不当作"用户选了"
+                var item = cmbUrl.SelectedItem as ComboBoxItem;
+                if (item == null) return;
+                string u = item.Tag as string;
+                if (string.IsNullOrEmpty(u)) return;
+
+                txtUrl.Text = u;
+                Navigate(u, true);
+            };
+            rowUrl.Children.Add(cmbUrl);
+
             txtUrl = new TextBox
             {
-                Width = 580,
+                // 不写死宽度，让它把这一行剩下的空间都吃掉 ——
+                // 窗口拉宽，输入框跟着变宽，不会留一块空白。
+                MinWidth = 200,
                 Margin = new Thickness(0, 0, 8, 0),
                 Background = new SolidColorBrush(Theme.FieldBg),
                 Foreground = new SolidColorBrush(Theme.TextPrimary),
@@ -166,21 +299,62 @@ namespace CampusNetHelper
 
             var btnOpen = MainWindow.MakeGhostButton("打开", delegate() { Navigate(txtUrl.Text, true); });
             btnOpen.FontSize = 12;
+            btnOpen.Margin = new Thickness(0, 0, 8, 0);
             rowUrl.Children.Add(btnOpen);
+
+            // 「存到列表」：把当前框里的地址记下来，下次下拉就能直接选。
+            // 单独一个按钮而不是"自动存" —— 用户可能只是临时试试某个地址，
+            // 不该让每次导航都往清单里塞一条。
+            var btnSaveUrl = MainWindow.MakeGhostButton("存到列表", delegate() { SaveCurrentUrlToList(); });
+            btnSaveUrl.FontSize = 12;
+            btnSaveUrl.ToolTip = "把这个网址记下来，以后从左边下拉框直接选";
+            rowUrl.Children.Add(btnSaveUrl);
+
+            var btnDelUrl = MainWindow.MakeGhostButton("删除", delegate() { DeleteCurrentUrlFromList(); });
+            btnDelUrl.FontSize = 12;
+            btnDelUrl.Margin = new Thickness(6, 0, 0, 0);
+            btnDelUrl.ToolTip = "从下拉列表里删掉当前这个网址";
+            rowUrl.Children.Add(btnDelUrl);
+
+            Grid.SetRow(rowUrl, 0);
+            root.Children.Add(rowUrl);
+
+            // ---------- 第 1.5 行：功能按钮 ----------
+            // 用 WrapPanel 而不是 StackPanel：窗口被拉窄时按钮会**自动折到下一行**，
+            // 而不是被右边裁掉。这是"永远看得见所有功能键"的关键。
+            var rowTools = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+
+            // 字段档案排在第一个 —— 它是这一屏里最常用、也最能让用户搞明白"程序在填什么"的按钮。
+            var btnProfile = MainWindow.MakePrimaryButton("字段档案", OpenProfileEditor);
+            btnProfile.FontSize = 12;
+            btnProfile.Margin = new Thickness(0, 0, 8, 6);
+            btnProfile.ToolTip = "教程序认框：指定页面上每个输入框该填什么，存下来。页面框多的时候用它";
+            rowTools.Children.Add(btnProfile);
 
             var btnSys = MainWindow.MakeGhostButton("用系统浏览器打开", delegate()
             {
                 OpenInSystemBrowser(txtUrl.Text);
             });
             btnSys.FontSize = 12;
-            btnSys.Margin = new Thickness(8, 0, 0, 0);
-            rowUrl.Children.Add(btnSys);
+            btnSys.Margin = new Thickness(0, 0, 8, 6);
+            rowTools.Children.Add(btnSys);
 
-            Grid.SetRow(rowUrl, 0);
-            root.Children.Add(rowUrl);
+            // 调试用：把内嵌浏览器"看到的"页面结构导出到日志。
+            // 排查"明明有密码框，程序却说没找到"这类问题时，这是最直接的证据 ——
+            // 能一次看清 IE 内核拿到的到底是哪个文档、里面有哪些元素。
+            var btnDump = MainWindow.MakeGhostButton("导出页面结构", DumpPageStructure);
+            btnDump.FontSize = 12;
+            btnDump.Margin = new Thickness(0, 0, 8, 6);
+            btnDump.ToolTip = "把当前页面里所有表单元素写进日志，用于排查填表失效";
+            rowTools.Children.Add(btnDump);
 
-            // ---------- 第 2 行：账号 / 密码 ----------
-            var rowAcc = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+            Grid.SetRow(rowTools, 1);
+            root.Children.Add(rowTools);
+
+            // ---------- 第 3 行：账号 / 密码 ----------
+            // 也改成 WrapPanel：窗口窄的时候「填表并登录」按钮会折到下一行，
+            // 不会被挤出去看不见。
+            var rowAcc = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
             rowAcc.Children.Add(MakeLabel("账号"));
             // ⚠️ 不能设 IsEditable = true —— MainWindow.MakeDarkCombo 的自定义模板里
             // 没有 PART_EditableTextBox，可编辑模式下会渲染成一片空白（选中了也看不见）。
@@ -225,19 +399,41 @@ namespace CampusNetHelper
             btnLogin.Margin = new Thickness(16, 0, 0, 0);
             rowAcc.Children.Add(btnLogin);
 
-            Grid.SetRow(rowAcc, 1);
+            Grid.SetRow(rowAcc, 2);
             root.Children.Add(rowAcc);
 
-            // ---------- 第 3 行：状态 ----------
+            // ---------- 第 4 行：登录成功后自动关闭 ----------
+            var rowAuto = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
+            chkAutoClose = new CheckBox
+            {
+                Content = "登录成功后自动关闭本窗口",
+                IsChecked = false,
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            chkAutoClose.Checked += delegate(object s, RoutedEventArgs e) { ApplyAutoCloseToggle(true); };
+            chkAutoClose.Unchecked += delegate(object s, RoutedEventArgs e) { ApplyAutoCloseToggle(false); };
+            rowAuto.Children.Add(chkAutoClose);
+
+            var autoHint = MakeHint("（勾上后，检测到网络真的连通就自动关窗）");
+            autoHint.Margin = new Thickness(12, 0, 0, 0);
+            autoHint.VerticalAlignment = VerticalAlignment.Center;
+            rowAuto.Children.Add(autoHint);
+
+            Grid.SetRow(rowAuto, 3);
+            root.Children.Add(rowAuto);
+
+            // ---------- 第 5 行：状态 ----------
             var statusBox = new StackPanel { Margin = new Thickness(0, 8, 0, 8) };
             lblFound = MakeHint("");
             lblStatus = MakeHint("");
             statusBox.Children.Add(lblFound);
             statusBox.Children.Add(lblStatus);
-            Grid.SetRow(statusBox, 2);
+            Grid.SetRow(statusBox, 4);
             root.Children.Add(statusBox);
 
-            // ---------- 第 4 行：浏览器 ----------
+            // ---------- 第 6 行：浏览器 ----------
             browser = new System.Windows.Forms.WebBrowser();
             browser.ScriptErrorsSuppressed = true;
             browser.DocumentCompleted += OnDocumentCompleted;
@@ -259,7 +455,7 @@ namespace CampusNetHelper
                 BorderThickness = new Thickness(1),
                 Child = host
             };
-            Grid.SetRow(frame, 3);
+            Grid.SetRow(frame, 5);
             root.Children.Add(frame);
 
             Content = root;
@@ -295,8 +491,13 @@ namespace CampusNetHelper
 
         private void LoadFromOwner()
         {
+            // 升级上来时，先把旧版单独存的那个网址搬进清单 ——
+            // 用户不该因为升级就发现自己填过的地址不见了。
+            owner.MigrateLegacyUrl();
+
             string url = owner.WebAuthUrl();
             txtUrl.Text = url;
+            RefreshUrlList(url);
 
             // 下拉框里塞的是**账号名**，不是 Account 对象 ——
             // MainWindow.MakeDarkCombo 没有配数据显示模板，直接塞对象会显示成类名
@@ -318,8 +519,217 @@ namespace CampusNetHelper
             else if (string.IsNullOrEmpty(url))
             {
                 SetStatus("第一次用：把你们学校的认证网页地址填到上面，点「打开」。"
-                    + "地址填好后会自动记住，下次打开直接就能用。");
+                    + "地址填好后点「存到列表」，下次从左边下拉框直接选就行。");
             }
+        }
+
+        // ==================================================================
+        // 认证网址清单
+        // ==================================================================
+
+        /// <summary>
+        /// 重建网址下拉框。prefer 是要预选中的那条（一般是当前输入框里的网址）。
+        ///
+        /// ⚠️ 全程用 _loadingUrlList 屏蔽 SelectionChanged —— 否则"程序填下拉项"
+        ///    会被当成"用户选了"，触发一次多余的导航（还会把用户刚打的字冲掉）。
+        ///    这个坑在字段档案窗口里踩过一次，这里直接用同样的防法。
+        /// </summary>
+        private void RefreshUrlList(string prefer)
+        {
+            if (cmbUrl == null) return;
+
+            _loadingUrlList = true;
+            try
+            {
+                cmbUrl.Items.Clear();
+
+                List<WebUrlStore.Entry> all = owner.WebUrlsSnapshot();
+                if (all.Count == 0)
+                {
+                    cmbUrl.Items.Add(new ComboBoxItem
+                    {
+                        Content = "（还没有保存的网址）",
+                        IsEnabled = false,
+                        Tag = null
+                    });
+                    cmbUrl.SelectedIndex = 0;
+                    cmbUrl.IsEnabled = false;
+                    return;
+                }
+
+                cmbUrl.IsEnabled = true;
+
+                string wantKey = FieldProfileStore.NormalizeUrl(prefer);
+                ComboBoxItem selected = null;
+
+                foreach (WebUrlStore.Entry e in all)
+                {
+                    var item = new ComboBoxItem();
+                    item.Content = e.Display();
+                    item.Tag = e.Url;
+                    item.ToolTip = e.Url
+                        + (string.IsNullOrEmpty(e.LastUsed) ? "" : "\n最后使用：" + e.LastUsed);
+                    cmbUrl.Items.Add(item);
+
+                    if (selected == null && wantKey.Length > 0
+                        && string.Equals(FieldProfileStore.NormalizeUrl(e.Url), wantKey,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        selected = item;
+                    }
+                }
+
+                cmbUrl.SelectedItem = selected != null ? selected : cmbUrl.Items[0];
+            }
+            finally
+            {
+                _loadingUrlList = false;
+            }
+        }
+
+        /// <summary>把当前输入框里的网址存进清单。</summary>
+        private void SaveCurrentUrlToList()
+        {
+            string raw = (txtUrl.Text ?? "").Trim();
+            string clean = WebUrlStore.Clean(raw);
+            if (clean.Length == 0)
+            {
+                SetStatus("网址是空的，先填一个再存。");
+                return;
+            }
+
+            // 没名字就问一个 —— 可选，不给也能存，只是下拉里显示裸网址。
+            // 用输入框而不是弹窗：这个操作会反复做，弹窗太打断人。
+            string name = AskUrlName(clean);
+            if (name == null) return;   // 用户取消了
+
+            string msg;
+            if (!owner.SaveWebUrl(clean, name, out msg))
+            {
+                SetStatus(msg.Length > 0 ? msg : "保存失败。");
+                return;
+            }
+
+            txtUrl.Text = clean;
+            RefreshUrlList(clean);
+            SetStatus(string.IsNullOrEmpty(name)
+                ? "已存入网址列表（没起名字）。下次从左边下拉框直接选。"
+                : "已存入网址列表，名字是「" + name + "」。下次从左边下拉框直接选。");
+        }
+
+        /// <summary>从清单里删掉当前输入框里的网址。</summary>
+        private void DeleteCurrentUrlFromList()
+        {
+            string raw = (txtUrl.Text ?? "").Trim();
+            string clean = WebUrlStore.Clean(raw);
+            if (clean.Length == 0)
+            {
+                SetStatus("网址是空的，没得删。");
+                return;
+            }
+            if (!WebUrlStore.Contains(clean))
+            {
+                SetStatus("列表里没有这个网址，不用删。");
+                return;
+            }
+
+            MessageBoxResult r = MessageBox.Show(
+                "从网址列表里删掉这条？\n\n" + clean
+                + "\n\n（只影响列表，不影响你此刻正在用的这个地址）",
+                "校园网助手", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+            if (r != MessageBoxResult.OK) return;
+
+            string msg;
+            if (!owner.DeleteWebUrl(clean, out msg))
+            {
+                SetStatus(msg.Length > 0 ? msg : "删除失败。");
+                return;
+            }
+
+            RefreshUrlList(clean);
+            SetStatus("已从网址列表删掉：" + clean);
+        }
+
+        /// <summary>
+        /// 问一个"给这条网址起个名"，可留空。返回 null 表示用户点了取消。
+        ///
+        /// ⚠️ 用自定义窗口而不是 Microsoft.VisualBasic.Interaction.InputBox：
+        ///    后者要引 VisualBasic 程序集，而本项目是 csc 单文件编译，
+        ///    为了一个改名框去加程序集引用不划算。
+        /// </summary>
+        private string AskUrlName(string url)
+        {
+            var dlg = new Window
+            {
+                Title = "给这个网址起个名字",
+                Width = 420,
+                Height = 190,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                ResizeMode = ResizeMode.NoResize,
+                Background = new SolidColorBrush(Theme.WindowBg)
+            };
+
+            var grid = new Grid { Margin = new Thickness(16) };
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var tip = new TextBlock
+            {
+                Text = "起个名字方便认（比如「宿舍」「教学楼」）。\n留空也行，列表里就直接显示网址。",
+                FontSize = 12,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = new SolidColorBrush(Theme.TextMuted)
+            };
+            Grid.SetRow(tip, 0);
+            grid.Children.Add(tip);
+
+            var box = new TextBox
+            {
+                Margin = new Thickness(0, 10, 0, 0),
+                Padding = new Thickness(8, 6, 8, 6),
+                Background = new SolidColorBrush(Theme.FieldBg),
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                BorderBrush = new SolidColorBrush(Theme.GlassBorder),
+                BorderThickness = new Thickness(1),
+                CaretBrush = new SolidColorBrush(Theme.TextPrimary)
+            };
+            Grid.SetRow(box, 1);
+            grid.Children.Add(box);
+
+            string result = null;
+
+            var btnRow = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 10, 0, 0)
+            };
+            var btnOk = MainWindow.MakePrimaryButton("存", delegate()
+            {
+                result = (box.Text ?? "").Trim();
+                dlg.DialogResult = true;
+                dlg.Close();
+            });
+            btnOk.MinWidth = 76;
+            var btnCancel = MainWindow.MakeGhostButton("取消", delegate()
+            {
+                dlg.DialogResult = false;
+                dlg.Close();
+            });
+            btnCancel.MinWidth = 76;
+            btnCancel.Margin = new Thickness(8, 0, 0, 0);
+            btnRow.Children.Add(btnOk);
+            btnRow.Children.Add(btnCancel);
+            Grid.SetRow(btnRow, 2);
+            grid.Children.Add(btnRow);
+
+            dlg.Content = grid;
+            dlg.Loaded += delegate(object s, RoutedEventArgs e) { box.Focus(); };
+
+            bool? ok = dlg.ShowDialog();
+            return ok == true ? result : null;
         }
 
         private ConfigStore.Account SelectedAccount()
@@ -341,8 +751,113 @@ namespace CampusNetHelper
             if (lblStatus != null) lblStatus.Text = text;
         }
 
-        private static void OpenInSystemBrowser(string url)
+        // ==================================================================
+        // 调试：导出内嵌浏览器看到的页面结构
+        // ==================================================================
+
+        /// <summary>
+        /// 把当前页面（主文档 + 各 iframe）里所有元素的标签、type、name、id 写进日志。
+        ///
+        /// 为什么需要这个按钮：
+        ///   现象是"页面上明明有密码框，程序却报没有密码框"。
+        ///   这类问题光看截图分不清三种可能 ——
+        ///     ① 表单在 iframe 里，主文档只是个空壳；
+        ///     ② IE 内核把文档解析成了别的结构（比如 ASP.NET 的怪癖）；
+        ///     ③ 元素是 JS 后插进来的，枚举时还没渲染。
+        ///   把 IE 内核**实际看到的东西**原样倒出来，一眼就能分辨。
+        /// </summary>
+        private void DumpPageStructure()
         {
+            try
+            {
+                Log.Info("========== 页面结构导出 开始 ==========");
+
+                WinForms.HtmlDocument main = browser.Document;
+                if (main == null)
+                {
+                    Log.Info("页面结构导出：browser.Document == null（页面可能还没开始加载）");
+                    SetStatus("页面还没加载好，等页面出来再点「导出页面结构」。");
+                    return;
+                }
+
+                Log.Info("主文档 URL = " + Safe(() => main.Url == null ? "(null)" : main.Url.ToString()));
+                Log.Info("浏览器 ReadyState = " + browser.ReadyState);
+
+                List<WinForms.HtmlDocument> docs = CollectDocuments();
+                Log.Info("可访问文档数 = " + docs.Count);
+
+                for (int di = 0; di < docs.Count; di++)
+                {
+                    WinForms.HtmlDocument doc = docs[di];
+                    string docUrl = Safe(() => doc.Url == null ? "(null)" : doc.Url.ToString());
+                    Log.Info("---- 文档 [" + di + "] " + docUrl + " ----");
+
+                    List<WinForms.HtmlElement> all = All(doc);
+                    Log.Info("文档 [" + di + "] 元素总数 = " + all.Count);
+
+                    // iframe 情况单列 —— 跨域 iframe 的 Document 取不到，会体现在这里
+                    string framesInfo = "";
+                    try
+                    {
+                        int fc = 0;
+                        foreach (WinForms.HtmlWindow w in doc.Window.Frames)
+                        {
+                            fc++;
+                            string fu = "(取不到)";
+                            try { if (w.Document != null && w.Document.Url != null) fu = w.Document.Url.ToString(); }
+                            catch { }
+                            framesInfo += "\n    frame[" + fc + "] " + fu;
+                        }
+                        if (fc == 0) framesInfo = " (无)";
+                    }
+                    catch (Exception ex) { framesInfo = " (枚举失败: " + ex.Message + ")"; }
+                    Log.Info("文档 [" + di + "] frames:" + framesInfo);
+
+                    // 逐个元素：只记表单相关的，避免日志爆炸
+                    int idx = 0;
+                    foreach (WinForms.HtmlElement el in all)
+                    {
+                        string tag = TagOf(el);
+                        if (tag != "input" && tag != "select" && tag != "textarea"
+                            && tag != "button" && tag != "form" && tag != "img") continue;
+                        if (idx++ > 60) { Log.Info("  ...(元素过多，已截断)"); break; }
+
+                        string type = AttrOf(el, "type");
+                        string name = AttrOf(el, "name");
+                        string id = AttrOf(el, "id");
+                        string val = AttrOf(el, "value");
+                        string src = AttrOf(el, "src");
+                        string dis = AttrOf(el, "disabled");
+
+                        Log.Info("    <" + tag
+                            + (type.Length > 0 ? " type=" + type : "")
+                            + (name.Length > 0 ? " name=" + name : "")
+                            + (id.Length > 0 ? " id=" + id : "")
+                            + " valueLen=" + val.Length
+                            + (src.Length > 0 ? " src=" + src : "")
+                            + (dis.Length > 0 ? " disabled=" + dis : "")
+                            + ">");
+                    }
+                }
+
+                Log.Info("========== 页面结构导出 结束 ==========");
+                SetStatus("页面结构已导出到日志。把「配置与日志目录」里的日志发我看一下。");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("页面结构导出失败: " + ex.Message);
+                SetStatus("导出失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>跑一段可能抛异常、但只想拿值的取值表达式。</summary>
+        private static string Safe(Func<string> f)
+        {
+            try { return f(); }
+            catch (Exception ex) { return "(异常: " + ex.Message + ")"; }
+        }
+
+        private static void OpenInSystemBrowser(string url)        {
             if (string.IsNullOrEmpty(url)) return;
             if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                 && !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -357,6 +872,47 @@ namespace CampusNetHelper
         // 导航与填表
         // ==================================================================
 
+        /// <summary>
+        /// 让下拉框的选中项跟当前网址对上（只改选中，不触发导航）。
+        /// 网址不在清单里的话，把选中清成"无"而不是随便选一个 ——
+        /// 否则下拉框会显示一个跟输入框内容不符的条目，看着像 bug。
+        /// </summary>
+        private void SyncUrlComboSelection(string url)
+        {
+            if (cmbUrl == null) return;
+
+            string want = FieldProfileStore.NormalizeUrl(url);
+            if (want.Length == 0) return;
+
+            _loadingUrlList = true;
+            try
+            {
+                ComboBoxItem hit = null;
+                foreach (object o in cmbUrl.Items)
+                {
+                    var item = o as ComboBoxItem;
+                    if (item == null) continue;
+                    string u = item.Tag as string;
+                    if (u == null) continue;
+                    if (string.Equals(FieldProfileStore.NormalizeUrl(u), want,
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        hit = item;
+                        break;
+                    }
+                }
+                if (hit != null) cmbUrl.SelectedItem = hit;
+            }
+            finally
+            {
+                _loadingUrlList = false;
+            }
+        }
+
+        /// <summary>
+        /// 刷新"最近用过"的时间戳，供主页下次选默认值。
+        /// 用 owner 的方法而不是直接写清单 —— 顺手也会同步旧设置项。
+        /// </summary>
         private void Navigate(string rawUrl, bool saveIt)
         {
             string url = (rawUrl ?? "").Trim();
@@ -374,7 +930,12 @@ namespace CampusNetHelper
 
             if (saveIt) owner.SaveWebAuthUrl(url);
 
+            // 下拉框如果开着且选的正不是这条，把它对齐过来 ——
+            // 用户手打了一个列表里已有的地址时，下拉框不该还停在别处。
+            SyncUrlComboSelection(url);
+
             _autoDoneThisLoad = false;
+            _submittedThisLoad = false;
             _loadToken++;
             SetStatus("正在打开认证页…");
             if (lblFound != null) lblFound.Text = "";
@@ -408,10 +969,22 @@ namespace CampusNetHelper
                     }
                     _retryLeft--;
                     if (chkAuto == null || chkAuto.IsChecked != true) return;
+
+                    // ⚠️ 只在页面**加载完成之后**才动手。
+                    // IE 内核在导航过程中会存在一个"文档对象已经建好、但表单还没解析出来"
+                    // 的中间态 —— 那时候枚举 DOM 拿到的是半成品（实测元素数 121，而加载完成后
+                    // 是 90）。这份中间态里没有 password 框，于是每次重试都报"没找到密码框"，
+                    // 白耗 6 次机会。等 ReadyState=Complete 才是真正的页面。
+                    try
+                    {
+                        if (browser.ReadyState != System.Windows.Forms.WebBrowserReadyState.Complete) return;
+                    }
+                    catch { return; }
+
                     if (TryAutoFillAndSubmit(true)) _autoDoneThisLoad = true;
                 };
             }
-            _retryLeft = 6;
+            _retryLeft = 12;   // 页面加载慢时给足机会（每次都会先检查 ReadyState，加载中不算数）
             _retryTimer.Start();
         }
 
@@ -425,6 +998,10 @@ namespace CampusNetHelper
             // 如果在那一次就把"本轮已处理"标志置上，真正的认证页反而会被跳过 ——
             // 之前的版本就是这么失败的（页面上明明有密码框，却报"没找到"）。
             if (e.Url.ToString().StartsWith("about:", StringComparison.OrdinalIgnoreCase)) return;
+
+            // 每次文档加载完都刷一下页面上「登录成功自动关闭」那个勾选框的实际状态，
+            // 让界面和配置保持一致。
+            SyncAutoCloseCheckbox();
 
             if (_autoDoneThisLoad) return;
 
@@ -444,9 +1021,540 @@ namespace CampusNetHelper
         }
 
         /// <summary>
+        /// 开机自启场景专用的"登录成功即关闭"守护。
+        ///
+        /// 为什么需要单独一个：网页认证页有验证码，程序不会自动提交 ——
+        /// 用户是自己点页面上的「登录」按钮提交的，那时候 AfterSubmit() 根本没被调用。
+        /// 所以这里起一个轻量轮询，只要发现"网通了 + 本窗口还开着"就自己退出。
+        ///
+        /// ⚠️ 只在这个窗口是"开机自启弹出来的"（_startupAutoClose）时才启动，
+        ///    手动打开的窗口绝不自作主张关闭。
+        /// </summary>
+        private void StartAutoCloseGuard()
+        {
+            // 开机自启 或 自动重连 —— 这两种都是"程序自己开的窗口"，
+            // 连上之后都该自己消失。用户手动开的窗口绝不自作主张关闭。
+            if (!_startupAutoClose && !_reauthMode) return;
+
+            Thread t = new Thread(delegate()
+            {
+                // 最多看 5 分钟：太短会让"用户磨蹭着打验证码"的场景失效，
+                // 太长又会变成一个常驻线程。5 分钟足够填个验证码了。
+                int rounds = 100;   // 100 × 3s = 300s
+                for (int i = 0; i < rounds; i++)
+                {
+                    Thread.Sleep(3000);
+
+                    // 用严格判定：认证前网关返回的 302 劫持页不算"通"。
+                    // 旧版用 ProbeInternet（收到任何响应都算通），没认证时也会误判成功。
+                    // ⚠️ 2026-09-30：改成调 NetProbe（与主页共用一个判据）。
+                    //    原先这里自己抄了一份 ProbeInternetStrict，两处判定一旦不同步，
+                    //    就会出现"认证窗口说成功了，主页还显示尚未连接"这种互相打脸。
+                    bool netOk = NetProbe.Online(true);   // 这里必须穿透缓存要一个实时答案
+                    if (!netOk) continue;
+
+                    Dispatcher.Invoke(new Action(delegate()
+                    {
+                        SetStatus("网络已连通 —— 认证成功，窗口即将自动关闭。");
+                        NotifyOwnerOnline();
+                    }));
+                    Thread.Sleep(1200);   // 让上面那句话能被看见
+                    try { Dispatcher.Invoke(new Action(delegate() { Close(); })); }
+                    catch { }
+                    return;
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // ==================================================================
+        // 字段档案：扫描页面 + 按档案填写
+        // ==================================================================
+
+        /// <summary>页面上扫到的字段（供字段档案窗口显示 / 编辑）。</summary>
+        internal List<FieldProfileStore.FieldProfile> ScanFields()
+        {
+            List<WinForms.HtmlElement> all = AllOfMainDocument();
+            return BuildScanList(all);
+        }
+
+        /// <summary>档案保存后调用：清掉本轮的填写标记，让下次重试按新档案来。</summary>
+        internal void OnProfileSaved()
+        {
+            _autoDoneThisLoad = false;
+            _submittedThisLoad = false;
+            SetStatus("字段档案已保存 —— 点「填表并登录」按新档案填一次。");
+            Log.Info("字段档案已保存，等待重新填表");
+        }
+
+        /// <summary>打开字段档案窗口。没扫到框就先提示。</summary>
+        private void OpenProfileEditor()
+        {
+            List<WinForms.HtmlElement> all = AllOfMainDocument();
+            List<FieldProfileStore.FieldProfile> scanned = BuildScanList(all);
+
+            if (scanned.Count == 0)
+            {
+                MessageBox.Show(
+                    "还没扫到输入框。\n\n先点「打开」把认证页显示出来，"
+                    + "确认页面上能看到账号密码框了，再来点「字段档案」。",
+                    "字段档案", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            owner.OpenFieldProfileWindow(NormalizedPageUrl(), scanned);
+        }
+
+        /// <summary>当前页面用于匹配档案的规范化网址。</summary>
+        private string NormalizedPageUrl()
+        {
+            // 优先用浏览器里真实的地址（可能已经跳到 /login 之类），
+            // 拿不到再退回输入框里那个。
+            try
+            {
+                WinForms.HtmlDocument d = browser.Document;
+                if (d != null && d.Url != null)
+                {
+                    string u = d.Url.ToString();
+                    if (u.StartsWith("http", StringComparison.OrdinalIgnoreCase)) return u;
+                }
+            }
+            catch { }
+            return txtUrl.Text;
+        }
+
+        /// <summary>
+        /// 把页面上的输入控件整理成一份可编辑的字段清单。
+        ///
+        /// 标签文字怎么来的（按可靠性依次尝试）：
+        ///   ① 同一个 &lt;label for="id"&gt; 的文字
+        ///   ② 包着这个输入框的 &lt;td&gt; / &lt;div&gt; / &lt;p&gt; 里、除输入框之外的那点文字
+        ///      （ASP.NET 那种 table 版式的登录页，标签就是同一格里的文字）
+        ///   ③ 输入框自己的 placeholder / title
+        ///   ④ 附近的文字节点
+        /// 四个都拿不到就留空 —— 界面上会退化成显示 name/id，用户照样能认出来。
+        /// </summary>
+        private List<FieldProfileStore.FieldProfile> BuildScanList(List<WinForms.HtmlElement> all)
+        {
+            var result = new List<FieldProfileStore.FieldProfile>();
+            if (all == null) return result;
+
+            // 先把标签索引建好：id → 标签文字
+            var labelById = new Dictionary<string, string>();
+            foreach (WinForms.HtmlElement el in all)
+            {
+                if (TagOf(el) != "label") continue;
+                string forId = AttrOf(el, "for");
+                if (forId.Length == 0) continue;
+                string t = CleanText(SafeInner(el));
+                if (t.Length > 0 && !labelById.ContainsKey(forId.ToLowerInvariant()))
+                    labelById[forId.ToLowerInvariant()] = t;
+            }
+
+            int idx = 0;
+            foreach (WinForms.HtmlElement el in all)
+            {
+                string tag = TagOf(el);
+                if (tag != "input" && tag != "select" && tag != "textarea") continue;
+
+                string type = AttrOf(el, "type").ToLowerInvariant();
+                // 隐藏域 / 提交按钮 / 文件框不是"要填的字段"
+                if (type == "hidden" || type == "submit" || type == "button"
+                    || type == "image" || type == "reset" || type == "file") continue;
+
+                var f = new FieldProfileStore.FieldProfile();
+                f.Name = AttrOf(el, "name");
+                f.Id = AttrOf(el, "id");
+                f.Index = idx++;
+
+                // ---- 标签文字 ----
+                string label = "";
+                if (f.Id.Length > 0)
+                {
+                    string k = f.Id.ToLowerInvariant();
+                    if (labelById.ContainsKey(k)) label = labelById[k];
+                }
+                if (label.Length == 0) label = NearestText(all, el);
+                if (label.Length == 0) label = AttrOf(el, "placeholder");
+                if (label.Length == 0) label = AttrOf(el, "title");
+
+                f.Label = CleanText(label);
+                if (f.Label.Length > 20) f.Label = f.Label.Substring(0, 20);
+
+                // ---- 猜一个默认类型（用户可在档案窗口改） ----
+                string blob = (f.Label + " " + f.Name + " " + f.Id + " " + AttrOf(el, "placeholder")).ToLowerInvariant();
+
+                if (type == "password" || LooksLikePwd(blob))
+                {
+                    f.Kind = FieldProfileStore.KindAccount;
+                    f.AccountField = "password";
+                }
+                else if (LooksLikeCaptcha(blob))
+                {
+                    f.Kind = FieldProfileStore.KindCaptcha;
+                }
+                else if (LooksLikeIdentity(blob))
+                {
+                    f.Kind = FieldProfileStore.KindAccount;
+                    f.AccountField = "user2";
+                }
+                else if (LooksLikeIsp(blob))
+                {
+                    // 运营商/ISP 这类：默认交还给页面自己的默认值，别乱填
+                    f.Kind = FieldProfileStore.KindIgnore;
+                }
+                else if (LooksLikeAccount(blob))
+                {
+                    f.Kind = FieldProfileStore.KindAccount;
+                    f.AccountField = "user";
+                }
+                else
+                {
+                    // 认不出来的文本框：默认不管它 —— 宁可少填，也不要填错框
+                    f.Kind = FieldProfileStore.KindIgnore;
+                }
+
+                if (tag != "input") f.Kind = FieldProfileStore.KindFixed;   // select / textarea 用固定值
+                result.Add(f);
+            }
+
+            // 如果扫出来的框里**一个账号框都没有**，把第一个普通文本框兜底当账号框 ——
+            // 否则用户打开档案会看到一个全"不填"的清单，不知道该改哪里。
+            bool hasAccount = false;
+            foreach (FieldProfileStore.FieldProfile f in result)
+            {
+                if (f.Kind == FieldProfileStore.KindAccount && f.AccountField == "user") hasAccount = true;
+            }
+            if (!hasAccount)
+            {
+                foreach (FieldProfileStore.FieldProfile f in result)
+                {
+                    if (f.Kind == FieldProfileStore.KindIgnore) { f.Kind = FieldProfileStore.KindAccount; f.AccountField = "user"; hasAccount = true; break; }
+                }
+            }
+            if (!hasAccount && result.Count > 1)
+            {
+                // 连一个可当账号的都没有，就把第一个非密码框顶上
+                foreach (FieldProfileStore.FieldProfile f in result)
+                {
+                    if (f.AccountField != "password" && f.Kind != FieldProfileStore.KindCaptcha)
+                    {
+                        f.Kind = FieldProfileStore.KindAccount; f.AccountField = "user"; break;
+                    }
+                }
+            }
+            return result;
+        }
+
+        private static string SafeInner(WinForms.HtmlElement el)
+        {
+            try { return el.InnerText ?? ""; } catch { return ""; }
+        }
+
+        private static string CleanText(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in s)
+            {
+                if (c == '\r' || c == '\n' || c == '\t') { if (sb.Length > 0 && sb[sb.Length - 1] != ' ') sb.Append(' '); continue; }
+                sb.Append(c);
+            }
+            string r = sb.ToString().Trim();
+            while (r.IndexOf("  ", StringComparison.Ordinal) >= 0) r = r.Replace("  ", " ");
+            return r;
+        }
+
+        /// <summary>
+        /// 输入框"挨着的那点文字"。
+        ///
+        /// 做法：从输入框出发往上走最多 4 层，在每一层里找**文字节点**，
+        /// 取第一个像标签的（不含输入框内容、长度合理）。
+        /// ASP.NET 的 table 版式登录页，标签就是同一格里的文字，这样能捞到；
+        /// 捞不到就返回空，不会硬编一个假标签出来。
+        /// </summary>
+        private static string NearestText(List<WinForms.HtmlElement> all, WinForms.HtmlElement el)
+        {
+            try
+            {
+                WinForms.HtmlElement cur = el;
+                for (int depth = 0; depth < 4 && cur != null; depth++)
+                {
+                    WinForms.HtmlElement parent = null;
+                    try { parent = cur.Parent; } catch { }
+                    if (parent == null) break;
+
+                    string t = FirstTextNode(parent, el);
+                    if (t.Length > 0) return t;
+                    cur = parent;
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>在容器里找第一个像"标签文字"的直接文字节点（跳过输入框自身）。</summary>
+        private static string FirstTextNode(WinForms.HtmlElement container, WinForms.HtmlElement skip)
+        {
+            try
+            {
+                WinForms.HtmlElementCollection kids = container.Children;
+                if (kids == null) return "";
+                // 只扫直接子节点里的文字节点；文本常挂在 span/label 上，也一并认
+                foreach (WinForms.HtmlElement kid in kids)
+                {
+                    if (kid == skip) continue;
+                    string tag = TagOf(kid);
+                    if (tag == "input" || tag == "select" || tag == "textarea" || tag == "script" || tag == "style") continue;
+
+                    string inner = SafeInner(kid);
+                    string clean = CleanText(inner);
+                    if (clean.Length == 0) continue;
+
+                    // 一个容器里塞了太多字（多半是整段说明而不是标签）就跳过
+                    if (clean.Length > 20) continue;
+                    // 里面还有输入框的，说明是更大的容器，不算标签
+                    bool hasInput = false;
+                    try
+                    {
+                        foreach (WinForms.HtmlElement kk in kid.Children)
+                        {
+                            string kt = TagOf(kk);
+                            if (kt == "input" || kt == "select" || kt == "textarea") { hasInput = true; break; }
+                        }
+                    }
+                    catch { }
+                    if (hasInput) continue;
+
+                    return clean;
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        private static bool LooksLikePwd(string blob)
+        {
+            return blob.IndexOf("pwd", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("pass", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("密码", StringComparison.Ordinal) >= 0;
+        }
+
+        private static bool LooksLikeCaptcha(string blob)
+        {
+            return blob.IndexOf("captcha", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("checkcode", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("verifycode", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("验证码", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("textboxcc", StringComparison.Ordinal) >= 0;
+        }
+
+        private static bool LooksLikeIdentity(string blob)
+        {
+            return blob.IndexOf("guitid", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("student", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("stuid", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("stuno", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("学工号", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("学号", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("工号", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("identity", StringComparison.Ordinal) >= 0;
+        }
+
+        private static bool LooksLikeIsp(string blob)
+        {
+            return blob.IndexOf("isp", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("运营商", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("operator", StringComparison.Ordinal) >= 0;
+        }
+
+        private static bool LooksLikeAccount(string blob)
+        {
+            return blob.IndexOf("ssoacc", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("account", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("username", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("userid", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("user", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("账号", StringComparison.Ordinal) >= 0
+                || blob.IndexOf("用户名", StringComparison.Ordinal) >= 0;
+        }
+
+        /// <summary>只取主文档的元素（档案填写不走 iframe，避免填错区域）。</summary>
+        private List<WinForms.HtmlElement> AllOfMainDocument()
+        {
+            try
+            {
+                WinForms.HtmlDocument d = browser.Document;
+                if (d == null) return new List<WinForms.HtmlElement>();
+                return All(d);
+            }
+            catch { return new List<WinForms.HtmlElement>(); }
+        }
+
+        /// <summary>页面上有没有图形验证码（按元素属性判断，供档案填写路径复用）。</summary>
+        private static bool PageHasCaptcha(List<WinForms.HtmlElement> all)
+        {
+            return HasCaptcha(all);
+        }
+
+        /// <summary>
+        /// 按字段档案填表。
+        ///
+        /// 返回 true = 档案命中并处理过（不管提交成没成功）。
+        /// 返回 false = 这个网址没有档案（或档案里一个可用字段都没有）。
+        ///
+        /// 匹配顺序（属性 → 标签 → 顺序）见 FieldProfileStore 的注释。
+        /// </summary>
+        private bool FillByProfile(List<WinForms.HtmlElement> all, string url, bool auto)
+        {
+            FieldProfileStore.Profile profile = FieldProfileStore.GetForUrl(url);
+            if (profile == null || profile.Fields.Count == 0) return false;
+
+            ConfigStore.Account acc = SelectedAccount();
+            int filled = 0;
+            var done = new List<string>();
+
+            foreach (FieldProfileStore.FieldProfile f in profile.Fields)
+            {
+                if (!f.Enabled) continue;
+
+                // 验证码：只登记，不填
+                if (f.Kind == FieldProfileStore.KindCaptcha) { done.Add("验证码（你填）"); continue; }
+                if (f.Kind == FieldProfileStore.KindIgnore) continue;
+
+                string value = FieldProfileStore.ResolveValue(f, acc);
+                if (value == null || value.Length == 0) continue;
+
+                WinForms.HtmlElement el = MatchField(all, f);
+                if (el == null)
+                {
+                    Log.Info("字段档案：没在页面上找到字段「" + f.Label + "」（name=" + f.Name + " id=" + f.Id + "）");
+                    continue;
+                }
+
+                SetValue(el, value);
+                filled++;
+                done.Add((f.Label.Length > 0 ? f.Label : f.Id) + " = " + MaskForLog(f, value));
+            }
+
+            if (filled == 0)
+            {
+                Log.Info("字段档案命中（" + profile.Url + "）但一个字段都没填上 —— 页面结构可能变了");
+                SetStatus("这个网址有字段档案，但一个框都没对上 —— 页面可能改版了，重新扫一次档案吧。");
+                return true;
+            }
+
+            Log.Info("字段档案填表：" + string.Join("、", done.ToArray()));
+            ClearFieldErrors(all);
+
+            // 页面上有验证码就"填好 + 提交一次"，让表单活起来（见 TryAutoFillAndSubmit 里的说明）
+            bool hasCc = PageHasCaptcha(all);
+            if (hasCc && !_submittedThisLoad)
+            {
+                _submittedThisLoad = true;
+                SubmitFirstForm(all);
+            }
+
+            if (lblFound != null)
+            {
+                lblFound.Text = "档案命中：「" + profile.Url + "」已填 " + filled + " 项 —— "
+                    + string.Join("、", done.ToArray());
+            }
+
+            if (hasCc)
+            {
+                SetStatus("档案已生效 —— 上面几项都填好了。验证码需要你自己看一眼填进去，然后点页面上的「登录」。");
+                return true;
+            }
+
+            WinForms.HtmlElement submit = FindSubmit(all);
+            if (submit == null)
+            {
+                SetStatus("档案已生效，但没找到「登录」按钮 —— 请手动点一下页面上的登录。");
+                return true;
+            }
+
+            SetStatus("档案已生效，正在提交…");
+            ClickElement(submit);
+            AfterSubmit();
+            return true;
+        }
+
+        private static string MaskForLog(FieldProfileStore.FieldProfile f, string v)
+        {
+            if (string.Equals(f.AccountField, "password", StringComparison.OrdinalIgnoreCase)) return "••••••";
+            return v;
+        }
+
+        /// <summary>按档案把一个字段对到页面上的元素：属性 → 标签 → 顺序。</summary>
+        private static WinForms.HtmlElement MatchField(List<WinForms.HtmlElement> all, FieldProfileStore.FieldProfile f)
+        {
+            var candidates = new List<WinForms.HtmlElement>();
+            foreach (WinForms.HtmlElement el in all)
+            {
+                string tag = TagOf(el);
+                if (tag != "input" && tag != "select" && tag != "textarea") continue;
+                string type = AttrOf(el, "type").ToLowerInvariant();
+                if (type == "hidden" || type == "submit" || type == "button"
+                    || type == "image" || type == "reset" || type == "file") continue;
+                if (IsDisabled(el)) continue;
+                candidates.Add(el);
+            }
+
+            // ① 按 name / id 精确匹配
+            if (!string.IsNullOrEmpty(f.Id))
+            {
+                foreach (WinForms.HtmlElement el in candidates)
+                {
+                    if (!string.IsNullOrEmpty(AttrOf(el, "id"))
+                        && string.Equals(AttrOf(el, "id"), f.Id, StringComparison.OrdinalIgnoreCase)) return el;
+                }
+            }
+            if (!string.IsNullOrEmpty(f.Name))
+            {
+                foreach (WinForms.HtmlElement el in candidates)
+                {
+                    if (!string.IsNullOrEmpty(AttrOf(el, "name"))
+                        && string.Equals(AttrOf(el, "name"), f.Name, StringComparison.OrdinalIgnoreCase)) return el;
+                }
+            }
+
+            // ② 按扫描时记下的顺序（最可靠的兜底 —— 同一个页面顺序不会变）
+            if (f.Index >= 0 && f.Index < candidates.Count)
+            {
+                WinForms.HtmlElement el = candidates[f.Index];
+                string id = AttrOf(el, "id");
+                string name = AttrOf(el, "name");
+                // 顺序位置上的元素 name/id 要能对上（都为空也算"对得上"，有些页面就没有）
+                bool ok = true;
+                if (!string.IsNullOrEmpty(f.Id) && !string.IsNullOrEmpty(id)
+                    && !string.Equals(id, f.Id, StringComparison.OrdinalIgnoreCase)) ok = false;
+                if (!ok && !string.IsNullOrEmpty(f.Name) && !string.IsNullOrEmpty(name)
+                    && !string.Equals(name, f.Name, StringComparison.OrdinalIgnoreCase)) ok = false;
+                if (ok) return el;
+            }
+
+            return null;
+        }
+
+        /// <summary>提交页面上的第一个表单（没指定具体控件时用）。</summary>
+        private static void SubmitFirstForm(List<WinForms.HtmlElement> all)
+        {
+            foreach (WinForms.HtmlElement el in all)
+            {
+                if (TagOf(el) != "form") continue;
+                SubmitForm(el);
+                return;
+            }
+        }
+
+        /// <summary>
         /// 通用启发式填表：不针对任何一所学校，靠页面结构推断。
         /// 找不到就明确告诉用户，不做危险操作。
         /// 返回 true = 这次真的找到了密码框并处理过（不管成没成功提交）。
+        ///
+        /// ⚠️ 有字段档案时**优先走档案** —— 用户亲手教过的，比任何启发式都准。
         /// </summary>
         private bool TryAutoFillAndSubmit(bool auto)
         {
@@ -465,8 +1573,35 @@ namespace CampusNetHelper
                 if (!auto) SetStatus("页面还没加载好，稍等一下再点。");
                 return false;
             }
-            Log.Info("认证页填表：可访问文档 " + docs.Count + " 个");
+            // ⚠️ 这条也**每轮加载只记一次**。
+            //    它比下面那条「没有密码框」刷得还凶 —— 补填定时器每 1.2 秒来一次、
+            //    每轮最多 12 次，实测 2026-09-30 一天占了整个日志的 **27.2%（169/622 行）**，
+            //    是全部日志里最吵的一条（同一秒里最多连着写 6 遍）。
+            //    文档个数在一轮加载内不会变，记一遍足够。
+            if (_noPwdLoggedToken != _loadToken)
+            {
+                Log.Info("认证页填表：可访问文档 " + docs.Count + " 个");
+            }
 
+            // ① 优先用字段档案（用户亲手教的，最准）
+            try
+            {
+                if (FieldProfileStore.HasForUrl(NormalizedPageUrl()))
+                {
+                    if (FillByProfile(AllOfMainDocument(), NormalizedPageUrl(), auto))
+                    {
+                        _autoDoneThisLoad = true;
+                        return true;
+                    }
+                    Log.Info("字段档案存在但对不上，回退到启发式识别");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("按档案填表失败，回退到启发式: " + ex.Message);
+            }
+
+            // ② 没有档案 / 档案没命中 → 老启发式
             foreach (WinForms.HtmlDocument doc in docs)
             {
                 // ⚠️ 只枚举一次 DOM。WinForms.HtmlElement 是 COM 包装对象，每枚举一次都会新建一批，
@@ -477,8 +1612,18 @@ namespace CampusNetHelper
                 if (pw == null)
                 {
                     // 记下来 —— 用户报"填不上"时，这条日志能直接分清是
-                    // "页面还没渲染" / "结构不认识" / "在跨域 iframe 里"
-                    Log.Info("认证页填表：这个文档里没有密码框 —— " + DescribeDoc(all));
+                    // "页面还没渲染" / "结构不认识" / "在跨域 iframe 里"。
+                    //
+                    // ⚠️ 但**每轮加载只记一次**。
+                    //    这条原先是无条件写的，而补填定时器每 1.2 秒重试一次、一轮最多 12 次，
+                    //    加上 DocumentCompleted 也会调一次 —— 实测一天下来这条占了整个日志的
+                    //    **17.9%（108/604 行）**，真正的信息被淹掉了（2026-09-30 冒烟测试发现）。
+                    //    诊断信息重复 12 遍不会让它更有用，只会把别的线索挤没。
+                    if (_noPwdLoggedToken != _loadToken)
+                    {
+                        _noPwdLoggedToken = _loadToken;
+                        Log.Info("认证页填表：这个文档里没有密码框 —— " + DescribeDoc(all));
+                    }
                     continue;
                 }
 
@@ -491,6 +1636,18 @@ namespace CampusNetHelper
 
                 SetValue(us, user);
                 SetValue(pw, pass);
+                // 页面给了提示（"请输入用户名/密码"这类）就清掉，免得看着像还没填
+                ClearFieldErrors(all);
+
+                // 附加账号（学工号）—— 只有页面上确实存在第二个"身份号"输入框，且有值时才填。
+                // 这是后加的，老账号没填 User2，这里会跳过，不影响原有行为。
+                string user2 = GetUser2();
+                WinForms.HtmlElement us2 = null;
+                if (user2.Length > 0)
+                {
+                    us2 = FindSecondUserInput(all, us, pw);
+                    if (us2 != null) SetValue(us2, user2);
+                }
 
                 WinForms.HtmlElement submit = FindSubmit(all);
 
@@ -499,12 +1656,23 @@ namespace CampusNetHelper
                 // 反复失败可能直接把账号锁一段时间。宁可让用户自己点一下。
                 if (HasCaptcha(all))
                 {
-                    SetStatus("这个页面有图形验证码 —— 账号密码已经帮你填好了，"
+                    // 光填进去不够 —— ASP.NET WebForms 的验证码是服务端生成的，
+                    // 必须把表单**提交**给服务器才能校验。所以：填好 ➜ 按一下回车触发一次提交，
+                    // 服务器返回"验证码错误!"。这样既不绕过验证码（还是得人来填），
+                    // 又让用户填完验证码直接在页面上点「登录」就能过 —— 不会卡在"必须先提交一次"。
+                    if (!_submittedThisLoad)
+                    {
+                        _submittedThisLoad = true;
+                        SubmitForm(pw);
+                    }
+
+                    SetStatus("这个页面有图形验证码 —— 账号密码已经帮你填好，"
                         + "验证码需要你自己看一眼填进去，然后点页面上的「登录」按钮。");
                     if (lblFound != null)
                     {
-                        lblFound.Text = "识别结果：账号框「" + Describe(us) + "」 密码框「" + Describe(pw)
-                            + "」；页面有图形验证码 → 已填好，但不自动提交";
+                        lblFound.Text = "识别结果：账号框「" + Describe(us) + "」 密码框「" + Describe(pw) + "」"
+                            + (us2 != null ? " 附加账号框「" + Describe(us2) + "」" : "")
+                            + "；页面有图形验证码 → 已填好，但不自动提交";
                     }
                     return true;
                 }
@@ -518,8 +1686,9 @@ namespace CampusNetHelper
                 SetStatus("已识别登录框，正在提交…");
                 if (lblFound != null)
                 {
-                    lblFound.Text = "识别结果：账号框「" + Describe(us) + "」 密码框「" + Describe(pw)
-                        + "」 提交按钮「" + Describe(submit) + "」";
+                    lblFound.Text = "识别结果：账号框「" + Describe(us) + "」 密码框「" + Describe(pw) + "」"
+                        + (us2 != null ? " 附加账号框「" + Describe(us2) + "」" : "")
+                        + " 提交按钮「" + Describe(submit) + "」";
                 }
 
                 ClickElement(submit);
@@ -539,7 +1708,22 @@ namespace CampusNetHelper
             return "";
         }
 
-        /// <summary>提交之后隔几秒探一次网：页面自己跳成功页或失败页，我们只看"网通没通"。</summary>
+        /// <summary>附加账号（学工号）。没填就返回空串 —— 调用方据此跳过第二个框。</summary>
+        private string GetUser2()
+        {
+            ConfigStore.Account a = SelectedAccount();
+            if (a != null && !string.IsNullOrEmpty(a.User2)) return a.User2;
+            return "";
+        }
+
+        /// <summary>
+        /// 提交之后隔几秒探一次网 + 读一次页面上的错误提示，判断这一步的结果。
+        ///
+        /// ⚠️ 这里**不能**再用 ProbeInternet() 判"成功"：
+        ///    它只要收到任何响应就算通 —— 而认证前网关会返回一个 302 跳认证页，
+        ///    也就是说"压根没登录成功"它也报 true，用户会看到"认证成功"但还是上不了网。
+        ///    改用 ProbeInternetStrict()（只认 204 / 空响应体）。
+        /// </summary>
         private void AfterSubmit()
         {
             int token = _loadToken;
@@ -549,13 +1733,54 @@ namespace CampusNetHelper
                 {
                     Thread.Sleep(5000);
                     if (token != _loadToken) return;   // 期间又导航过了，这次结果作废
-                    bool netOk = ProbeInternet();
+
+                    bool netOk = NetProbe.Online(true);   // 实时确认，读缓存没意义
+
+                    // 顺便读一下页面上服务器的原话（如"验证码错误!"）——
+                    // 拿不到就空着，不影响主流程。
+                    string pageErr = "";
+                    try
+                    {
+                        Dispatcher.Invoke(new Action(delegate()
+                        {
+                            if (token != _loadToken) return;
+                            try
+                            {
+                                List<WinForms.HtmlElement> all = All(browser.Document);
+                                pageErr = ReadPageError(all);
+                            }
+                            catch { }
+                        }));
+                    }
+                    catch { }
+
                     Dispatcher.Invoke(new Action(delegate()
                     {
                         if (token != _loadToken) return;
-                        SetStatus(netOk
-                            ? "已提交，网络已连通 —— 认证成功。"
-                            : "已提交，但还没连通。可能是账号密码不对，或者页面还停在登录页 —— 看一眼下面的网页。");
+
+                        if (netOk)
+                        {
+                            SetStatus("已提交，网络已连通 —— 认证成功。");
+                            // 开机自启 + 设置了"登录后自动关闭"：连通了就自己退出，
+                            // 别让一个已经完成任务的窗口杵在桌面上。
+                            if (_startupAutoClose || _reauthMode)
+                            {
+                                try { Close(); }
+                                catch { }
+                            }
+                        }
+                        else if (pageErr.Length > 0)
+                        {
+                            SetStatus("没登上去 —— 页面上写着：「" + pageErr + "」。"
+                                + (pageErr.IndexOf("验证码", StringComparison.Ordinal) >= 0
+                                    ? "把验证码填进去再点一次页面上的「登录」。"
+                                    : "看一眼下面的网页，改完再登一次。"));
+                            if (lblFound != null) lblFound.Text = "服务器返回：" + pageErr;
+                        }
+                        else
+                        {
+                            SetStatus("已提交，但还没连通。可能是账号密码不对，或者页面还停在登录页 —— 看一眼下面的网页。");
+                        }
                     }));
                 }
                 catch { }
@@ -590,6 +1815,36 @@ namespace CampusNetHelper
             {
                 return false;
             }
+        }
+
+        /// <summary>
+        /// 判断"网络是否真的通了"。
+        ///
+        /// ⚠️ 2026-09-30：本方法原本在这里自己实现了一遍严格探测，现已**废弃并移除**，
+        ///    改为统一调用 NetProbe.Online()。原因：
+        ///    · 主页也要判断"上没上网"，两处各写一份必然漂移；
+        ///    · 一旦漂移就会出现"认证窗口报成功、主页仍显示尚未连接"这种自相矛盾的现象；
+        ///    · NetProbe 额外带了 5 秒结果缓存，主页每秒轮询也不会疯狂发请求。
+        ///    判据本身没变，仍然是它当年那套：204 / 200 且响应体极短才算真通。
+        /// </summary>
+        private static bool ProbeInternetStrict()
+        {
+            return NetProbe.Online(true);
+        }
+
+        /// <summary>
+        /// 认证通了之后知会主窗口一声，让它立刻把状态条切到"已认证上网"。
+        /// 不等主窗口自己那轮轮询（最多等 5 秒），用户关了认证窗回头就能看到正确结果。
+        /// </summary>
+        private void NotifyOwnerOnline()
+        {
+            try
+            {
+                MainWindow mw = Owner as MainWindow;
+                if (mw == null) return;
+                mw.OnWebAuthOnline();
+            }
+            catch { }
         }
 
         // ==================================================================
@@ -795,6 +2050,62 @@ namespace CampusNetHelper
             return null;
         }
 
+        /// <summary>
+        /// 找"第二个账号框"（学工号那类）。
+        ///
+        /// 背景：有些学校的网页认证页要**两个号** —— 比如桂电信科那个门户，表单里
+        /// 同时有「学(工)号」和「上网账号」两个文本输入框，只填一个登不上去。
+        ///
+        /// 认法（依次尝试，命中即返回）：
+        ///   ① name/id 里带学工号特征的（guitid / studentid / stuid / schoolid / jobid / xh / sno）
+        ///   ② 页面上一共有 ≥2 个可用文本输入框时，取"除主账号框之外、离密码框最近的那个"
+        ///
+        /// ⚠️ 只在调用方确认**有第二个账号值**（User2 非空）时才会走到这里；
+        ///    找不到就返回 null，绝不硬塞，避免把值填到错误的框里。
+        /// </summary>
+        private static WinForms.HtmlElement FindSecondUserInput(List<WinForms.HtmlElement> all,
+            WinForms.HtmlElement mainUser, WinForms.HtmlElement pw)
+        {
+            string[] keys = new string[]
+            {
+                "guitid", "studentid", "studentno", "stuid", "stuno", "schoolid", "jobid",
+                "xh", "sno", "xuehao", "gonghao", "idcard", "identity"
+            };
+
+            // ① 按特征词找
+            foreach (WinForms.HtmlElement el in all)
+            {
+                if (el == mainUser) continue;
+                if (TagOf(el) != "input") continue;
+                string type = AttrOf(el, "type").ToLowerInvariant();
+                if (type != "" && type != "text" && type != "tel" && type != "search") continue;
+                if (IsDisabled(el)) continue;
+
+                string id = (AttrOf(el, "id") + " " + AttrOf(el, "name")).ToLowerInvariant();
+                if (id.Length == 0) continue;
+                foreach (string k in keys)
+                {
+                    if (id.IndexOf(k, StringComparison.Ordinal) >= 0) return el;
+                }
+            }
+
+            // ② 兜底：找密码框之前、且不是主账号框的另一个文本输入框
+            List<WinForms.HtmlElement> textInputs = new List<WinForms.HtmlElement>();
+            foreach (WinForms.HtmlElement el in all)
+            {
+                if (TagOf(el) != "input") continue;
+                string type = AttrOf(el, "type").ToLowerInvariant();
+                if (type != "" && type != "text" && type != "tel") continue;
+                if (IsDisabled(el)) continue;
+                if (el == mainUser) continue;
+                textInputs.Add(el);
+            }
+
+            // 只有一个"其他"文本框时才敢认（多了就分不清，宁可不动手）
+            if (textInputs.Count == 1) return textInputs[0];
+            return null;
+        }
+
         private static WinForms.HtmlElement FindSubmit(List<WinForms.HtmlElement> all)
         {
             // form 元素留着兜底用（最后找不到按钮时直接提交表单）
@@ -880,6 +2191,19 @@ namespace CampusNetHelper
             catch { }
 
             // click 点不动就退回"直接提交表单"
+            SubmitForm(el);
+        }
+
+        /// <summary>
+        /// 直接让元素所在的表单提交。
+        ///
+        /// 为什么需要单独一个：有些提交按钮（或二次校验的链接）在内嵌 IE 内核里
+        /// InvokeMember("click") 会静默失败 —— 页面什么都不发生，用户就会觉得
+        /// "点你们应用的按钮没反应"。直接提交表单是可靠的兜底。
+        /// </summary>
+        private static void SubmitForm(WinForms.HtmlElement el)
+        {
+            if (el == null) return;
             try
             {
                 WinForms.HtmlElementCollection forms = el.Document.GetElementsByTagName("form");
@@ -889,6 +2213,63 @@ namespace CampusNetHelper
             {
                 Log.Warn("提交登录表单失败（请手动点页面上的登录）: " + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// 清掉页面上"请输入用户名/密码"这类校验提示。
+        ///
+        /// ⚠️ 只改**浏览器里看到的**文字，不代替服务端校验 ——
+        /// 真正的账号密码对不对，仍然由服务器说了算。
+        /// 做这件的唯一原因是：用户已经填好之后，页面上那句红字会让用户以为没填上。
+        /// </summary>
+        private static void ClearFieldErrors(List<WinForms.HtmlElement> all)
+        {
+            string[] keys = new string[] { "请输入用户名", "请输入密码", "请输入账号", "请输入验证码", "不能为空" };
+            foreach (WinForms.HtmlElement el in all)
+            {
+                string t = TagOf(el);
+                if (t != "span" && t != "div" && t != "p" && t != "label") continue;
+                string txt = "";
+                try { txt = (el.InnerText ?? "").Trim(); }
+                catch { }
+                if (txt.Length == 0 || txt.Length > 20) continue;
+                foreach (string k in keys)
+                {
+                    if (txt.IndexOf(k, StringComparison.Ordinal) >= 0)
+                    {
+                        try { el.InnerText = ""; } catch { }
+                        break;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 找页面上的错误提示文本（ASP.NET 的 validation-summary-errors 那类）。
+        ///
+        /// 为什么要读它：光靠"网络通不通"判断登录结果有延迟、也不精确 ——
+        /// 服务器其实已经明说了"验证码错误!"。读出来能立刻告
+        /// 诉用户到底卡在哪一步，不用他自己猜。
+        /// </summary>
+        private static string ReadPageError(List<WinForms.HtmlElement> all)
+        {
+            string best = "";
+            foreach (WinForms.HtmlElement el in all)
+            {
+                string cls = AttrOf(el, "class").ToLowerInvariant();
+                bool looksLikeError =
+                    cls.IndexOf("validation", StringComparison.Ordinal) >= 0
+                    || cls.IndexOf("error", StringComparison.Ordinal) >= 0
+                    || cls.IndexOf("message", StringComparison.Ordinal) >= 0;
+                if (!looksLikeError) continue;
+
+                string txt = "";
+                try { txt = (el.InnerText ?? "").Trim().Replace("\r", " ").Replace("\n", " "); }
+                catch { }
+                if (txt.Length == 0 || txt.Length > 40) continue;
+                if (best.Length == 0) best = txt;
+            }
+            return best;
         }
     }
 }

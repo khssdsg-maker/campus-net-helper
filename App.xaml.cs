@@ -32,6 +32,29 @@ namespace CampusNetHelper
                 }
             }
 
+            // 界面自测：跑一遍"模拟用户点击 + 打字"的用例，把结果写文件后退出。
+            // 放在单实例保护**之前** —— 自测要能在程序正跑着的时候独立运行。
+            if (args != null)
+            {
+                foreach (string arg in args)
+                {
+                    if (arg.Equals("--selftest", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // ⚠️ 先关掉文件日志 —— 自测会把网络质量探测、心跳、网速采样
+                        //    这些后台子系统真的跑起来，它们会往用户当天的正式日志里灌
+                        //    一堆"测试痕迹"。自测结果本身写到 %TEMP% 的独立文件里，
+                        //    不依赖日志。（2026-09-30 冒烟测试发现：光"自测结果已写入"
+                        //    一天就写了 24 条，把用户自己的运行记录挤掉了。）
+                        Log.SelfTestQuiet = true;
+
+                        string text = UiTest.Run();
+                        string path = Path.Combine(Path.GetTempPath(), "campusnet-selftest.txt");
+                        try { File.WriteAllText(path, text, Encoding.UTF8); } catch { }
+                        return;
+                    }
+                }
+            }
+
             // 单实例保护：多实例并存会导致托盘图标重复、日志交错。
             if (!AcquireSingleInstance())
             {
@@ -110,6 +133,27 @@ namespace CampusNetHelper
                 catch (Exception ex)
                 {
                     Log.Warn("静默模式确保主窗口句柄失败: " + ex.Message);
+                }
+            }
+
+            // 网页认证模式下，开机自启要**弹出认证窗口**而不是静默拨号。
+            //
+            // 为什么必须分流：网页认证要人填图形验证码，程序没法静默完成 ——
+            // 与其让用户开机后自己找托盘、点菜单，不如直接把认证页怼到脸上。
+            // 拨号模式则维持原来的静默行为，一个字都不改。
+            if (silent && mainWindow.IsPortalMode())
+            {
+                if (mainWindow.InNightQuiet())
+                {
+                    // 夜间免打扰时段内不弹窗，避免半夜重启电脑被弹窗打扰。
+                    // 次日的常规起点（tick）会跳过拨号逻辑，用户需要时自己点托盘即可。
+                    Log.Info("网页认证模式：当前处于夜间免打扰时段，不弹出认证窗口");
+                }
+                else
+                {
+                    Log.Info("网页认证模式：开机自启弹出网页认证窗口"
+                        + "（行为=" + mainWindow.PortalStartupBehavior() + "）");
+                    mainWindow.OpenWebAuthWindowOnStartup();
                 }
             }
 

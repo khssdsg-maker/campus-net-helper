@@ -57,6 +57,38 @@ namespace CampusNetHelper
         public string LastResult { get { return _lastResult; } }
 
         /// <summary>
+        /// 【调试/自测专用】直接注入一次心跳结果，不发真实网络请求。
+        /// 
+        /// 用途：验证"成功不刷屏、失败必记、恢复记一笔"这套日志策略。
+        /// 真实 Beat() 会走 HTTP，自测里跑不了（也不该跑）。
+        /// </summary>
+        internal void DebugInjectBeat(bool ok, string info)
+        {
+            _lastBeatAt = DateTime.Now;
+            if (ok)
+            {
+                bool wasOk = (_okCount > 0 && _failCount == 0);
+                _okCount++;
+                if (_failCount > 0)
+                {
+                    Log.Info("心跳保活：恢复正常 · " + info + "（此前连续失败 " + _failCount + " 次，(注入)）");
+                    _failCount = 0;
+                }
+                else if (!wasOk)
+                {
+                    Log.Info("心跳保活：已启动 · " + info + "（(注入)）");
+                }
+                _lastResult = "正常 · " + info;
+            }
+            else
+            {
+                _failCount++;
+                _lastResult = "失败 · " + info;
+                Log.Warn("心跳保活：失败 · " + info + "（累计失败 " + _failCount + " 次，(注入)）");
+            }
+        }
+
+        /// <summary>
         /// 开始 / 停止心跳。拨号连上传 true，断开传 false。
         /// 已经在跑的时候再次传 true 只会更新间隔，不会重启线程
         /// （重启会把攒下的计数清零，用户会看到统计莫名其妙归零）。
@@ -165,9 +197,29 @@ namespace CampusNetHelper
             _lastBeatAt = DateTime.Now;
             if (ok)
             {
+                // ⚠️ 成功**不是每次都写日志** —— 只在「从失败恢复成正常」时写一条。
+                //
+                //    原因：心跳是 3 分钟一次的稳态行为，一整天大约 480 次。
+                //    原先每次成功都记，实测 2026-09-30 一天占了整个日志的
+                //    **28.1%（175/622 行）**，而且内容完全一样（就是"正常"两个字），
+                //    把真正的异常线索全淹了。日志的价值在"变化"，不在"重复"。
+                //
+                //    「第 N 次」这个成功计数对排查没用，删掉；失败次数仍然保留在
+                //    失败那条日志里，因为那个才是要看的。
+                bool wasOk = (_okCount > 0 && _failCount == 0);
                 _okCount++;
+                if (_failCount > 0)
+                {
+                    // 之前失败过 → 这次恢复，值得记一笔（带上之前攒了多少次失败）
+                    Log.Info("心跳保活：恢复正常 · " + info + "（此前连续失败 " + _failCount + " 次，" + url + "）");
+                    _failCount = 0;   // reset：下次再正常就不报了
+                }
+                else if (!wasOk)
+                {
+                    // 本次运行第一次心跳，记一条作为"保活已启动"的锚点
+                    Log.Info("心跳保活：已启动 · " + info + "（" + url + "）");
+                }
                 _lastResult = "正常 · " + info;
-                Log.Info("心跳保活：正常 · " + info + "（第 " + _okCount + " 次，" + url + "）");
             }
             else
             {

@@ -99,6 +99,22 @@ namespace CampusNetHelper
 
             // 最大化/还原时同步顶栏那个按钮的图标
             StateChanged += delegate(object s, EventArgs e) { UpdateMaximizeGlyph(); };
+
+            // 从托盘点开主窗口时立刻核对一次联网状态 —— 用户切过来就是为了看结果，
+            // 不该让他等下一轮轮询（最多 5 秒）才看到正确显示。
+            Activated += delegate(object s, EventArgs e)
+            {
+                // 切回来先按挂钟把时长对齐（拖动/点击期间可能漏过 tick）
+                if (_state == ConnState.Connected || IsPortalMode()) RefreshOnlineTime();
+                if (IsPortalMode()) RefreshPortalOnlineNow();
+            };
+
+            // 用户一动窗口就补刷时长。
+            // 拖动窗口、点标题栏这些动作会让 Windows 进入模态循环，DispatcherTimer 被压住不发 ——
+            // 用户看到的正是"我盯着它，时间却不动"。这些事件触发的时刻刚好补上。
+            PreviewMouseDown += OnUserActivity;
+            PreviewMouseMove += OnUserActivity;
+            PreviewKeyDown += OnUserActivity;
             LoadAll();
             ApplyTheme();
             InitTray();
@@ -123,6 +139,11 @@ namespace CampusNetHelper
             RefreshAccountList();
             RefreshParamCards();
             RefreshHistoryUi();
+
+            // 网页认证模式：启动时先探一次（后台），这样窗口一显示就带着真实结果，
+            // 而不是先给人看一秒「尚未连接」再跳成「已认证上网」。
+            if (IsPortalMode()) NetProbe.WarmUpAsync();
+
             ApplyState(ConnState.Idle, "尚未连接", "选择账号后点击「立即连接」");
 
             // 启动时如果已经存在拨号连接（例如用户先用学校客户端拨上了），
@@ -165,6 +186,132 @@ namespace CampusNetHelper
         // ==================================================================
         // 配置
         // ==================================================================
+
+        // ==================================================================
+        // 自测出口（仅供 UITest 使用，界面代码不用它们）
+        // ==================================================================
+
+        /// <summary>当前状态条标题的文案。</summary>
+        internal string DebugStatusTitle()
+        {
+            return lblStatusTitle == null ? "" : (lblStatusTitle.Text ?? "");
+        }
+
+        /// <summary>当前在线时长的文案。</summary>
+        internal string DebugOnlineTime()
+        {
+            return lblOnlineTime == null ? "" : (lblOnlineTime.Text ?? "");
+        }
+
+        /// <summary>
+        /// 把"在线起点"往前挪一段，模拟"已经在线 N 秒"。
+        ///
+        /// 为什么需要它：自测里没有真实时间流逝（DispatcherTimer 不会自己跳），
+        /// 而"时长确实在走"这件事必须验证 —— 之前的 bug 正是"看着不动"。
+        /// 直接改 _connectedAt 比等待 1 秒真实时间可靠得多。
+        /// </summary>
+        /// <summary>
+        /// 把"在线起点"往前挪一段，模拟"已经在线 N 秒"。
+        ///
+        /// 为什么需要它：自测里没有真实时间流逝（DispatcherTimer 不会自己跳），
+        /// 而"时长确实在走"这件事必须验证 —— 之前的 bug 正是"看着不动"。
+        /// 直接改 _connectedAt 比等待 1 秒真实时间可靠得多。
+        ///
+        /// ⚠️ 语义是**绝对**的：调用后显示值必然等于 N 秒。
+        ///    （相对累加会让自测算错 —— 第一版就踩了：
+        ///     先挪 125 秒、再挪 3645 秒，起点一共被推了 3770 秒，
+        ///     显示成 01:02:50，白白让用例红了。）
+        /// </summary>
+        internal void DebugSetOnlineSeconds(int seconds)
+        {
+            _connectedAt = DateTime.Now.AddSeconds(-seconds);
+        }
+
+        /// <summary>
+        /// 模拟"用户动了一下窗口"这条路径，触发和真实鼠标/键盘事件完全相同的处理。
+        ///
+        /// 自测必须走这条路径而不是直接调 RefreshOnlineTime ——
+        /// 要测的正是"用户操作时界面会不会补刷"，绕过 OnUserActivity 就测不到了。
+        /// </summary>
+        internal void DebugPokeUserActivity()
+        {
+            OnUserActivity(this, EventArgs.Empty);
+        }
+
+        /// <summary>清掉补刷节流，让自测能连续触发两次。</summary>
+        internal void DebugResetActivityThrottle()
+        {
+            _lastActivityRefresh = DateTime.MinValue;
+        }
+
+        /// <summary>当前网速卡片上显示的上下行文案（自测用来确认曲线确实是活的）。</summary>
+        internal string DebugSpeedDown()
+        {
+            return lblSpeedDown == null ? "" : (lblSpeedDown.Text ?? "");
+        }
+
+        internal string DebugSpeedUp()
+        {
+            return lblSpeedUp == null ? "" : (lblSpeedUp.Text ?? "");
+        }
+
+        internal string DebugSpeedTotal()
+        {
+            return valSpeed == null ? "" : (valSpeed.Text ?? "");
+        }
+
+        /// <summary>曲线上的采样点数。</summary>
+        internal int DebugSpeedPointCount()
+        {
+            return _speedHistory.Count;
+        }
+
+        /// <summary>当前网速采样盯的是哪块网卡（网络接口 Id）。</summary>
+        internal string DebugSpeedAdapterId()
+        {
+            return _speedAdapterId ?? "";
+        }
+
+        /// <summary>手工触发一次采样（自测用 —— 不依赖 DispatcherTimer 真的跳）。</summary>
+        internal void DebugSampleSpeedNow()
+        {
+            SampleSpeed();
+        }
+
+        /// <summary>当前「在线起点」是否已设（自测用来判断状态机有没有真的记上起点）。</summary>
+        internal bool DebugHasOnlineStart()
+        {
+            return _connectedAt != DateTime.MinValue;
+        }
+
+        /// <summary>质量卡片旁那行"看的是哪块网卡"的文字。</summary>
+        internal string DebugAdapterLabel()
+        {
+            return _primaryAdapterLabel ?? "";
+        }
+
+        /// <summary>
+        /// 把主页强制切到"认证成功"的样子，供自测检查文案分支。
+        /// 不碰真实探测，纯展示逻辑。
+        /// </summary>
+        internal void SimulatePortalState(bool online)
+        {
+            if (online)
+            {
+                _portalOnline = true;
+                if (_connectedAt == DateTime.MinValue) _connectedAt = DateTime.Now;
+                ApplyState(ConnState.Connected, "已认证上网",
+                    "网页认证已生效，可以正常上网");
+                RefreshParamCards();
+            }
+            else
+            {
+                _portalOnline = false;
+                _connectedAt = DateTime.MinValue;
+                ApplyState(ConnState.Idle, "未联网",
+                    "还没通过网页认证，点「打开认证页」登录一下");
+            }
+        }
 
         private void LoadAll()
         {
@@ -287,7 +434,44 @@ namespace CampusNetHelper
         /// </summary>
         internal string ApplySettingsFromWindow(bool autoReconnect, bool silent, bool closeToTray,
             int interval, bool keepAlive, int keepAliveMinutes,
-            bool nightQuiet, string quietStart, string quietEnd)
+            bool nightQuiet, string quietStart, string quietEnd,
+            string authMode, string portalStartupBehavior)
+        {
+            ApplySettingsCore(autoReconnect, closeToTray, interval, keepAlive, keepAliveMinutes,
+                nightQuiet, quietStart, quietEnd, authMode, portalStartupBehavior);
+
+            string note = ReconcileStartupCopy(silent);
+
+            Log.Info("设置已更新: 自动重连=" + autoReconnect + " 开机自启=" + silent
+                + " 关闭到托盘=" + closeToTray + " 间隔=" + interval
+                + " 保活=" + keepAlive + " 保活间隔=" + keepAliveMinutes + "分钟"
+                + " 免打扰=" + (nightQuiet ? (quietStart + "-" + quietEnd) : "关")
+                + " 认证方式=" + AuthMode() + " 网页自启行为=" + PortalStartupBehavior());
+            return note;
+        }
+
+        /// <summary>
+        /// 自动保存用的静默版本：只落盘 + 让开关立刻生效，**不碰开机自启的启动副本**。
+        ///
+        /// 为什么不走 ApplySettingsFromWindow：那个函数会在"开机自启"变化时创建/删除
+        /// 「启动」文件夹里的副本，还可能因为文件被占用而返回一段要弹给用户看的说明。
+        /// 自动保存是用户随手改个开关触发的，不适合做这种有副作用、还可能弹框的操作 ——
+        /// 那种事留给底部那个明确的「保存设置」按钮。
+        /// </summary>
+        internal void ApplySettingsFromWindowSilent(bool autoReconnect, bool silent, bool closeToTray,
+            int interval, bool keepAlive, int keepAliveMinutes,
+            bool nightQuiet, string quietStart, string quietEnd,
+            string authMode, string portalStartupBehavior)
+        {
+            ApplySettingsCore(autoReconnect, closeToTray, interval, keepAlive, keepAliveMinutes,
+                nightQuiet, quietStart, quietEnd, authMode, portalStartupBehavior);
+        }
+
+        /// <summary>设置落盘 + 让"立刻生效"的开关动起来（不含开机自启副本的处理）。</summary>
+        private void ApplySettingsCore(bool autoReconnect, bool closeToTray,
+            int interval, bool keepAlive, int keepAliveMinutes,
+            bool nightQuiet, string quietStart, string quietEnd,
+            string authMode, string portalStartupBehavior)
         {
             ConfigStore.SetBool(_settings, "AutoReconnect", autoReconnect);
             ConfigStore.SetBool(_settings, "CloseToTray", closeToTray);
@@ -297,21 +481,17 @@ namespace CampusNetHelper
             ConfigStore.SetBool(_settings, "NightQuiet", nightQuiet);
             _settings["NightQuietStart"] = quietStart ?? "23:30";
             _settings["NightQuietEnd"] = quietEnd ?? "07:00";
-            SaveAll();
 
-            // 开关改了立刻生效：如果刚打开免打扰且当前就在时段内，让下一次 tick 处理
-            // （_quietActive 会被 tick 里的差异判断接上，不用额外通知）
+            // 认证方式：只接受 dial / portal 两个值，其余一律回落 dial（防手改配置写坏）
+            _settings["AuthMode"] = string.Equals(authMode, "portal", StringComparison.OrdinalIgnoreCase)
+                ? "portal" : "dial";
+            _settings["PortalStartupBehavior"] = string.Equals(portalStartupBehavior, "keep", StringComparison.OrdinalIgnoreCase)
+                ? "keep" : "auto";
+
+            SaveAll();
 
             // 开关可能刚被改掉，立刻生效，不用等下次连接状态变化
             _keepAlive.SetActive(_state == ConnState.Connected && keepAlive, keepAliveMinutes);
-
-            string note = ReconcileStartupCopy(silent);
-
-            Log.Info("设置已更新: 自动重连=" + autoReconnect + " 开机自启=" + silent
-                + " 关闭到托盘=" + closeToTray + " 间隔=" + interval
-                + " 保活=" + keepAlive + " 保活间隔=" + keepAliveMinutes + "分钟"
-                + " 免打扰=" + (nightQuiet ? (quietStart + "-" + quietEnd) : "关"));
-            return note;
         }
 
         /// <summary>
@@ -379,21 +559,150 @@ namespace CampusNetHelper
         }
 
         // ==================================================================
-        // 网页认证
+        // 认证方式（拨号 / 网页认证）
         // ==================================================================
+
+        /// <summary>
+        /// 认证方式。
+        ///   "dial"   = 系统拨号（PPPoE），可静默自启、自动重连
+        ///   "portal" = 网页认证，需要人填验证码，无法静默
+        ///
+        /// 默认 dial —— 保持老用户的原行为，升级后不会因为选错模式而上不了网。
+        /// </summary>
+        internal string AuthMode()
+        {
+            string v = ConfigStore.GetString(_settings, "AuthMode", "dial");
+            if (string.Equals(v, "portal", StringComparison.OrdinalIgnoreCase)) return "portal";
+            return "dial";
+        }
+
+        internal bool IsPortalMode()
+        {
+            return AuthMode() == "portal";
+        }
+
+        /// <summary>
+        /// 网页认证模式下，开机自启时的行为：
+        ///   "auto"   = 弹出认证窗口，用户登完自己关（默认）
+        ///   "keep"   = 弹出认证窗口并保持打开（可反复用）
+        /// </summary>
+        internal string PortalStartupBehavior()
+        {
+            string v = ConfigStore.GetString(_settings, "PortalStartupBehavior", "auto");
+            if (string.Equals(v, "keep", StringComparison.OrdinalIgnoreCase)) return "keep";
+            return "auto";
+        }
 
         internal string WebAuthUrl()
         {
+            // 三级兜底，顺序不能乱：
+            //   ① 网址清单里"最近用过"的那条（用户存过就用他的）
+            //   ② 旧版本的 WebAuthUrl 设置项（升级上来的老配置，别丢）
+            //   ③ 编译时的默认值（本校专属，放在 SiteConfig，不进公开仓库）
+            string fromList = WebUrlStore.MostRecent();
+            if (!string.IsNullOrEmpty(fromList)) return fromList;
+
             string v = ConfigStore.GetString(_settings, "WebAuthUrl", "");
             if (!string.IsNullOrEmpty(v)) return v;
-            // 没填过就用编译时的默认值（本校专属，放在 SiteConfig，不进公开仓库）
+
             return SiteConfig.DefaultWebAuthUrl;
         }
 
         internal void SaveWebAuthUrl(string url)
         {
-            _settings["WebAuthUrl"] = url ?? "";
+            string clean = WebUrlStore.Clean(url);
+            if (clean.Length == 0) return;
+
+            // 同时写两处：
+            //   · 清单 —— 新版的数据源，能存多条
+            //   · 旧设置项 —— 万一用户回退到旧版本，还认得出他填的地址
+            // 两处都写一遍的代价可以忽略，换来的是"降级不丢配置"。
+            string msg;
+            WebUrlStore.Touch(clean);
+            if (!WebUrlStore.Contains(clean)) WebUrlStore.Save(clean, "", out msg);
+
+            _settings["WebAuthUrl"] = clean;
             SaveAll();
+        }
+
+        /// <summary>
+        /// 把旧版单条网址搬进清单（只在清单为空时搬一次）。
+        /// 升级用户第一次打开认证窗口时调用 —— 他会发现自己填过的地址还在。
+        /// </summary>
+        internal void MigrateLegacyUrl()
+        {
+            try
+            {
+                if (WebUrlStore.LoadAll().Count > 0) return;   // 清单已有内容，不插手
+
+                string legacy = ConfigStore.GetString(_settings, "WebAuthUrl", "");
+                if (string.IsNullOrEmpty(legacy)) return;
+
+                string msg;
+                if (WebUrlStore.Save(legacy, "原来的地址", out msg))
+                {
+                    Log.Info("已把旧版设置的认证网址搬进网址清单: " + legacy);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>网址清单快照（给认证窗口填下拉框用）。</summary>
+        internal List<WebUrlStore.Entry> WebUrlsSnapshot()
+        {
+            return WebUrlStore.LoadAll();
+        }
+
+        /// <summary>存一条网址进清单。</summary>
+        internal bool SaveWebUrl(string url, string name, out string message)
+        {
+            bool ok = WebUrlStore.Save(url, name, out message);
+            if (ok)
+            {
+                // 存了就等于"要用它"，顺手同步到旧设置项
+                _settings["WebAuthUrl"] = WebUrlStore.Clean(url);
+                SaveAll();
+            }
+            return ok;
+        }
+
+        /// <summary>从清单删一条网址。</summary>
+        internal bool DeleteWebUrl(string url, out string message)
+        {
+            return WebUrlStore.Delete(url, out message);
+        }
+
+        // ==================================================================
+        // 字段档案（网页认证：把"哪个框填什么"教给程序）
+        // ==================================================================
+
+        /// <summary>
+        /// 让当前打开的认证窗口扫一遍页面，返回扫到的字段（带推断标签）。
+        /// 没有打开认证窗口时返回空列表。
+        /// </summary>
+        internal List<FieldProfileStore.FieldProfile> ScanWebAuthFields()
+        {
+            try
+            {
+                if (_webAuthWindow == null || !_webAuthWindow.IsLoaded) return new List<FieldProfileStore.FieldProfile>();
+                return _webAuthWindow.ScanFields();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("扫描认证页字段失败: " + ex.Message);
+                return new List<FieldProfileStore.FieldProfile>();
+            }
+        }
+
+        /// <summary>打开字段档案窗口（供认证窗口调用）。</summary>
+        internal void OpenFieldProfileWindow(string url, List<FieldProfileStore.FieldProfile> scanned)
+        {
+            var w = new FieldProfileWindow(this, url, scanned);
+            w.ShowDialog();
+            if (w.Saved && _webAuthWindow != null && _webAuthWindow.IsLoaded)
+            {
+                _webAuthWindow.OnProfileSaved();
+            }
         }
 
         /// <summary>账号列表的快照 —— 给网页认证窗口填下拉框用（不直接把内部列表交出去）。</summary>
@@ -412,8 +721,42 @@ namespace CampusNetHelper
 
             _webAuthWindow = new WebAuthWindow(this);
             _webAuthWindow.Owner = this;
-            _webAuthWindow.Closed += delegate(object s, EventArgs a) { _webAuthWindow = null; };
+            _webAuthWindow.Closed += delegate(object s, EventArgs a)
+            {
+                _webAuthWindow = null;
+                RefreshPortalOnlineNow();
+            };
             _webAuthWindow.Show();
+        }
+
+        /// <summary>
+        /// 开机自启走网页认证时调用的入口。
+        ///
+        /// 与 OpenWebAuthWindow 的区别：
+        ///   · 主窗口当前是隐藏的（静默启动），窗口不能挂 Owner = 隐藏的主窗口，
+        ///     否则激活时会被一起带出来 / 抢焦点。所以这里**不设 Owner**。
+        ///   · 会把"登录完成后自动关闭"的意图传下去（对应设置里的开机行为选项）。
+        /// </summary>
+        internal void OpenWebAuthWindowOnStartup()
+        {
+            if (_webAuthWindow != null && _webAuthWindow.IsLoaded)
+            {
+                _webAuthWindow.Activate();
+                return;
+            }
+
+            bool autoClose = PortalStartupBehavior() != "keep";
+
+            _webAuthWindow = new WebAuthWindow(this);
+            _webAuthWindow.SetStartupAutoClose(autoClose);
+            _webAuthWindow.Closed += delegate(object s, EventArgs a)
+            {
+                _webAuthWindow = null;
+                // 认证窗口一关就立刻核对一次 —— 用户刚登完，主页该马上反映结果
+                RefreshPortalOnlineNow();
+            };
+            _webAuthWindow.Show();
+            _webAuthWindow.Activate();
         }
 
         // ==================================================================
@@ -422,18 +765,67 @@ namespace CampusNetHelper
 
         private void InitTimers()
         {
-            _tickTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            // ⚠️ 在线时长（以及其它每秒的界面刷新）**不能只靠定时器**。
+            //
+            // 用户报的问题（2026-09-30）：
+            //   "呼出主页时在线时长不动，放在后台时时间才同步。"
+            // 原因：
+            //   DispatcherTimer 是在消息泵空闲时才派发的。用户拖动窗口 / 按住标题栏 /
+            //   点击时，Windows 进入"模态消息循环"，WM_TIMER 被压着不发 ——
+            //   Dispatcher 优先级 4（Background）甚至 5（Normal）的定时器回调都可能被
+            //   一拖好几秒。而后台时窗口不接收这类消息，反而跑得正常。
+            //
+            // 修法（两层，缺一不可）：
+            //   ① 时长按"挂钟差"算 —— 起点是 _connectedAt，显示值永远 = 现在 - 起点。
+            //      即使中途漏掉了 N 次 tick，只要派发过一次就立刻跳到正确的值，
+            //      **自动补齐，不会累积偏差**。（见 RefreshOnlineTime）
+            //   ② 把刷新的优先级提到 Render，并额外挂 Keyboard/Mouse 的 UI 事件驱动，
+            //      让用户一动窗口就顺手刷一次，不用等下一个 tick。
+            _tickTimer = new DispatcherTimer(DispatcherPriority.Render);
+            _tickTimer.Interval = TimeSpan.FromSeconds(1);
             _tickTimer.Tick += (s, e) => OnTick();
             _tickTimer.Start();
 
-            _speedTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _speedTimer = new DispatcherTimer(DispatcherPriority.Render);
+            _speedTimer.Interval = TimeSpan.FromSeconds(1);
             _speedTimer.Tick += (s, e) => SampleSpeed();
             _speedTimer.Start();
+        }
+
+        /// <summary>
+        /// "用户正在操作窗口"时顺手刷一次界面。
+        ///
+        /// 不和定时器重复劳动：这些事件只在真的有输入时触发，
+        /// 而输入恰好就是会让消息泵卡住的那种场景 —— 正是最需要补刷的时刻。
+        /// 加了节流：MouseMove 触发极密，没必要每个像素都算一遍时长（一秒刷一次足够）。
+        /// </summary>
+        private DateTime _lastActivityRefresh = DateTime.MinValue;
+
+        private void OnUserActivity(object sender, EventArgs e)
+        {
+            if (_closing) return;
+            if (_state != ConnState.Connected && !IsPortalMode()) return;
+            if (_connectedAt == DateTime.MinValue) return;
+
+            // 节流：同一秒内只刷一次
+            DateTime now = DateTime.Now;
+            if ((now - _lastActivityRefresh).TotalMilliseconds < 900) return;
+            _lastActivityRefresh = now;
+
+            RefreshOnlineTime();
         }
 
         private void OnTick()
         {
             bool quiet = InNightQuiet();
+
+            // 网页认证模式走一条完全不同的路 —— 它没有拨号会话可看，
+            // 唯一可靠的判据就是"能不能真的上网"。
+            if (IsPortalMode())
+            {
+                TickPortal(quiet);
+                return;
+            }
 
             // 免打扰时段的进出：只在状态变化时处理一次（否则每秒都要动检测开关）
             if (quiet != _quietActive)
@@ -457,12 +849,7 @@ namespace CampusNetHelper
 
             if (_state == ConnState.Connected)
             {
-                if (_connectedAt != DateTime.MinValue && lblOnlineTime != null)
-                {
-                    TimeSpan ts = DateTime.Now - _connectedAt;
-                    lblOnlineTime.Text = "在线 " + string.Format("{0:00}:{1:00}:{2:00}",
-                        (int)ts.TotalHours, ts.Minutes, ts.Seconds);
-                }
+                if (_connectedAt != DateTime.MinValue) RefreshOnlineTime();
 
                 if (!DialEngine.IsDialConnected())
                 {
@@ -529,15 +916,474 @@ namespace CampusNetHelper
             }
         }
 
+        // ==================================================================
+        // 网页认证模式的主页状态
+        // ==================================================================
+
+        /// <summary>连续探测失败多少次才判定掉线。探测本身有抖动，一次失败不能作数。</summary>
+        private const int PortalOfflineStrikes = 2;
+
+        private int _portalFailStreak = 0;
+        private bool _portalOnline = false;
+
+        /// <summary>
+        /// 网页认证模式的主循环。
+        ///
+        /// 为什么不能用拨号模式那套（2026-09-30 海辰报的问题）：
+        ///   拨号模式靠 DialEngine.IsDialConnected() 判断 —— 看系统里有没有已连接的 PPP 接口。
+        ///   但网页认证**根本不建立拨号会话**，认证成功后系统里还是只有那张物理网卡，
+        ///   于是 _state 永远停在 Idle，主页显示「尚未连接」、在线时长不启动、
+        ///   质量卡片不采样、参数卡片也不刷新 —— 用户的感受就是"主页没有任何网络信息"。
+        ///
+        ///   真相是：网页认证模式下"上没上网"只有一个答案 —— **发个请求看能不能通**。
+        /// </summary>
+        private void TickPortal(bool quiet)
+        {
+            // 免打扰时段不动探测（夜里没人看界面，省点电也省得刷日志）
+            if (quiet)
+            {
+                if (_state != ConnState.Connected && _state != ConnState.Quiet) EnterQuiet();
+                return;
+            }
+            if (_state == ConnState.Quiet)
+            {
+                // 免打扰结束，回到正常评估
+                ApplyState(ConnState.Idle, "尚未连接", "等待认证上网");
+            }
+
+            bool online = NetProbe.Online();
+
+            if (online)
+            {
+                _portalFailStreak = 0;
+
+                if (!_portalOnline)
+                {
+                    // 刚检测到能上网 —— 记一笔在线起点。
+                    //   · 用户刚点了认证并成功 → 这里有值
+                    //   · 程序启动时其实早就认证过了 → 也走这里，起点=现在（时长从此刻算）
+                    _portalOnline = true;
+                    if (_connectedAt == DateTime.MinValue) _connectedAt = DateTime.Now;
+                    Log.Info("网页认证模式：检测到可以正常上网");
+                    AddHistory("认证有效 · 可以上网");
+                }
+
+                if (_state != ConnState.Connected)
+                {
+                    ApplyState(ConnState.Connected, "已认证上网",
+                        "网页认证已生效，可以正常上网");
+                }
+
+                // 拨号那套后台重连在认证模式下毫无意义，别让它空转。
+                // （认证模式的重连不走它，见 StartPortalAutoReauth 的说明）
+                _autoReconnectArmed = false;
+
+                // 网络恢复了 → 自动重连的计数清零，下次掉线重新开始
+                if (_portalReauthAttempts > 0)
+                {
+                    Log.Info("网页认证：网络已恢复，自动重连计数归零（此前试了 "
+                        + _portalReauthAttempts + " 次）");
+                    _portalReauthAttempts = 0;
+                    _autoReconnectAttempts = 0;
+                }
+                _pendingPortalReauth = false;
+            }
+            else
+            {
+                // 探测抖动保护：连续失败才认，避免网络一卡就弹"掉线"
+                _portalFailStreak++;
+                if (_portalFailStreak < PortalOfflineStrikes) return;
+
+                if (_portalOnline)
+                {
+                    _portalOnline = false;
+                    _connectedAt = DateTime.MinValue;
+                    if (lblOnlineTime != null) lblOnlineTime.Text = "";
+                    Log.Warn("网页认证模式：连续 " + _portalFailStreak + " 次探测不通，判定已掉线");
+                    AddHistory("认证可能已失效 · 需要重新认证");
+
+                    // ⭐ 判定掉线的那一刻，把自动重连武装起来。
+                    //    拨号模式下 _autoReconnectArmed 是由"用户点过立即连接"置位的；
+                    //    认证模式没有那个动作，所以在这里置位 —— 语义相同：
+                    //    "用户是想上网的，断了就帮他接回来"。
+                    if (AutoReconnectEnabled() && !_quietActive)
+                    {
+                        _autoReconnectArmed = true;
+                        _lastAutoTry = DateTime.MinValue;   // 不等退避，立刻试第一次
+                        Log.Info("网页认证模式：已武装自动重连，准备自动重新认证");
+                    }
+                }
+
+                if (_state != ConnState.Connected && _state != ConnState.Error
+                    && _state != ConnState.Connecting)
+                {
+                    ApplyState(ConnState.Idle, "未联网",
+                        "还没通过网页认证，点「打开认证页」登录一下");
+                }
+
+                // ⭐ 掉线且已武装 → 走认证模式自己的自动重连
+                if (_autoReconnectArmed && AutoReconnectEnabled() && !_quietActive)
+                {
+                    TryAutoReconnect();
+                }
+            }
+
+            RefreshParamCards();
+        }
+
+        /// <summary>
+        /// 认证窗口确认"网络已连通"时回调（由 WebAuthWindow 调用）。
+        /// 立刻把主页切到已认证状态，不等下一轮轮询。
+        /// </summary>
+        internal void OnWebAuthOnline()
+        {
+            if (!IsPortalMode()) return;
+
+            try
+            {
+                _portalFailStreak = 0;
+                if (!_portalOnline)
+                {
+                    _portalOnline = true;
+                    if (_connectedAt == DateTime.MinValue) _connectedAt = DateTime.Now;
+                    AddHistory("认证有效 · 可以上网");
+                }
+                ApplyState(ConnState.Connected, "已认证上网",
+                    "网页认证已生效，可以正常上网");
+                RefreshParamCards();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 网页认证刚提交完（或用户点「立即连接」）时调一次：
+        /// 丢弃探测缓存并同步确认一次，让主页立刻反映"到底通没通"，
+        /// 不用干等下一轮轮询。
+        /// </summary>
+        internal void RefreshPortalOnlineNow()
+        {
+            if (!IsPortalMode()) return;
+
+            ThreadPool.QueueUserWorkItem(delegate(object state)
+            {
+                bool ok = NetProbe.Online(true);
+                try
+                {
+                    Dispatcher.Invoke(delegate()
+                    {
+                        if (ok)
+                        {
+                            _portalFailStreak = 0;
+                            if (!_portalOnline)
+                            {
+                                _portalOnline = true;
+                                _connectedAt = DateTime.Now;
+                                AddHistory("认证有效 · 可以上网");
+                            }
+                            ApplyState(ConnState.Connected, "已认证上网",
+                                "网页认证已生效，可以正常上网");
+                        }
+                        RefreshParamCards();
+                    });
+                }
+                catch { }
+            });
+        }
+
         private void TryAutoReconnect()
         {
             if ((DateTime.Now - _lastAutoTry).TotalSeconds < NextRetryDelay()) return;
             _lastAutoTry = DateTime.Now;
             _autoReconnectAttempts++;
+
+            // ⚠️ 两种模式的"恢复连接"是完全不同的动作，必须分流。
+            //
+            //   拨号模式   → 重新拨号（StartDial）
+            //   网页认证模式 → 根本不存在拨号会话，重拨必然得到 628。
+            //                  正确动作是**把认证页重新打开并自动提交**。
+            //
+            // 2026-09-30 的 bug 实证：海辰 17:15 把认证方式切成 portal 之后，
+            // 18:03 断网时程序仍然去调了 StartDial()，日志留下
+            // `拨号结果: exit=628 success=False` —— 白试一次，还平白给学校
+            // 攒了一次失败记录（学校对频繁拨号会限速）。根因就是这里没分流。
+            if (IsPortalMode())
+            {
+                Log.Info("自动重连（网页认证）：第 " + _autoReconnectAttempts + " 次尝试重开认证页");
+                StartPortalAutoReauth();
+                return;
+            }
+
             Log.Info("自动重连：第 " + _autoReconnectAttempts + " 次尝试恢复连接 "
                 + (_current != null ? _current.Name : "(无)"));
             StartDial(false);
         }
+
+        // ==================================================================
+        // 网页认证模式的自动重连（2026-09-30 第十一批补）
+        //
+        // 背景 / 为什么需要单独一套：
+        //   认证模式下断了网，程序此前**什么都不做** —— 不重开认证页、不重拨，
+        //   只能用户手动点「打开认证页」重新登录。这不是优化，是功能缺失。
+        //
+        // 认证模式下"恢复连接"的正确动作是什么：
+        //   把认证页**重新打开并自动提交**（账号密码程序有，验证码要用户填）。
+        //   它和拨号是两回事，不能复用 StartDial。
+        //
+        // ⚠️ 三条安全边界（想清楚了才敢自动做）：
+        //
+        //   ① 绝不绕过验证码。程序只做"填账号密码 + 点登录"，
+        //      验证码永远等用户亲眼看着敲。这是硬底线，没有例外。
+        //
+        //   ② 不能偷偷摸摸弹窗。用户在打游戏、在看视频，桌面突然蹦出一个窗口
+        //      是最讨厌的行为。所以自动重开时：
+        //        · 窗口不抢焦点（ShowActivated = false）
+        //        · 静默模式（开机自启 / 后台待着）下**只发托盘气泡**，
+        //          让用户自己点气泡里的动作来开；绝不主动弹到前台。
+        //      ——海辰的明确要求："尤其游戏场景，反对任何弹窗与侵入性闪烁"。
+        //
+        //   ③ 要能停下来。连续失败到上限就放弃并把状态标成 Error，
+        //      由用户介入。认证连续失败通常意味着密码改了 / 学号变了，
+        //      再重试也没用，反而可能触发学校的风控。
+        //
+        // 状态标记 _portalReauthRunning 是防重入的：认证页本身有 5 分钟
+        // 自动重试窗口，这段时间内不该再叠一个。
+        // ==================================================================
+
+        /// <summary>认证页自动重开的进行中标记（防重入）。</summary>
+        private bool _portalReauthRunning = false;
+
+        /// <summary>本次掉线已经自动重开过几次认证页。连上或用户手动操作后归零。</summary>
+        private int _portalReauthAttempts = 0;
+
+        /// <summary>连续重试到这里就不试了，交给用户。3 次足够覆盖瞬时抖动。</summary>
+        private const int PortalReauthMaxAttempts = 3;
+
+        private void StartPortalAutoReauth()
+        {
+            // 免打扰时段不动手（和拨号模式一致：夜里不折腾）
+            if (_quietActive) return;
+
+            if (!AutoReconnectEnabled()) return;
+
+            // 没有账号就没法自动填表 —— 直接说清楚，别假装在努力
+            if (_accounts.Count == 0)
+            {
+                Log.Warn("网页认证自动重连：一个账号都没有，无法自动认证");
+                ApplyState(ConnState.Error, "需要重新认证",
+                    "认证已失效，但程序里没有任何已保存的账号。点「管理账号」加一个。");
+                return;
+            }
+
+            // 认证窗口已经开着（用户自己开的，或上一轮还没结束）→ 不重复开
+            if (_webAuthWindow != null && _webAuthWindow.IsLoaded)
+            {
+                Log.Info("网页认证自动重连：认证页已经开着，交给它自己处理");
+                return;
+            }
+
+            if (_portalReauthRunning) return;
+
+            if (_portalReauthAttempts >= PortalReauthMaxAttempts)
+            {
+                Log.Warn("网页认证自动重连：已连续失败 " + _portalReauthAttempts + " 次，停止自动尝试");
+                ApplyState(ConnState.Error, "需要重新认证",
+                    "自动重新认证试了 " + _portalReauthAttempts + " 次都没成功。"
+                    + "可能是密码改了或账号变了，点「打开认证页」手动登一次。");
+                AddHistory("自动重新认证失败 · 请手动登录");
+                return;
+            }
+
+            _portalReauthAttempts++;
+            _portalReauthRunning = true;
+
+            ApplyState(ConnState.Connecting, "正在重新认证…",
+                "认证已失效，正在自动打开认证页（第 " + _portalReauthAttempts + " 次）");
+
+            bool silent = _silentStart || !IsVisible;
+
+            if (silent)
+            {
+                // 静默场景（开机自启 / 缩在托盘里）：**不发窗口、不抢焦点**，
+                // 只发一个托盘气泡。用户点了才开认证页。
+                // 这样绝不会在他打游戏时蹦出一个窗口来。
+                Log.Info("网页认证自动重连：当前是后台/静默状态，改为发托盘提示而不弹窗");
+                ShowBalloon("认证已失效，需要重新登录",
+                    "网络断了。点这里打开认证页登录（账号密码已帮你填好，只需填验证码）。");
+
+                // 把"重开认证页"挂到气泡点击上 —— 见 ShowBalloon 的 clickAction 重载
+                _pendingPortalReauth = true;
+                _portalReauthRunning = false;
+                AddHistory("认证失效 · 已提示（未弹窗，避免打扰）");
+                return;
+            }
+
+            // 前台场景：用户正开着主界面，直接把认证页拉起来。
+            // ⚠️ 不抢焦点（ShowActivated=false）：用户可能正在别的地方打字，
+            //    弹出窗口抢走焦点会让半截输入丢失。
+            OpenWebAuthWindowForReauth();
+        }
+
+        /// <summary>气泡被点过之后，真正把认证页打开（由 ShowBalloon 的回调触发）。</summary>
+        private bool _pendingPortalReauth = false;
+
+        internal void OpenPendingPortalReauthIfAny()
+        {
+            if (!_pendingPortalReauth) return;
+            _pendingPortalReauth = false;
+            OpenWebAuthWindowForReauth();
+        }
+
+        /// <summary>
+        /// 自动重连场景下打开认证页：自动填表 + 提交，但不抢焦点。
+        /// 与 OpenWebAuthWindowOnStartup 的区别是这里带"自动认证"语义。
+        /// </summary>
+        private void OpenWebAuthWindowForReauth()
+        {
+            try
+            {
+                if (_webAuthWindow != null && _webAuthWindow.IsLoaded)
+                {
+                    _portalReauthRunning = false;
+                    return;
+                }
+
+                _webAuthWindow = new WebAuthWindow(this);
+                _webAuthWindow.SetReauthMode(true);   // 通知它：这是自动重连，走自动填表
+                _webAuthWindow.Owner = this;
+                _webAuthWindow.ShowActivated = false;   // ⚠️ 不抢焦点
+
+                _webAuthWindow.Closed += delegate(object s, EventArgs a)
+                {
+                    _webAuthWindow = null;
+                    _portalReauthRunning = false;
+
+                    // 窗口关了 → 看看到底连上没有，决定要不要继续重试
+                    RefreshPortalOnlineNow();
+                    Dispatcher.BeginInvoke(new Action(delegate()
+                    {
+                        CheckPortalReauthOutcome();
+                    }), DispatcherPriority.Background);
+                };
+
+                _webAuthWindow.Show();
+                AddHistory("已自动打开认证页 · 请填验证码并登录");
+            }
+            catch (Exception ex)
+            {
+                _portalReauthRunning = false;
+                Log.Error("网页认证自动重连：打开认证页失败", ex);
+            }
+        }
+
+        /// <summary>
+        /// 认证页关闭后核对结果：通了就归零计数；没通就留着计数，
+        /// 下一轮 TickPortal 判定仍不在线时会再触发一次（受退避和上限约束）。
+        /// </summary>
+        private void CheckPortalReauthOutcome()
+        {
+            try
+            {
+                if (NetProbe.Online())
+                {
+                    Log.Info("网页认证自动重连：已恢复上网");
+                    _portalReauthAttempts = 0;
+                    _autoReconnectAttempts = 0;
+                    AddHistory("自动重新认证成功 · 已恢复上网");
+                }
+                else
+                {
+                    Log.Info("网页认证自动重连：认证页关掉了但仍未上网"
+                        + "（已试 " + _portalReauthAttempts + "/" + PortalReauthMaxAttempts + "）");
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>自测出口：当前自动重开认证页到第几次了。</summary>
+        internal int DebugPortalReauthAttempts() { return _portalReauthAttempts; }
+
+        /// <summary>
+        /// 自测出口：走一遍"该用哪个重连分支"的判断，返回分支名，**不真的执行**。
+        ///
+        /// 为什么需要它：本次修的 bug 正是"分支走错了"——认证模式下跑去拨号。
+        /// 所以用例必须能直接问"现在这个设置下，重连会走哪条路"，
+        /// 而不是去看日志里有没有"拨号结果: exit=628"（那要真跑拨号，代价太大）。
+        /// </summary>
+        internal string DebugReconnectBranch()
+        {
+            return IsPortalMode() ? "portal" : "dial";
+        }
+
+        /// <summary>
+        /// 自测出口：把一个假的"掉线"喂给判定逻辑，看会不会武装自动重连。
+        /// 返回 (是否武装, 是否走认证分支)。
+        /// </summary>
+        internal bool DebugArmAutoReconnect()
+        {
+            if (!AutoReconnectEnabled()) return false;
+            _autoReconnectArmed = true;
+            _lastAutoTry = DateTime.MinValue;
+            return _autoReconnectArmed;
+        }
+
+        /// <summary>
+        /// 自测出口：把 _portalOnline 设成"曾经在线过"，用于模拟"在线中断线"。
+        /// </summary>
+        internal void DebugSetPortalWasOnline()
+        {
+            _portalOnline = true;
+            _portalFailStreak = 0;
+        }
+
+        /// <summary>自测出口：读当前是否已武装（不改状态）。</summary>
+        internal bool DebugIsArmed() { return _autoReconnectArmed; }
+
+        /// <summary>自测出口：模拟一次"判定掉线"的收尾动作（不碰真实网络）。</summary>
+        internal void DebugSimulatePortalDrop()
+        {
+            _portalFailStreak = 0;
+            if (_portalOnline)
+            {
+                _portalOnline = false;
+                _connectedAt = DateTime.MinValue;
+                if (AutoReconnectEnabled() && !_quietActive)
+                {
+                    _autoReconnectArmed = true;
+                    _lastAutoTry = DateTime.MinValue;
+                }
+            }
+        }
+
+        /// <summary>自测出口：重置自动重连计数，让用例可重复跑。</summary>
+        internal void DebugResetPortalReauth()
+        {
+            _portalReauthAttempts = 0;
+            _autoReconnectAttempts = 0;
+            _portalReauthRunning = false;
+            _lastAutoTry = DateTime.MinValue;
+            _pendingPortalReauth = false;
+        }
+
+        /// <summary>
+        /// 自测出口：只做"计数 + 上限判断"这部分，不打开任何窗口。
+        /// 用来验证重试到底会不会在 3 次之后停下。
+        /// 返回 true = 还允许继续尝试。
+        /// </summary>
+        internal bool DebugBumpPortalReauthAttempt()
+        {
+            if (_portalReauthAttempts >= PortalReauthMaxAttempts) return false;
+            _portalReauthAttempts++;
+            return true;
+        }
+
+        /// <summary>自测出口：上限值是多少。</summary>
+        internal int DebugPortalReauthMax() { return PortalReauthMaxAttempts; }
+
+        /// <summary>自测出口：当前认证方式（原始字符串，用于打印）。</summary>
+        internal string DebugAuthModeText() { return AuthMode(); }
+
+        /// <summary>自测出口：当前是不是"等着用户点气泡"的状态。</summary>
+        internal bool DebugPendingPortalReauth() { return _pendingPortalReauth; }
 
         // ==================================================================
         // 夜间免打扰
@@ -713,28 +1559,35 @@ namespace CampusNetHelper
         // 网速
         // ==================================================================
 
+        /// <summary>
+        /// 上一轮采样时统计的是哪块网卡（按 Id 记，Id 是稳定的）。
+        ///
+        /// 为什么要记：网卡一换（拨号建立、认证前后切到物理网卡），
+        /// 新网卡的累计字节数跟老网卡没有可比性 —— 直接相减会算出一个
+        /// 巨大或负数的速率，曲线上凭空出现一根尖刺或者一个掉到 0 的坑。
+        /// 换了网卡就当"重新开始采样"，跳过这一次的差值计算。
+        /// </summary>
+        private string _speedAdapterId = "";
+
         private void SampleSpeed()
         {
             try
             {
-                long rx = 0, tx = 0;
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                NetworkInterface ni = NetProbe.PickTrafficAdapter();
+
+                long rx, tx;
+                if (!NetProbe.TrafficOf(ni, out rx, out tx))
                 {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                    // 只统计拨号接口 —— 否则局域网共享、Wi-Fi 的流量也会被算进来，
-                    // 用户会看到"明明没上网，速率却在跳"。
-                    if (ni.NetworkInterfaceType != NetworkInterfaceType.Ppp) continue;
-                    try
-                    {
-                        IPv4InterfaceStatistics st = ni.GetIPv4Statistics();
-                        rx += st.BytesReceived;
-                        tx += st.BytesSent;
-                    }
-                    catch { }
+                    // 这一轮没采到（网卡消失 / 权限问题）——
+                    // 不要把它当成"零流量"，保持上一轮的显示，下一轮再试。
+                    return;
                 }
 
+                string id = ni.Id ?? "";
+                bool changed = (id != _speedAdapterId);
+
                 DateTime now = DateTime.Now;
-                if (_lastSampleAt != DateTime.MinValue)
+                if (_lastSampleAt != DateTime.MinValue && !changed)
                 {
                     double secs = (now - _lastSampleAt).TotalSeconds;
                     if (secs > 0.2)
@@ -749,6 +1602,24 @@ namespace CampusNetHelper
                         _speedHistory.Add(down);
                         while (_speedHistory.Count > SpeedHistoryMax) _speedHistory.RemoveAt(0);
                         RedrawSpeedGraph();
+                    }
+                }
+
+                if (changed)
+                {
+                    // 换了网卡 —— 上一块的累计值不能用来算这块的差值。
+                    // 记一笔，从这块网卡开始重新起算。
+                    //
+                    // ⚠️ 只有**运行中途换网卡**才写日志。
+                    //    程序刚起来时 _speedAdapterId 还是空串，第一次采样必然
+                    //    "changed == true" —— 那不是切换，是初始化。原先这里无条件写，
+                    //    结果每次启动都留下一条"网速统计切换到网卡"，纯噪音
+                    //    （2026-09-30 冒烟测试发现：13 条里有 11 条是这么来的）。
+                    bool firstEver = (_speedAdapterId.Length == 0);
+                    _speedAdapterId = id;
+                    if (!firstEver)
+                    {
+                        Log.Info("网速统计切换到网卡: " + (ni.Name ?? "") + "（" + NetProbe.KindOf(ni) + "）");
                     }
                 }
 
@@ -875,6 +1746,12 @@ namespace CampusNetHelper
                 lblQualityDetail.Text = active ? s.Detail : "连接后自动开始监测丢包与延迟。";
             }
 
+            // 适配器名（"程序看的是哪条线"）—— 与参数卡片同源，一起刷新不会打架
+            if (lblAdapter != null)
+            {
+                lblAdapter.Text = _primaryAdapterLabel ?? "";
+            }
+
             // 曲线跟着等级换色
             if (qualityLine != null) qualityLine.Stroke = new SolidColorBrush(c);
             if (qualityFill != null)
@@ -976,65 +1853,57 @@ namespace CampusNetHelper
         {
             try
             {
-                string ip = "", gw = "", dns = "";
+                // 参数卡片只关心"当前是哪条线在上网"。
+                // 选卡逻辑统一收在 NetProbe 里 —— 原先这里自己写了一遍枚举，
+                // 既没排虚拟网卡，也要跟质量模块的逻辑对不上（两处会得出不同答案）。
+                NetworkInterface ni = NetProbe.PickPrimaryAdapter();
 
-                // 优先展示拨号接口；没有拨号接口时退回其他网卡。
-                // 否则同时插着网线又连着 Wi-Fi 时，卡片上显示的可能是 Wi-Fi 的地址。
-                var ordered = new List<NetworkInterface>();
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Ppp) ordered.Insert(0, ni);
-                    else ordered.Add(ni);
-                }
-
-                foreach (NetworkInterface ni in ordered)
-                {
-                    IPInterfaceProperties props = ni.GetIPProperties();
-
-                    if (ip.Length == 0)
-                    {
-                        foreach (UnicastIPAddressInformation ua in props.UnicastAddresses)
-                        {
-                            if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                            {
-                                ip = ua.Address.ToString();
-                                break;
-                            }
-                        }
-                    }
-                    if (gw.Length == 0)
-                    {
-                        foreach (GatewayIPAddressInformation g in props.GatewayAddresses)
-                        {
-                            if (g.Address != null
-                                && g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
-                                && g.Address.ToString() != "0.0.0.0")
-                            {
-                                gw = g.Address.ToString();
-                                break;
-                            }
-                        }
-                    }
-                    if (dns.Length == 0)
-                    {
-                        foreach (System.Net.IPAddress d in props.DnsAddresses)
-                        {
-                            if (d.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                            {
-                                dns = d.ToString();
-                                break;
-                            }
-                        }
-                    }
-                }
+                string ip = NetProbe.Ipv4Of(ni);
+                string gw = NetProbe.GatewayOf(ni);
+                string dns = NetProbe.DnsOf(ni);
 
                 if (valIp != null) valIp.Text = ip.Length > 0 ? ip : "—";
                 if (valGateway != null) valGateway.Text = gw.Length > 0 ? gw : "—";
                 if (valDns != null) valDns.Text = dns.Length > 0 ? dns : "—";
+
+                // 顺手把"程序看的是哪块网卡"记下来给质量卡片用。
+                // 本机同时挂着向日葵 / UU远程 / FlClash TUN / Watt Toolkit 一堆虚拟网卡，
+                // 用户只看数字的话没法确认程序有没有选错线，得把名字摆出来。
+                _primaryAdapterLabel = BuildAdapterLabel(ni);
             }
             catch { }
+        }
+
+        /// <summary>当前用于展示的适配器描述，形如「以太网 · 有线 1000 Mbps」。</summary>
+        private string _primaryAdapterLabel = "";
+
+        /// <summary>
+        /// 给适配器拼一句人话，用于界面自证"看的是哪条线"。
+        /// 取不到任何信息时返回空串（界面上就不显示，不占地方）。
+        /// </summary>
+        private static string BuildAdapterLabel(NetworkInterface ni)
+        {
+            if (ni == null) return "";
+
+            string kind = NetProbe.KindOf(ni);
+            string name = ni.Name ?? "";
+            if (name.Length == 0) name = ni.Description ?? "";
+            if (name.Length == 0) return "";
+
+            string head = name;
+            if (kind.Length > 0) head = head + " · " + kind;
+
+            // 拨号接口报的速率没有参考价值，干脆不显示
+            if (kind != "拨号")
+            {
+                try
+                {
+                    long mbps = ni.Speed / 1000000L;
+                    if (mbps > 0) head = head + " " + mbps + " Mbps";
+                }
+                catch { }
+            }
+            return head;
         }
 
         // ==================================================================
@@ -1062,6 +1931,9 @@ namespace CampusNetHelper
             // 质量监测跟着连接状态走：连上就开始测，断开就停
             _quality.SetActive(state == ConnState.Connected);
             RefreshQualityUi();
+
+            // 在线时长跟着状态一起刷 —— 否则刚连上那一秒里时长是空的
+            RefreshOnlineTime();
 
             // 心跳保活同理：只有连着网才需要发心跳，断开就该停
             _keepAlive.SetActive(state == ConnState.Connected && KeepAliveEnabled(),
@@ -1123,6 +1995,43 @@ namespace CampusNetHelper
             return Theme.TextPrimary;
         }
 
+        /// <summary>
+        /// 刷新在线时长那行字。
+        ///
+        /// ⚠️ 两条历史教训，都写在这儿免得再踩：
+        ///
+        /// ① 原先这段逻辑只写在 OnTick 里，于是状态刚变成"已连接"的那一秒内
+        ///    时长显示是空的 —— 用户点完认证、窗口关掉回头一看，正好撞上这个空窗期。
+        ///    抽出来给 ApplyState 也调一次，状态一变时长立刻就有值。
+        ///
+        /// ② 【2026-09-30 海辰报的第二个 bug】"呼出主页时在线时长不动，
+        ///    放在后台时时间才同步"。
+        ///    根因不在这个函数，而在"谁来调它"：拖动窗口 / 点击标题栏会让 Windows
+        ///    进入模态消息循环，DispatcherTimer 被压住不发。
+        ///    而这个函数的写法本身是**自愈**的 —— 它永远按"现在 - 起点"重算，
+        ///    不做 `+= 1` 的累加。所以只要被调到一次，显示值立刻跳到正确位置，
+        ///    漏掉多少 tick 都不会累积误差。**别把它改成累加式，那样一定会漂。**
+        /// </summary>
+        private void RefreshOnlineTime()
+        {
+            if (lblOnlineTime == null) return;
+
+            if (_connectedAt == DateTime.MinValue)
+            {
+                lblOnlineTime.Text = "";
+                return;
+            }
+
+            TimeSpan ts = DateTime.Now - _connectedAt;
+            if (ts < TimeSpan.Zero) ts = TimeSpan.Zero;   // 系统时间被往回调过也不显示负数
+
+            string text = "在线 " + string.Format("{0:00}:{1:00}:{2:00}",
+                (int)ts.TotalHours, ts.Minutes, ts.Seconds);
+
+            // 值没变就不写 —— 每秒都赋同一个字符串会让 WPF 白白重排一次文本
+            if (lblOnlineTime.Text != text) lblOnlineTime.Text = text;
+        }
+
         private static Color Cc(byte r, byte g, byte b)
         {
             return Color.FromRgb(r, g, b);
@@ -1135,6 +2044,14 @@ namespace CampusNetHelper
         private void BtnMainAction_Click(object sender, RoutedEventArgs e)
         {
             if (_state == ConnState.Connecting || _state == ConnState.Disconnecting) return;
+
+            // 网页认证模式：「立即连接」= 打开认证页去登录，不是拨号
+            if (IsPortalMode())
+            {
+                OpenWebAuthWindowOnStartup();
+                return;
+            }
+
             StartDial(_state == ConnState.Connected);
         }
 
@@ -1529,6 +2446,13 @@ namespace CampusNetHelper
                 Visible = true
             };
             trayIcon.DoubleClick += delegate(object s, EventArgs e) { ShowMainWindow(); };
+
+            // 点了气泡 → 如果正等着"用户确认才开认证页"（自动重连的静默分支），
+            // 这时候才真的把它打开。这样静默/游戏场景下就不会无预警弹窗。
+            trayIcon.BalloonTipClicked += delegate(object s, EventArgs e)
+            {
+                OpenPendingPortalReauthIfAny();
+            };
         }
 
         private void UpdateTrayState(string text)

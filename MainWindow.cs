@@ -52,6 +52,9 @@ namespace CampusNetHelper
         internal Polyline qualityFill;
         internal Polyline qualityLine;
         internal Border badgeQuality;
+
+        /// <summary>质量卡片标题行右侧的「适配器名 · 类型 速率」小字。</summary>
+        internal TextBlock lblAdapter;
         internal TextBlock lblQualityVerdict;
         internal TextBlock valLoss;
         internal TextBlock valRtt;
@@ -94,7 +97,7 @@ namespace CampusNetHelper
 
         internal const string FontUi = "Microsoft YaHei UI, Microsoft YaHei, Segoe UI";
         internal const string FontMono = "Consolas, Microsoft YaHei UI";
-        internal const string VersionText = "1.3.5";
+        internal const string VersionText = "2.0.0";
 
         // ==================================================================
         // 本校专属默认值
@@ -1026,6 +1029,21 @@ namespace CampusNetHelper
                 Child = lblQualityVerdict
             };
             head.Children.Add(badgeQuality);
+
+            // 程序到底在看哪块网卡 —— 本机虚拟网卡一堆（向日葵 / UU远程 / FlClash TUN /
+            // Watt Toolkit），只看数字没法自证有没有选错线，所以把名字和协商速率摆出来。
+            lblAdapter = new TextBlock
+            {
+                Text = "",
+                FontSize = 11,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(10, 0, 0, 0),
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                MaxWidth = 220
+            };
+            _mutedTexts.Add(lblAdapter);
+            head.Children.Add(lblAdapter);
 
             btnSpeedTest = MakeGhostButton("网络测速", delegate() { BtnSpeedTest_Click(null, null); });
             btnSpeedTest.FontSize = 11;

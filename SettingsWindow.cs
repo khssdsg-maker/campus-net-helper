@@ -28,14 +28,37 @@ namespace CampusNetHelper
         private Button btnAutostart;
         private TextBlock lblAutostart;
 
+        // 认证方式
+        private RadioButton rbDial;
+        private RadioButton rbPortal;
+        private TextBlock lblAuthHint;
+        private StackPanel panelPortalOpts;
+        private RadioButton rbPortalAuto;
+        private RadioButton rbPortalKeep;
+
+        /// <summary>
+        /// 装载配置期间置 true —— 这期间控件的赋值会触发变更事件，
+        /// 不挡住的话会在窗口刚打开时反写一遍配置（还可能弹校验失败的框）。
+        /// </summary>
+        private bool _loading = false;
+
+        /// <summary>自动保存的节流定时器：连点几下只写一次盘。</summary>
+        private System.Windows.Threading.DispatcherTimer _autoSaveTimer;
+
+        /// <summary>顶部那行"已自动保存 ✓"提示。</summary>
+        private TextBlock lblAutoSaveHint;
+
         public SettingsWindow(MainWindow ownerWindow)
         {
             owner = ownerWindow;
 
             Title = "设置";
-            Width = 540;
+            // ⚠️ 这里的宽度和 MinWidth 是"文字不被挤断"的下限：
+            //    认证方式那两条说明是最长的一行，540 是量着它定的。
+            //    MinWidth 也照着给，别让用户把窗口拉窄到文字折成一条一条。
+            Width = 560;
             Height = 640;
-            MinWidth = 480;
+            MinWidth = 540;
             MinHeight = 520;
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
             Background = new SolidColorBrush(Theme.WindowBg);
@@ -44,6 +67,7 @@ namespace CampusNetHelper
 
             BuildUi();
             LoadFromOwner();
+            HookAutoSave();          // 改动即存 —— 不用再滚到底找「保存」
             RefreshAutostartState();
         }
 
@@ -56,6 +80,93 @@ namespace CampusNetHelper
             };
             var stack = new StackPanel { Margin = new Thickness(20) };
             scroll.Content = stack;
+
+            // ---------- 顶部：自动保存提示条 ----------
+            lblAutoSaveHint = new TextBlock
+            {
+                Text = "本页设置会自动保存，改完即可关闭。",
+                FontSize = 12,
+                Foreground = new SolidColorBrush(Theme.Accent),
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            stack.Children.Add(lblAutoSaveHint);
+
+            // ---------- 认证方式（最上面，最关键的一个选择） ----------
+            stack.Children.Add(SectionTitle("认证方式"));
+
+            var authCard = new Border
+            {
+                Background = new SolidColorBrush(Theme.GlassCard),
+                BorderBrush = new SolidColorBrush(Theme.Accent),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(14, 12, 14, 14),
+                Margin = new Thickness(0, 10, 0, 0)
+            };
+            var authPanel = new StackPanel();
+            authCard.Child = authPanel;
+            stack.Children.Add(authCard);
+
+            rbDial = new RadioButton
+            {
+                Content = "系统拨号（宽带连接）",
+                GroupName = "AuthMode",
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                FontSize = 13,
+                Margin = new Thickness(0, 0, 0, 0)
+            };
+            rbDial.Checked += delegate(object s, RoutedEventArgs e) { OnAuthModeChanged(); };
+            authPanel.Children.Add(rbDial);
+            authPanel.Children.Add(HintLine("上网账号密码保存在本机，开机可以静默自动连接，掉线自动重连。"));
+
+            rbPortal = new RadioButton
+            {
+                Content = "网页认证（打开认证页面登录）",
+                GroupName = "AuthMode",
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                FontSize = 13,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            rbPortal.Checked += delegate(object s, RoutedEventArgs e) { OnAuthModeChanged(); };
+            authPanel.Children.Add(rbPortal);
+            authPanel.Children.Add(HintLine("登录网页里要填图形验证码，程序没法替你自动认，"
+                + "所以开机后会把认证窗口直接弹出来，账号密码帮你填好，你填一下验证码就行。"));
+
+            // 网页认证模式下的开机行为（只在选了网页认证时显示）
+            panelPortalOpts = new StackPanel { Margin = new Thickness(20, 12, 0, 0) };
+            panelPortalOpts.Children.Add(new TextBlock
+            {
+                Text = "开机弹出认证窗口后：",
+                FontSize = 11,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+
+            rbPortalAuto = new RadioButton
+            {
+                Content = "登录完成后自动关闭窗口",
+                GroupName = "PortalStartup",
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                FontSize = 12
+            };
+            panelPortalOpts.Children.Add(rbPortalAuto);
+
+            rbPortalKeep = new RadioButton
+            {
+                Content = "窗口保持打开，方便反复使用",
+                GroupName = "PortalStartup",
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                FontSize = 12,
+                Margin = new Thickness(0, 6, 0, 0)
+            };
+            panelPortalOpts.Children.Add(rbPortalKeep);
+            authPanel.Children.Add(panelPortalOpts);
+
+            lblAuthHint = HintLine("");
+            lblAuthHint.Margin = new Thickness(0, 10, 0, 0);
+            authPanel.Children.Add(lblAuthHint);
+
+            stack.Children.Add(Divider());
 
             // ---------- 自动化 ----------
             stack.Children.Add(SectionTitle("自动化"));
@@ -291,7 +402,7 @@ namespace CampusNetHelper
             btnLog.Margin = new Thickness(0, 12, 0, 0);
             stack.Children.Add(btnLog);
 
-            var btnSave = MainWindow.MakeButton("保存设置",
+            var btnSave = MainWindow.MakeButton("保存并校验设置（本页已自动保存）",
                 Theme.Accent, Theme.OnAccent, Theme.Accent, SaveToOwner);
             btnSave.HorizontalAlignment = HorizontalAlignment.Left;
             btnSave.Margin = new Thickness(0, 18, 0, 0);
@@ -309,6 +420,167 @@ namespace CampusNetHelper
                 FontWeight = FontWeights.Medium,
                 Foreground = new SolidColorBrush(Theme.TextPrimary)
             };
+        }
+
+        /// <summary>缩进的小字说明（挂在某个选项下面）。</summary>
+        private static TextBlock HintLine(string text)
+        {
+            return new TextBlock
+            {
+                Text = text,
+                FontSize = 11,
+                Foreground = new SolidColorBrush(Theme.TextFaint),
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 17,
+                Margin = new Thickness(20, 4, 0, 0)
+            };
+        }
+
+        /// <summary>切换认证方式时：显隐"网页认证专属选项"、更新提示文案。</summary>
+        private void OnAuthModeChanged()
+        {
+            bool portal = rbPortal != null && rbPortal.IsChecked == true;
+
+            if (panelPortalOpts != null)
+            {
+                panelPortalOpts.Visibility = portal ? Visibility.Visible : Visibility.Collapsed;
+            }
+
+            if (lblAuthHint != null)
+            {
+                lblAuthHint.Text = portal
+                    ? "选它之后：开机自启不再静默拨号，而是直接弹出网页认证窗口（夜间免打扰时段内不弹）。"
+                    : "选它之后：开机自启在后台静默拨号，保持原来的行为，不会弹窗打扰。";
+            }
+        }
+
+        // ==================================================================
+        // 自动保存
+        //
+        // 为什么改成自动保存：原来只有窗口最底部一个「保存设置」按钮，
+        // 设置项一多就得往下滚很久才找得到，很容易改完以为生效了其实没保存。
+        // 现在改成"改哪儿存哪儿"，底部那个按钮保留，作为"我就是要保存一下"的兜底。
+        // ==================================================================
+
+        /// <summary>给所有会改配置的控件挂上变更事件。</summary>
+        private void HookAutoSave()
+        {
+            _autoSaveTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(600)
+            };
+            _autoSaveTimer.Tick += delegate(object s, EventArgs e)
+            {
+                _autoSaveTimer.Stop();
+                AutoSaveNow();
+            };
+
+            if (chkAutoReconnect != null)
+                chkAutoReconnect.Checked += delegate { RequestAutoSave(); };
+            if (chkAutoReconnect != null)
+                chkAutoReconnect.Unchecked += delegate { RequestAutoSave(); };
+            if (chkKeepAlive != null)
+                chkKeepAlive.Checked += delegate { RequestAutoSave(); };
+            if (chkKeepAlive != null)
+                chkKeepAlive.Unchecked += delegate { RequestAutoSave(); };
+            if (chkCloseToTray != null)
+                chkCloseToTray.Checked += delegate { RequestAutoSave(); };
+            if (chkCloseToTray != null)
+                chkCloseToTray.Unchecked += delegate { RequestAutoSave(); };
+
+            // 夜间免打扰：开关和时段都要存
+            if (chkNightQuiet != null)
+                chkNightQuiet.Checked += delegate { RequestAutoSave(); };
+            if (chkNightQuiet != null)
+                chkNightQuiet.Unchecked += delegate { RequestAutoSave(); };
+            if (txtQuietStart != null)
+                txtQuietStart.LostFocus += delegate { RequestAutoSave(); };
+            if (txtQuietEnd != null)
+                txtQuietEnd.LostFocus += delegate { RequestAutoSave(); };
+
+            // 数字/文本输入框：失焦时才触发，避免边打字边存
+            if (txtInterval != null)
+                txtInterval.LostFocus += delegate { RequestAutoSave(); };
+            if (txtKeepAlive != null)
+                txtKeepAlive.LostFocus += delegate { RequestAutoSave(); };
+
+            // 认证方式（RadioButton 的 Checked 事件在 BuildUi 里已挂 OnAuthModeChanged，
+            // 这里再挂一个保存）
+            if (rbDial != null)
+                rbDial.Checked += delegate { RequestAutoSave(); };
+            if (rbPortal != null)
+                rbPortal.Checked += delegate { RequestAutoSave(); };
+            if (rbPortalAuto != null)
+                rbPortalAuto.Checked += delegate { RequestAutoSave(); };
+            if (rbPortalKeep != null)
+                rbPortalKeep.Checked += delegate { RequestAutoSave(); };
+        }
+
+        /// <summary>请求一次自动保存（600ms 内的多次请求合并成一次）。</summary>
+        private void RequestAutoSave()
+        {
+            if (_loading) return;            // 装载阶段的赋值不触发保存
+            if (_autoSaveTimer == null) return;
+            _autoSaveTimer.Stop();
+            _autoSaveTimer.Start();
+        }
+
+        /// <summary>
+        /// 真正执行自动保存。
+        ///
+        /// ⚠️ 与手动保存的区别：**不弹任何对话框**，也不因为格式不合法而回退输入。
+        ///    用户还在输入途中（比如时间只打了一半），这时候弹框或改他的字都很讨厌。
+        ///    格式不合法就**跳过这次保存**，等他填完整再说 —— 界面上有底部按钮
+        ///    负责"认真保存并校验"。
+        /// </summary>
+        private void AutoSaveNow()
+        {
+            if (_loading) return;
+
+            int iv;
+            if (!int.TryParse((txtInterval.Text ?? "").Trim(), out iv) || iv < 5 || iv > 600) return;
+
+            int ka;
+            if (!int.TryParse((txtKeepAlive.Text ?? "").Trim(), out ka) || ka < 1 || ka > 60) return;
+
+            string qs = (txtQuietStart.Text ?? "").Trim();
+            string qe = (txtQuietEnd.Text ?? "").Trim();
+            if (chkNightQuiet.IsChecked == true)
+            {
+                if (!MainWindow.IsValidHm(qs) || !MainWindow.IsValidHm(qe)) return;
+                if (qs == qe) return;
+            }
+
+            try
+            {
+                owner.ApplySettingsFromWindowSilent(
+                    chkAutoReconnect.IsChecked == true,
+                    chkSilent.IsChecked == true,
+                    chkCloseToTray.IsChecked == true,
+                    iv,
+                    chkKeepAlive.IsChecked == true,
+                    ka,
+                    chkNightQuiet.IsChecked == true,
+                    qs,
+                    qe,
+                    (rbPortal != null && rbPortal.IsChecked == true) ? "portal" : "dial",
+                    (rbPortalKeep != null && rbPortalKeep.IsChecked == true) ? "keep" : "auto");
+
+                // 静默保存不改勾选框（避免打断用户），但开机自启的实际状态要跟一下
+                if (chkSilent != null) chkSilent.IsChecked = owner.SilentEnabled();
+
+                SetSaveHint("已自动保存 ✓");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("自动保存设置失败: " + ex.Message);
+            }
+        }
+
+        private void SetSaveHint(string text)
+        {
+            if (lblAutoSaveHint == null) return;
+            lblAutoSaveHint.Text = text;
         }
 
         private static CheckBox MakeCheck(string text, bool initial)
@@ -335,16 +607,30 @@ namespace CampusNetHelper
 
         private void LoadFromOwner()
         {
-            chkAutoReconnect.IsChecked = owner.AutoReconnectEnabled();
-            chkSilent.IsChecked = owner.SilentEnabled();
-            chkCloseToTray.IsChecked = owner.CloseToTrayEnabled();
-            txtInterval.Text = owner.ReconnectInterval().ToString();
-            chkKeepAlive.IsChecked = owner.KeepAliveEnabled();
-            txtKeepAlive.Text = owner.KeepAliveIntervalMinutes().ToString();
+            _loading = true;
+            try
+            {
+                chkAutoReconnect.IsChecked = owner.AutoReconnectEnabled();
+                chkSilent.IsChecked = owner.SilentEnabled();
+                chkCloseToTray.IsChecked = owner.CloseToTrayEnabled();
+                txtInterval.Text = owner.ReconnectInterval().ToString();
+                chkKeepAlive.IsChecked = owner.KeepAliveEnabled();
+                txtKeepAlive.Text = owner.KeepAliveIntervalMinutes().ToString();
 
-            chkNightQuiet.IsChecked = owner.NightQuietEnabled();
-            txtQuietStart.Text = owner.NightQuietStart();
-            txtQuietEnd.Text = owner.NightQuietEnd();
+                chkNightQuiet.IsChecked = owner.NightQuietEnabled();
+                txtQuietStart.Text = owner.NightQuietStart();
+                txtQuietEnd.Text = owner.NightQuietEnd();
+
+                // 认证方式
+                bool portal = owner.IsPortalMode();
+                rbDial.IsChecked = !portal;
+                rbPortal.IsChecked = portal;
+                bool keepOpen = owner.PortalStartupBehavior() == "keep";
+                rbPortalKeep.IsChecked = keepOpen;
+                rbPortalAuto.IsChecked = !keepOpen;
+                OnAuthModeChanged();
+            }
+            finally { _loading = false; }
         }
 
         private void SaveToOwner()
@@ -395,7 +681,9 @@ namespace CampusNetHelper
                 ka,
                 chkNightQuiet.IsChecked == true,
                 qs,
-                qe);
+                qe,
+                (rbPortal.IsChecked == true) ? "portal" : "dial",
+                (rbPortalKeep.IsChecked == true) ? "keep" : "auto");
 
             // 勾选框以**实际结果**为准：装计划任务时会拒绝创建副本、从副本运行时删不掉，
             // 这两种情况都得让界面如实回退，不能让用户看着是勾上的却其实没生效。
