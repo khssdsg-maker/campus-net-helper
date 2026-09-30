@@ -27,3 +27,6 @@ SiteConfig.cs
 Thumbs.db
 Desktop.ini
 desktop.ini
+
+# 宣传物料生成脚本（硬编码了本机输出目录，只在发版/宣传时本地跑）
+promo_shots.py
