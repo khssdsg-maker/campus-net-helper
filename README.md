@@ -25,6 +25,9 @@
 > 👉 [gitee.com/khssdsg-maker/campus-net-helper/releases](https://gitee.com/khssdsg-maker/campus-net-helper/releases)
 > 两个仓库内容完全一致，挑一个能打开的下载就行。
 
+<!-- TODO(待确认)：Gitee 仓库建好后，把上面两条链接里的 khssdsg-maker 换成真实用户名，
+     并确认 releases 页面已同步上传 exe / zip 两个附件。 -->
+
 有两种下法，随便挑：
 
 | 下哪个 | 怎么用 |
