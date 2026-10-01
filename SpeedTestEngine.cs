@@ -202,6 +202,18 @@ namespace CampusNetHelper
         private const double MinUsefulSeconds = 1.0;
 
         /// <summary>
+        /// 上传结果的最小可信数据量。
+        ///
+        /// 低于它说明这个源几乎灌不进数据，结果没有参考价值 ——
+        /// 该判失败去换列表里下一个源，而不是给用户一个像模像样的假数字。
+        /// 下载那边一直有下限（MinUsefulBytes），**上传漏了**（2026-10-01 审计确认）：
+        /// 原来只排除"正好为 0"，某个源限速 / 半开连接 / 服务器慢吞吞收包时，
+        /// 10 秒只发出几 KB 也算"成功"，界面上显示"上传 0.003 Mbps"，
+        /// 而且因为返回了 true，后面的源连试都不试了。
+        /// </summary>
+        private const long MinUploadUsefulBytes = 262144;  // 256 KB
+
+        /// <summary>
         /// 预热期（秒）。TCP 慢启动 + 发送缓冲区填满的这段时间速率偏虚高，理论上该剔除。
         /// 但实测（16 线程 / CDN 源）跳过与不跳过分别是 711 / 705 Mbps，差异可以忽略；
         /// 而剔除字节会让有效计数时间变短、反而容易低估。
@@ -990,12 +1002,21 @@ namespace CampusNetHelper
             sw.Stop();
 
             long got = Interlocked.Read(ref total);
-            if (got <= 0) return false;
 
             double fullSecs = sw.Elapsed.TotalSeconds;
             double secs = fullSecs - UploadWarmupSeconds;
             if (secs < 1.0) secs = fullSecs;
             if (secs <= 0.05) return false;
+
+            // ⚠️ 数据量不够就判失败，让调用方去换下一个源（2026-10-01 审计确认）。
+            //    这里原来是 `if (got <= 0) return false;` —— 只挡"正好为 0"，
+            //    于是"连得上但几乎灌不动"的源会产出一个看起来很正常的假数字。
+            if (secs < MinUsefulSeconds || got < MinUploadUsefulBytes)
+            {
+                Log.Warn("上传测速数据不足（换源）: " + (got / 1024) + " KB / "
+                    + secs.ToString("0.0") + "s");
+                return false;
+            }
 
             mbps = got * 8.0 / secs / 1e6;
             mb = got / 1e6;

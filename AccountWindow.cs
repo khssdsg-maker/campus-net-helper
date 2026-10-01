@@ -409,6 +409,23 @@ namespace CampusNetHelper
                 return;
             }
 
+            // ⚠️ accounts.txt 是用 `|` 分列的，而且**历史原因没做转义**
+            //    （FieldProfileStore / WebUrlStore 都老老实实转义了，唯独账号文件没有）。
+            //    字段里混进一个 `|` 或换行，整行就错位 —— 读回来时密码会丢、
+            //    DPAPI 解密失败刷日志、重名检测也跟着失效（2026-10-01 审计确认）。
+            //    改存储格式要做兼容读写，风险和收益不成比例；
+            //    而这几种字符本来也不该出现在账号里，所以直接在输入侧拦掉。
+            string[] checkFields = new string[] { name, user, user2 };
+            foreach (string fv in checkFields)
+            {
+                if (fv != null && (fv.IndexOf('|') >= 0 || fv.IndexOf('\n') >= 0 || fv.IndexOf('\r') >= 0))
+                {
+                    MessageBox.Show("连接名称、宽带账号、附加账号里不能包含「|」或换行字符，请修改后再保存。",
+                        "账号", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+            }
+
             int sel = lst.SelectedIndex;
             int existIdx = -1;
             for (int i = 0; i < accounts.Count; i++)
@@ -462,10 +479,21 @@ namespace CampusNetHelper
                 MessageBoxButton.OKCancel, MessageBoxImage.Question);
             if (r != MessageBoxResult.OK) return;
 
-            accounts.RemoveAt(sel);
-
+            // ⚠️ 必须走 ConfigStore.DeleteAccount，**不能**自己 RemoveAt + SaveAccounts。
+            //
+            // 2026-10-01 审计确认的 bug：SaveAccounts 在写之前会把含账号的旧内容复制进 .bak
+            // （SafeFile.KeepBackup），而 LoadAccounts 看到"主文件 0 条 + 备份里有货"，
+            // 会判定为**文件损坏并自动恢复** —— 于是删掉的账号下次启动又"复活"，
+            // 还顺带生成一个 accounts.txt.bad。
+            // 这是 v1.3.2 那次"防账号丢失"逻辑和删除路径打架留下的回归。
+            // DeleteAccount 里自带对应的「删光就连备份一起清掉」处理（见它的注释）。
             string msg;
-            ConfigStore.SaveAccounts(accounts, out msg);
+            if (!ConfigStore.DeleteAccount(accounts, name, out msg))
+            {
+                MessageBox.Show("删除失败，账号保留：" + msg, "账号",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
 
             string rm;
             DialEngine.RemoveEntry(name, out rm);

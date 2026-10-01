@@ -354,37 +354,28 @@ namespace CampusNetHelper
         {
             try
             {
-                NetworkInterface ppp = null;
-                NetworkInterface other = null;
+                // ⚠️ 2026-10-01 改：选卡走 NetProbe.PickPrimaryAdapter()（判据的唯一来源）。
+                //
+                // 原来是这里自己遍历网卡、取"第一个 Up 的非 PPP 非回环"，**没有任何过滤** ——
+                // 装了 VMware / Hyper-V / Docker / Clash TUN / 向日葵 的机器上会选中虚拟网卡：
+                // 虚拟网卡没有真网关 → 网关丢包恒 100% → 四个数字废掉两个，
+                // 还永远给用户下"本地线路不稳定，先换网线"的错误结论（让人白白换网线）。
+                //
+                // PickPrimaryAdapter 自带类型过滤（排除 Tunnel）和虚拟网卡关键词黑名单，
+                // 而且它本身就优先返回 PPP —— 和原来"拨号优先"的语义一致。
+                NetworkInterface ni = NetProbe.PickPrimaryAdapter();
 
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                // 找不到可信网卡就**不报网关数字**。
+                // 报一个虚拟网卡的假网关，比干脆不报更害人。
+                if (ni == null) return "";
+
+                foreach (GatewayIPAddressInformation g in ni.GetIPProperties().GatewayAddresses)
                 {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    if (g.Address == null) continue;
+                    if (g.Address.AddressFamily != AddressFamily.InterNetwork) continue;
 
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Ppp)
-                    {
-                        if (ppp == null) ppp = ni;
-                    }
-                    else if (other == null)
-                    {
-                        other = ni;
-                    }
-                }
-
-                NetworkInterface[] order = new NetworkInterface[] { ppp, other };
-                foreach (NetworkInterface ni in order)
-                {
-                    if (ni == null) continue;
-
-                    foreach (GatewayIPAddressInformation g in ni.GetIPProperties().GatewayAddresses)
-                    {
-                        if (g.Address == null) continue;
-                        if (g.Address.AddressFamily != AddressFamily.InterNetwork) continue;
-
-                        string a = g.Address.ToString();
-                        if (a != "0.0.0.0") return a;
-                    }
+                    string a = g.Address.ToString();
+                    if (a != "0.0.0.0") return a;
                 }
             }
             catch { }
@@ -470,19 +461,19 @@ namespace CampusNetHelper
             return best;
         }
 
-        /// <summary>识别虚拟网卡 —— 它们的 Speed 字段不代表真实链路。</summary>
+        /// <summary>
+        /// 识别虚拟网卡 —— 它们没有真实网关，Speed 字段也不代表真实链路。
+        ///
+        /// ⚠️ 2026-10-01 起**直接引 NetProbe 的那份名单**，不再自己存一份。
+        ///    以前这里抄了个短版本，漏掉 clash / flclash / docker / watt / steam++ /
+        ///    virtualbox / wsl 等 11 个词。两份名单一旦分叉就出事：
+        ///    装了 Docker 或加速器的机器上，"链路速率"会显示虚拟网卡的假 1G。
+        /// </summary>
         private static bool IsVirtualAdapter(NetworkInterface ni)
         {
             string s = ((ni.Description ?? "") + " " + (ni.Name ?? "")).ToLowerInvariant();
 
-            string[] bad = new string[]
-            {
-                "virtual", "vmware", "hyper-v", "vethernet", "tap-", "tap ", "tun",
-                "vpn", "loopback", "bluetooth", "tailscale", "zerotier", "wintun",
-                "npcap", "oray", "gameviewer", "radmin", "hamachi", "sangfor"
-            };
-
-            foreach (string b in bad)
+            foreach (string b in NetProbe.VirtualAdapterKeywords)
             {
                 if (s.IndexOf(b) >= 0) return true;
             }

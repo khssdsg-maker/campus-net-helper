@@ -32,10 +32,10 @@
 1 ICON "logo.ico"
 
 // ---- 版本信息 ----
-// 版本号：2.1.0.0（四段式，最后一段留给以后的热修）
+// 版本号：2.1.1.0（四段式，最后一段留给以后的热修）
 1 VERSIONINFO
-FILEVERSION     2,1,0,0
-PRODUCTVERSION  2,1,0,0
+FILEVERSION     2,1,1,0
+PRODUCTVERSION  2,1,1,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          0x00040004L
@@ -49,12 +49,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "校园网助手（个人作品）"
             VALUE "FileDescription",  "校园网助手 —— 轻量的校园网连接管理工具"
-            VALUE "FileVersion",      "2.1.0.0"
+            VALUE "FileVersion",      "2.1.1.0"
             VALUE "InternalName",     "CampusNetHelper"
             VALUE "LegalCopyright",   "免费使用 · 不含任何广告与信息收集"
             VALUE "OriginalFilename", "校园网助手.exe"
             VALUE "ProductName",      "校园网助手"
-            VALUE "ProductVersion",   "2.1.0"
+            VALUE "ProductVersion",   "2.1.1"
             VALUE "Comments",         "C# + WPF 单文件 · 绿色免安装"
         END
     END

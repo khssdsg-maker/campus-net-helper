@@ -1502,7 +1502,26 @@ namespace CampusNetHelper
         private static string MaskForLog(FieldProfileStore.FieldProfile f, string v)
         {
             if (string.Equals(f.AccountField, "password", StringComparison.OrdinalIgnoreCase)) return "••••••";
+
+            // ⚠️ 账号和附加账号（学工号）也要掩码（2026-10-01 审计确认）。
+            //    原来它们原样进日志，真实日志里已经出现了完整学号和手机号。
+            //    而使用说明恰恰教用户"出问题就把日志发给懂电脑的人" —— 一份日志里
+            //    带着学号和手机号在外部流转，这个泄露面实在没必要。
+            if (string.Equals(f.AccountField, "user", StringComparison.OrdinalIgnoreCase)) return MaskAccount(v);
+            if (string.Equals(f.AccountField, "user2", StringComparison.OrdinalIgnoreCase)) return MaskAccount(v);
+
             return v;
+        }
+
+        /// <summary>
+        /// 账号半掩码：留头尾各 2 位，中间打点（如 18••••••47）。
+        /// 不够 5 位就全掩 —— 太短的字符串露两头等于没掩。
+        /// </summary>
+        private static string MaskAccount(string v)
+        {
+            if (string.IsNullOrEmpty(v)) return v;
+            if (v.Length <= 4) return new string('•', v.Length);
+            return v.Substring(0, 2) + new string('•', v.Length - 4) + v.Substring(v.Length - 2);
         }
 
         /// <summary>按档案把一个字段对到页面上的元素：属性 → 标签 → 顺序。</summary>
@@ -1574,8 +1593,66 @@ namespace CampusNetHelper
         ///
         /// ⚠️ 有字段档案时**优先走档案** —— 用户亲手教过的，比任何启发式都准。
         /// </summary>
+        /// <summary>
+        /// 当前页面是否还停在认证地址的域上。
+        ///
+        /// ⚠️ 为什么必须有这道闸（2026-10-01 审计确认）：
+        ///   填表前从来不检查"当前页面是不是认证页本身"。而认证页一旦重定向到运营商广告页，
+        ///   或者有人在宿舍网里 ARP / DNS 劫持了认证地址，程序就会把**账号密码填进对方的表单，
+        ///   还替用户把提交按钮点了** —— 更麻烦的是"断线自动重连"这条路整个过程零交互，
+        ///   用户完全无感知（不是他自己点的，也没有窗口跳出来）。
+        ///
+        /// 放行规则：同域，或互为子域都放行
+        ///   （认证页跳到同主域的 SSO 子域是常见且正常的，比如 sso.xxx 与 xxx）。
+        ///   取不到当前地址 / 认证网址没填 / 解析失败时**一律放行** ——
+        ///   宁可漏拦，也绝不能误拦正常用户（拦错了就是填不上，用户完全不知道该怎么办）。
+        /// </summary>
+        private bool CurrentPageIsTrusted()
+        {
+            try
+            {
+                string stored = (txtUrl.Text ?? "").Trim();
+                if (stored.Length == 0) return true;
+
+                string current = null;
+                try
+                {
+                    if (browser != null && browser.Url != null) current = browser.Url.ToString();
+                }
+                catch { }
+                if (string.IsNullOrEmpty(current)) return true;
+
+                Uri cur, want;
+                if (!Uri.TryCreate(current, UriKind.Absolute, out cur)) return true;
+                if (!Uri.TryCreate(stored, UriKind.Absolute, out want)) return true;
+
+                string ch = cur.Host ?? "";
+                string wh = want.Host ?? "";
+                if (ch.Length == 0 || wh.Length == 0) return true;
+
+                if (string.Equals(ch, wh, StringComparison.OrdinalIgnoreCase)) return true;
+                if (ch.EndsWith("." + wh, StringComparison.OrdinalIgnoreCase)) return true;
+                if (wh.EndsWith("." + ch, StringComparison.OrdinalIgnoreCase)) return true;
+                return false;
+            }
+            catch { return true; }
+        }
+
         private bool TryAutoFillAndSubmit(bool auto)
         {
+            // ⚠️ 这道检查必须放在**最开头** —— 在任何"取档案 / 猜字段"动作之前。
+            //    放这里才能一处覆盖全部入口：页面加载后自动填、12 次补填定时器、
+            //    断线自动重连、以及用户手动点「填表并登录」。
+            //    拦住时不填值、不提交、不点任何按钮。
+            if (!CurrentPageIsTrusted())
+            {
+                Log.Warn("自动填表已拦截：当前页面与认证地址不同域，防止凭据被填进陌生页面");
+                SetStatus("当前页面与认证网址不是同一个网站，已停止自动填写"
+                    + "（防止账号密码被填进陌生页面）。如果确认这个页面没问题，"
+                    + "把上面的认证网址改成当前页面地址，再点一次。");
+                return false;
+            }
+
             string user = GetUser();
             string pass = txtPass.Password;
 

@@ -70,6 +70,38 @@ namespace CampusNetHelper
             return Online(false);
         }
 
+        /// <summary>
+        /// 只读缓存结果；**缓存过期也不阻塞调用方** —— 让后台线程去真探
+        /// （WarmUpAsync 自带防重入），先把已知的值还给调用方。
+        ///
+        /// ⚠️ 为什么需要它（2026-10-01 审计发现）：
+        ///   上面的 Online(false) 在缓存过期时会在**调用方线程**同步发请求，
+        ///   而 ProbeOnce 的超时是 6 秒。OnTick 是 DispatcherTimer 回调（UI 线程），
+        ///   它每秒都会问一次"能不能上网" —— 于是网页认证模式下一旦断网，
+        ///   每 5 秒（缓存过期）就有一次 6 秒的 UI 冻结：窗口拖不动、按钮点不了，
+        ///   而且会无限循环下去。项目早就写明"真发请求绝不能在 UI 线程上做"，
+        ///   但 Online() 自己没设防。
+        ///
+        /// ✅ UI 线程一律用这个；需要"立刻要真实结果"的场景（用户主动点按钮）
+        ///    才用 Online(true) 穿透缓存，且那类调用点本来就在后台线程上。
+        /// </summary>
+        public static bool OnlineStale()
+        {
+            lock (_lock)
+            {
+                if (_cachedAt != DateTime.MinValue
+                    && (DateTime.Now - _cachedAt).TotalMilliseconds < CacheMs)
+                {
+                    return _cached;
+                }
+            }
+
+            // 缓存过期了：让后台去探，本次先把"上一次知道的结果"返回去。
+            // 代价是状态可能晚几秒才更新，但界面永远不会因此卡住。
+            WarmUpAsync();
+            return LastKnown();
+        }
+
         /// <summary>最近一次的探测结果，不触发新探测。从未探测过时返回 false。</summary>
         public static bool LastKnown()
         {
@@ -330,22 +362,33 @@ namespace CampusNetHelper
             return "";
         }
 
-        /// <summary>识别虚拟网卡。与 QualityMonitor 里那份判定保持一致。</summary>
+        /// <summary>
+        /// 虚拟网卡关键词黑名单 —— **全项目唯一的一份**，QualityMonitor 也引这里。
+        ///
+        /// ⚠️ 为什么必须只有一份（2026-10-01 审计确认）：
+        ///   以前 NetProbe 和 QualityMonitor 各存了一份，而 QualityMonitor 那份短了 11 个词
+        ///   （少了 clash / flclash / docker / watt / steam++ / virtualbox / wsl 等）。
+        ///   两份名单一分叉就出事 —— 装了 Docker 或加速器的机器上：
+        ///     · "链路速率"会拿虚拟网卡的假 1G 来显示；
+        ///     · "到网关"会选中没有真网关的虚拟网卡 → 丢包恒 100% →
+        ///       永远给用户下"本地线路不稳定，先换网线"的错误结论。
+        /// </summary>
+        internal static readonly string[] VirtualAdapterKeywords = new string[]
+        {
+            "virtual", "vmware", "hyper-v", "vethernet", "tap-", "tap ", "tun",
+            "vpn", "loopback", "bluetooth", "tailscale", "zerotier", "wintun",
+            "npcap", "oray", "gameviewer", "radmin", "hamachi", "sangfor",
+            // 本机实际装过的加速器 / 远程工具（2026-09-22 摸清）
+            "watt", "steam++", "clash", "flclash", "uu加速", "uu booster",
+            "小米", "miracast", "virtualbox", "docker", "wsl"
+        };
+
+        /// <summary>识别虚拟网卡。QualityMonitor 也引这份名单 —— 别再各存一份。</summary>
         private static bool IsVirtualAdapter(NetworkInterface ni)
         {
             string s = ((ni.Description ?? "") + " " + (ni.Name ?? "")).ToLowerInvariant();
 
-            string[] bad = new string[]
-            {
-                "virtual", "vmware", "hyper-v", "vethernet", "tap-", "tap ", "tun",
-                "vpn", "loopback", "bluetooth", "tailscale", "zerotier", "wintun",
-                "npcap", "oray", "gameviewer", "radmin", "hamachi", "sangfor",
-                // 本机实际装过的加速器/远程工具（2026-09-22 摸清）：
-                "watt", "steam++", "clash", "flclash", "uu加速", "uu booster",
-                "小米", "miracast", "virtualbox", "docker", "wsl"
-            };
-
-            foreach (string b in bad)
+            foreach (string b in VirtualAdapterKeywords)
             {
                 if (s.IndexOf(b) >= 0) return true;
             }

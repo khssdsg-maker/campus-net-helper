@@ -68,7 +68,16 @@ namespace CampusNetHelper
 
         /// <summary>心跳保活（防学校设备"空闲下线"）。后台线程，实现见 KeepAlive.cs。</summary>
         private readonly KeepAlive _keepAlive = new KeepAlive();
-        private bool _closing = false;
+        /// <summary>
+        /// 退出流程已开始。
+        ///
+        /// ⚠️ 它是给**后台线程**看的：拨号 / 断开这类工作线程完成时会 Dispatcher.Invoke 回来，
+        ///    而退出时 Dispatcher 已经关了，那个 Invoke 会抛 TaskCanceledException ——
+        ///    如果它的 catch 里还再 Invoke 一次，就成了后台线程未捕获异常，直接崩进程。
+        ///
+        /// volatile：UI 线程写、后台线程读，不加可能读到旧值（JIT 会把它缓存在寄存器里）。
+        /// </summary>
+        private volatile bool _closing = false;
 
         /// <summary>系统正在关机 / 注销（见 OnClosing 里的说明，这个标志是保命用的）。</summary>
         private bool _sessionEnding = false;
@@ -951,7 +960,13 @@ namespace CampusNetHelper
                 ApplyState(ConnState.Idle, "尚未连接", "等待认证上网");
             }
 
-            bool online = NetProbe.Online();
+            // ⚠️ 必须用 OnlineStale()，不能用 Online()。
+            //    本方法由 DispatcherTimer 回调，跑在 **UI 线程**上；
+            //    而 Online() 在缓存过期时会同步发一个最长 6 秒的请求 ——
+            //    网页认证模式下一旦断网，就变成"每 5 秒（缓存过期）冻结界面 6 秒"的死循环，
+            //    窗口拖不动、按钮点不了，而且会一直循环下去（2026-10-01 审计确认）。
+            //    OnlineStale 只读缓存、过期就让后台去探，代价是状态文字晚几秒，但界面不卡。
+            bool online = NetProbe.OnlineStale();
 
             if (online)
             {
@@ -985,6 +1000,7 @@ namespace CampusNetHelper
                         + _portalReauthAttempts + " 次）");
                     _portalReauthAttempts = 0;
                     _autoReconnectAttempts = 0;
+                    _portalExhaustedReported = false;   // 连上了，闸门复位，下次掉线重新能报
                 }
                 _pendingPortalReauth = false;
             }
@@ -1115,7 +1131,8 @@ namespace CampusNetHelper
 
             Log.Info("自动重连：第 " + _autoReconnectAttempts + " 次尝试恢复连接 "
                 + (_current != null ? _current.Name : "(无)"));
-            StartDial(false);
+            // 第二参数 true = 这次是自动重连发起的：失败时不弹窗，只发一次气泡
+            StartDial(false, true);
         }
 
         // ==================================================================
@@ -1155,6 +1172,26 @@ namespace CampusNetHelper
         /// <summary>本次掉线已经自动重开过几次认证页。连上或用户手动操作后归零。</summary>
         private int _portalReauthAttempts = 0;
 
+        /// <summary>
+        /// "自动重连次数已用尽"这件事，是否已经如实报告过一次了。
+        ///
+        /// ⚠️ 为什么需要这个闸门（2026-10-01 审计确认）：
+        ///   达到上限之后，每 30 秒退避到期都会重新进 StartPortalAutoReauth，
+        ///   那段"报告失败"的代码就会再跑一遍 —— 往历史面板塞重复记录、重写 settings.txt，
+        ///   一直刷下去。状态条上的"需要重新认证"本来就不会消失，喊一次就够了。
+        ///   网络恢复或计数归零时复位。
+        /// </summary>
+        private bool _portalExhaustedReported = false;
+
+        /// <summary>
+        /// 拨号模式的"自动重连"连续失败了几次。
+        ///
+        /// ⚠️ 只用来决定**要不要发提示气泡**：只有本次连败的第一次发，之后静默。
+        ///   自动重连一旦失败往往是"密码失效 / 欠费"这类不会自愈的原因，
+        ///   每 30 秒吵一次毫无意义，只会让人把程序静音。拨号成功时归零。
+        /// </summary>
+        private int _autoDialFailStreak = 0;
+
         /// <summary>连续重试到这里就不试了，交给用户。3 次足够覆盖瞬时抖动。</summary>
         private const int PortalReauthMaxAttempts = 3;
 
@@ -1185,6 +1222,14 @@ namespace CampusNetHelper
 
             if (_portalReauthAttempts >= PortalReauthMaxAttempts)
             {
+                // ⚠️ 闸门：这一段以前每 30 秒（退避到期重进本方法）就重跑一次 ——
+                //    往历史面板塞一条一模一样的记录、重写一次 settings.txt，直到天荒地老
+                //    （2026-10-01 审计确认，当时日志里能看到它被反复触发）。
+                //    报告过一次就停手：状态条上那句"需要重新认证"不会自己消失，
+                //    用户随时看得到，没必要每 30 秒再喊一遍。
+                if (_portalExhaustedReported) return;
+                _portalExhaustedReported = true;
+
                 Log.Warn("网页认证自动重连：已连续失败 " + _portalReauthAttempts + " 次，停止自动尝试");
                 ApplyState(ConnState.Error, "需要重新认证",
                     "自动重新认证试了 " + _portalReauthAttempts + " 次都没成功。"
@@ -1193,11 +1238,17 @@ namespace CampusNetHelper
                 return;
             }
 
-            _portalReauthAttempts++;
             _portalReauthRunning = true;
 
+            // ⚠️ 计数**不能**在这里加（2026-10-01 审计确认的老问题）。
+            //    此处还没确定要走哪条路：是"真开认证页"，还是"只发个托盘气泡"。
+            //    静默场景下每轮退避都会走到这里、白白扣掉一次配额，
+            //    而真正的动作是挂在"用户点气泡"上的 —— 用户没注意到气泡，
+            //    3 次配额就被空耗光了，之后即使点气泡也只剩手动登录这一条路。
+            //    所以计数后移到真正要开认证页的两处：前台分支 + 气泡点击回调。
+
             ApplyState(ConnState.Connecting, "正在重新认证…",
-                "认证已失效，正在自动打开认证页（第 " + _portalReauthAttempts + " 次）");
+                "认证已失效，正在自动打开认证页（第 " + (_portalReauthAttempts + 1) + " 次）");
 
             bool silent = _silentStart || !IsVisible;
 
@@ -1220,6 +1271,7 @@ namespace CampusNetHelper
             // 前台场景：用户正开着主界面，直接把认证页拉起来。
             // ⚠️ 不抢焦点（ShowActivated=false）：用户可能正在别的地方打字，
             //    弹出窗口抢走焦点会让半截输入丢失。
+            _portalReauthAttempts++;   // 真开了才计数（理由见上面"计数后移"那段）
             OpenWebAuthWindowForReauth();
         }
 
@@ -1230,6 +1282,11 @@ namespace CampusNetHelper
         {
             if (!_pendingPortalReauth) return;
             _pendingPortalReauth = false;
+
+            // ⚠️ 到这一刻才是"真的要开认证页"—— 计数也该在这一刻才算数。
+            //    配额是给"开认证页"用的，不是给"发气泡"用的（见 StartPortalAutoReauth 的说明）。
+            if (_portalReauthAttempts < PortalReauthMaxAttempts) _portalReauthAttempts++;
+
             OpenWebAuthWindowForReauth();
         }
 
@@ -1283,11 +1340,14 @@ namespace CampusNetHelper
         {
             try
             {
-                if (NetProbe.Online())
+                // ⚠️ 同上：本方法是被 Dispatcher.BeginInvoke 投递进来的，同样在 UI 线程上，
+                //    所以也得用不阻塞的 OnlineStale()（2026-10-01 审计确认）。
+                if (NetProbe.OnlineStale())
                 {
                     Log.Info("网页认证自动重连：已恢复上网");
                     _portalReauthAttempts = 0;
                     _autoReconnectAttempts = 0;
+                    _portalExhaustedReported = false;   // 恢复上网，闸门也复位
                     AddHistory("自动重新认证成功 · 已恢复上网");
                 }
                 else
@@ -1360,6 +1420,7 @@ namespace CampusNetHelper
             _portalReauthAttempts = 0;
             _autoReconnectAttempts = 0;
             _portalReauthRunning = false;
+            _portalExhaustedReported = false;
             _lastAutoTry = DateTime.MinValue;
             _pendingPortalReauth = false;
         }
@@ -2052,7 +2113,8 @@ namespace CampusNetHelper
                 return;
             }
 
-            StartDial(_state == ConnState.Connected);
+            // 第二参数 false = 用户点按钮发起的：失败时可以正常弹窗（他就坐在屏幕前）
+            StartDial(_state == ConnState.Connected, false);
         }
 
         private void BtnDisconnect_Click(object sender, RoutedEventArgs e)
@@ -2060,7 +2122,21 @@ namespace CampusNetHelper
             DoDisconnect(true);
         }
 
-        private void StartDial(bool reconnectFirst)
+        /// <summary>
+        /// 发起拨号。
+        /// </summary>
+        /// <param name="reconnectFirst">true = 拨之前先把现有的连接断掉再重拨。</param>
+        /// <param name="auto">
+        /// true = 这次是**自动重连**发起的（不是用户点的按钮）。
+        ///
+        /// ⚠️ 为什么要区分来源（2026-10-01 审计确认）：
+        ///   失败时两者必须区别对待。手动失败弹窗是对的 —— 用户就在屏幕前，
+        ///   他需要知道失败原因；但**自动重连失败绝不能弹窗**：
+        ///   MessageBox 的模态消息循环**不阻塞** DispatcherTimer，于是第一个弹窗还挂着，
+        ///   30 秒后退避到期又弹第二个，整夜能堆几十个模态框。
+        ///   用户睡觉之后密码失效 / 欠费就会触发，而他完全不知情。
+        /// </param>
+        private void StartDial(bool reconnectFirst, bool auto)
         {
             if (_current == null || string.IsNullOrEmpty(_current.Name))
             {
@@ -2074,11 +2150,13 @@ namespace CampusNetHelper
             // 直接告诉他，并把"自动连接"武装上：网线插回去会自动连（见 OnTick）。
             if (!CheckLinkNow())
             {
-                bool auto = AutoReconnectEnabled();
-                if (auto) _autoReconnectArmed = true;
+                // ⚠️ 这个局部变量**不能**叫 auto —— 会和新加的同名参数撞（CS0136）。
+                //    它问的是"网线插回来要不要自动连"，和"本次是不是自动重连发起的"是两回事。
+                bool autoLink = AutoReconnectEnabled();
+                if (autoLink) _autoReconnectArmed = true;
                 EnterWaitingLink();
                 MessageBox.Show("网线没有插好（或者另一头的设备没通电）。\n\n"
-                    + (auto ? "插好网线后不用点任何按钮，程序会自动连接。"
+                    + (autoLink ? "插好网线后不用点任何按钮，程序会自动连接。"
                             : "插好网线后再点一次「立即连接」。"),
                     "校园网助手", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
@@ -2110,13 +2188,14 @@ namespace CampusNetHelper
                     DialEngine.DialResult res = DialEngine.Dial(entryName, user, pass);
                     Log.Info("拨号结果: exit=" + res.ExitCode + " success=" + res.Success + " :: " + res.Message);
 
-                    Dispatcher.Invoke(delegate()
+                    SafeInvoke(delegate()
                     {
                         if (res.Success)
                         {
                             _connectedAt = DateTime.Now;
                             _autoReconnectArmed = true;
                             _autoReconnectAttempts = 0;   // 连上了，重试计数归零
+                            _autoDialFailStreak = 0;      // 失败连击也归零（下次失败重新从"第一次"算）
                             ApplyState(ConnState.Connected, "已连接",
                                 "已通过宽带拨号上网（" + entryName + "）");
                             AddHistory("连接成功 · " + entryName);
@@ -2128,23 +2207,40 @@ namespace CampusNetHelper
                             ApplyState(ConnState.Error, "连接失败", res.Message);
                             AddHistory("连接失败 · " + entryName + " · " + res.Message);
 
-                            var sb = new System.Text.StringBuilder();
-                            sb.AppendLine(res.Message);
-                            if (res.Hints.Count > 0)
+                            if (auto)
                             {
-                                sb.AppendLine();
-                                sb.AppendLine("建议排查：");
-                                foreach (string h in res.Hints) sb.AppendLine("· " + h);
+                                // 自动重连失败 —— **不弹窗**。
+                                //   弹窗的模态消息循环不阻塞 DispatcherTimer，第一个框还挂着，
+                                //   30 秒后退避到期又弹一个，整夜能堆几十个（2026-10-01 审计确认）。
+                                //   状态条已经如实写明失败原因，用户看界面就知道出了事；
+                                //   这里只对**本次连败的第一次**发个托盘气泡，之后静默 ——
+                                //   免得每 30 秒吵他一次。
+                                _autoDialFailStreak++;
+                                if (_autoDialFailStreak == 1)
+                                {
+                                    ShowBalloon("自动重连失败", res.Message);
+                                }
                             }
-                            MessageBox.Show(sb.ToString(), "连接失败",
-                                MessageBoxButton.OK, MessageBoxImage.Warning);
+                            else
+                            {
+                                var sb = new System.Text.StringBuilder();
+                                sb.AppendLine(res.Message);
+                                if (res.Hints.Count > 0)
+                                {
+                                    sb.AppendLine();
+                                    sb.AppendLine("建议排查：");
+                                    foreach (string h in res.Hints) sb.AppendLine("· " + h);
+                                }
+                                MessageBox.Show(sb.ToString(), "连接失败",
+                                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                            }
                         }
                     });
                 }
                 catch (Exception ex)
                 {
                     Log.Error("拨号线程异常", ex);
-                    Dispatcher.Invoke(delegate()
+                    SafeInvoke(delegate()
                     {
                         ApplyState(ConnState.Error, "连接异常", ex.Message);
                     });
@@ -2152,6 +2248,30 @@ namespace CampusNetHelper
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        /// <summary>
+        /// 后台线程往 UI 线程投递动作的**安全包装**。
+        ///
+        /// ⚠️ 拨号 / 断开这类工作线程必须走它，不能直接 Dispatcher.Invoke：
+        ///    退出流程里 Dispatcher 已经关闭，直接 Invoke 会抛 TaskCanceledException；
+        ///    而如果那个 catch 里还再 Invoke 一次，就成了后台线程未捕获异常 ——
+        ///    直接崩进程（2026-10-01 审计确认的"拨号中途点退出偶发崩溃"就是这个）。
+        ///
+        /// 行为：正在退出就**直接丢弃**（UI 都要没了，更新它没有意义）；
+        ///      投递失败也只记一条日志，绝不往外抛。
+        /// </summary>
+        private void SafeInvoke(Action act)
+        {
+            if (_closing) return;
+            try
+            {
+                Dispatcher.Invoke(act);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("UI 回调投递失败（程序可能正在退出）: " + ex.Message);
+            }
         }
 
         private void DoDisconnect(bool userInitiated)
@@ -2163,38 +2283,49 @@ namespace CampusNetHelper
 
             Thread t = new Thread(delegate()
             {
-                string msg;
-                bool ok = DialEngine.Disconnect(entryName, out msg);
-                Log.Info("断开结果: " + ok + " :: " + msg);
-
-                Dispatcher.Invoke(delegate()
+                // ⚠️ 整个委托体都要包 try/catch —— 以前这里连 try 都没有，
+                //    Dispatcher.Invoke 是裸奔的（2026-10-01 审计确认）。
+                //    退出流程中 Invoke 会抛 TaskCanceledException，没有 catch 就是
+                //    后台线程未捕获异常，直接崩进程。
+                try
                 {
-                    _connectedAt = DateTime.MinValue;
-                    if (lblOnlineTime != null) lblOnlineTime.Text = "";
+                    string msg;
+                    bool ok = DialEngine.Disconnect(entryName, out msg);
+                    Log.Info("断开结果: " + ok + " :: " + msg);
 
-                    if (userInitiated)
+                    SafeInvoke(delegate()
                     {
-                        // 用户主动断开：解除自动重连，避免过一会儿自己又连上
-                        _autoReconnectArmed = false;
-                        _lastAutoTry = DateTime.MinValue;
-                        _autoReconnectAttempts = 0;
-                    }
-                    else
-                    {
-                        _lastAutoTry = DateTime.Now;
-                    }
+                        _connectedAt = DateTime.MinValue;
+                        if (lblOnlineTime != null) lblOnlineTime.Text = "";
 
-                    if (ok)
-                    {
-                        ApplyState(ConnState.Idle, "尚未连接", msg);
-                        if (userInitiated) AddHistory("手动断开 · " + entryName);
-                        RefreshParamCards();
-                    }
-                    else
-                    {
-                        ApplyState(ConnState.Error, "断开异常", msg);
-                    }
-                });
+                        if (userInitiated)
+                        {
+                            // 用户主动断开：解除自动重连，避免过一会儿自己又连上
+                            _autoReconnectArmed = false;
+                            _lastAutoTry = DateTime.MinValue;
+                            _autoReconnectAttempts = 0;
+                        }
+                        else
+                        {
+                            _lastAutoTry = DateTime.Now;
+                        }
+
+                        if (ok)
+                        {
+                            ApplyState(ConnState.Idle, "尚未连接", msg);
+                            if (userInitiated) AddHistory("手动断开 · " + entryName);
+                            RefreshParamCards();
+                        }
+                        else
+                        {
+                            ApplyState(ConnState.Error, "断开异常", msg);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("断开线程异常", ex);
+                }
             });
             t.IsBackground = true;
             t.Start();
@@ -2319,6 +2450,24 @@ namespace CampusNetHelper
 
                 var b = MakeGhostButton(a.Name, delegate()
                 {
+                    // ⚠️ 已连接（或免打扰保活）状态下切换账号，必须**先把现有连接断掉**。
+                    //
+                    // 2026-10-01 审计确认的老问题：原代码直接就 ApplyState(Idle, "已选择账号")，
+                    // 于是界面显示"尚未连接"，但 RAS 连接其实**还挂着**：
+                    //   · 质量监测和心跳保活是按 state==Connected 启停的 → 两个都停了，
+                    //     而学校有"空闲踢下线"策略，停发心跳可能真就把人踢了；
+                    //   · OnTick 里唯一的自我纠正路径要求 !DialEngine.IsDialConnected()，
+                    //     连接还在、进不去 —— 错误状态会一直持续到下次真掉线为止。
+                    bool wasConnected = (_state == ConnState.Connected || _state == ConnState.Quiet);
+
+                    if (wasConnected)
+                    {
+                        MessageBoxResult r = MessageBox.Show(
+                            "当前已连接。切换账号会先断开现有连接，确定吗？",
+                            "切换账号", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+                        if (r != MessageBoxResult.OK) return;
+                    }
+
                     _current = captured;
                     if (cmbAccount != null)
                     {
@@ -2331,6 +2480,16 @@ namespace CampusNetHelper
                             }
                         }
                     }
+
+                    if (wasConnected)
+                    {
+                        // 断开是异步的，它自己的完成回调会把状态置成 Idle
+                        //（此时 _current 已经是新账号了，语义正确）—— 所以这里不用再 ApplyState。
+                        // Disconnecting 期间主按钮本来就是禁用的（busy 判定），不会抢跑。
+                        DoDisconnect(true);
+                        return;
+                    }
+
                     ApplyState(ConnState.Idle, "已选择账号", "点击「立即连接」开始拨号");
                 });
                 b.HorizontalAlignment = HorizontalAlignment.Stretch;
@@ -2772,7 +2931,7 @@ namespace CampusNetHelper
             trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             trayMenu.Items.Add("显示主窗口", null, delegate(object s, EventArgs e) { ShowMainWindow(); });
             trayMiDial = new System.Windows.Forms.ToolStripMenuItem("连接上网", null,
-                delegate(object s, EventArgs e) { Dispatcher.Invoke(delegate() { StartDial(false); }); });
+                delegate(object s, EventArgs e) { Dispatcher.Invoke(delegate() { StartDial(false, false); }); });
             trayMenu.Items.Add(trayMiDial);
             trayMiDisconnect = new System.Windows.Forms.ToolStripMenuItem("断开连接", null,
                 delegate(object s, EventArgs e) { Dispatcher.Invoke(delegate() { DoDisconnect(true); }); });
@@ -2914,6 +3073,17 @@ namespace CampusNetHelper
 
         internal void ExitApp()
         {
+            // ⚠️ 第一件事就是把"正在退出"立起来，再动别的。
+            //    这台机器上此刻可能还有拨号线程在跑（拨号最长 60 秒），
+            //    它干完活会 Dispatcher.Invoke 回来 —— 而下面那句 Shutdown 会关掉 Dispatcher。
+            _closing = true;
+
+            // 顺手补齐退出清理：OnClosing 的两条路径都做了这两句，这里原先漏了。
+            // 漏掉的后果：Shutdown 期间 tick 定时器和 QualityMonitor 的 Updated 事件
+            // 还在往已经关掉的 Dispatcher 上投递。
+            _quality.Shutdown();
+            _keepAlive.Shutdown();
+
             SaveAll();
             if (trayIcon != null)
             {
