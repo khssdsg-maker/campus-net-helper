@@ -243,15 +243,110 @@ namespace CampusNetHelper
         ///
         /// ⚠️ 最关键的是 **ExecutionTimeLimit 默认 PT72H**：计划任务会在 72 小时后**强制终止**程序。
         /// 对 7x24 常驻的网络守护来说，等于每 3 天静默死一次（2026-09-12 实测确认默认值就是 PT72H）。
-        /// `schtasks.exe` 没有关闭该限制的开关（`/ET` 是每日结束时刻，不是时长），只能用
-        /// Win8+ 自带的 ScheduledTasks 模块改。
-        ///
-        /// ⚠️ 实测踩坑：Windows PowerShell 5.1 的 `New-ScheduledTaskSettingsSet` **没有**
-        /// `-AllowStartOnDemand` 参数（只有反向的 `-DisallowDemandStart`），而 `AllowStartOnDemand`
-        /// 属性也不可写。误传该参数会让 `$s` 为 null，连带 `Set-ScheduledTask` 参数验证失败，
-        /// 修正静默无效而退出码仍可能是 0 —— 所以改完必须回查 ExecutionTimeLimit。
+        /// `schtasks.exe` 没有关闭该限制的开关（`/ET` 是每日结束时刻，不是时长），
+        /// 只能走 Task Scheduler 的 COM 接口。
         /// </summary>
         private static bool FixTaskSettings(out string message)
+        {
+            // 首选：原生 COM（进程内调用，不起子进程）。实测重注册一次约 16ms，
+            // 而起 powershell.exe 光是冷启动就要数百毫秒 —— 差一个数量级。
+            string nativeMsg;
+            if (FixTaskSettingsNative(out nativeMsg))
+            {
+                message = nativeMsg;
+                return true;
+            }
+
+            // 回落：旧的 PowerShell 实现。**只在 COM 不可用时才走到这里**，
+            // 保留它是为了"退化回原来能用的行为"，不是重新依赖 PowerShell。
+            string psMsg;
+            if (FixTaskSettingsByPowerShell(out psMsg))
+            {
+                message = psMsg + "（原生 COM 未成功：" + nativeMsg + "）";
+                return true;
+            }
+
+            message = "修正计划任务设置失败。原生 COM: " + nativeMsg + "；PowerShell 回落: " + psMsg;
+            return false;
+        }
+
+        // ================= 原生 COM 访问（替代起 powershell.exe 子进程）=================
+        //
+        // 2026-10-01 实测踩坑，两条都很难从报错里看出来：
+        //
+        // ① **不能用 `null` 占位**：`root.RegisterTaskDefinition(a, b, c, d, null, e, null)`
+        //    会抛 `ArgumentException: 未能将调用的参数 5 转换为 RegisterTaskDefinition`。
+        //    必须传 `Type.Missing`。`password` 与 `sddl` 两个位置都是如此。
+        // ② **definition 实参必须是真正的 ITaskDefinition 对象**：传 XML 字符串会得到
+        //    `COMException 0x80020005 (DISP_E_TYPEMISMATCH)`。
+        //    → 从 `root.GetTask(name).Definition` 拿，或用 `svc.NewTask(0)` 新建。
+        //
+        // 传 `Type.Missing` 占位是 COM 晚绑定的既定用法（DISP_E_PARAMNOTFOUND 等价于"没给"），
+        // 这里单独抽成常量，免得以后又被"顺手改成 null"。
+
+        private const int TaskCreateOrUpdate = 6;
+
+        /// <summary>COM 可选参数的"未提供"占位符。⚠️ 绝不要换成 `null`，见上方说明。</summary>
+        private static readonly object ComMissing = Type.Missing;
+
+        /// <summary>连到任务计划服务并取回根目录 `\` 的 ITaskFolder。失败直接抛，由调用方兜。</summary>
+        private static dynamic OpenTaskFolder()
+        {
+            Type t = Type.GetTypeFromProgID("Schedule.Service");
+            if (t == null) throw new InvalidOperationException("取不到 ProgID Schedule.Service");
+            dynamic svc = Activator.CreateInstance(t);
+            svc.Connect();
+            return svc.GetFolder("\\");
+        }
+
+        /// <summary>原生 COM 改计划任务设置。成功返回 true；任何异常都在内部兜住并写进 message。</summary>
+        private static bool FixTaskSettingsNative(out string message)
+        {
+            try
+            {
+                dynamic folder = OpenTaskFolder();
+                dynamic def = folder.GetTask(TaskName).Definition;
+
+                def.Settings.ExecutionTimeLimit = "PT0S";   // PT0S = 无限制
+                def.Settings.MultipleInstances = 2;         // TASK_INSTANCES_IGNORE_NEW
+                def.Settings.StartWhenAvailable = true;
+
+                // 回填原有的账户与登录方式：重新注册会整体覆盖任务定义，
+                // 不带上这两项就会把运行身份改掉（本机实测该值为 InteractiveToken / 当前用户）。
+                string userId = Convert.ToString(def.Principal.UserId);
+                if (string.IsNullOrEmpty(userId)) userId = null;
+                int logonType = Convert.ToInt32(def.Principal.LogonType);
+
+                folder.RegisterTaskDefinition(TaskName, def, TaskCreateOrUpdate,
+                    userId == null ? ComMissing : (object)userId,
+                    ComMissing, logonType, ComMissing);
+
+                message = "ExecutionTimeLimit 已设为 PT0S(无限制)［原生 COM］";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                message = "原生 COM 改计划任务失败: " + ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>原生 COM 只读一次 ExecutionTimeLimit。读不到返回 ""（不起子进程）。</summary>
+        private static string GetTaskExecutionTimeLimitNative()
+        {
+            try
+            {
+                dynamic folder = OpenTaskFolder();
+                object v = folder.GetTask(TaskName).Definition.Settings.ExecutionTimeLimit;
+                return v == null ? "" : Convert.ToString(v).Trim();
+            }
+            catch { return ""; }
+        }
+
+        // ================= 以下为回落实现（仅在原生 COM 不可用时才会执行）=================
+
+        /// <summary>旧的 PowerShell 实现，作为原生 COM 失败时的回落。</summary>
+        private static bool FixTaskSettingsByPowerShell(out string message)
         {
             string cmd = "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
                 + "-MultipleInstances IgnoreNew -StartWhenAvailable; "
@@ -265,20 +360,25 @@ namespace CampusNetHelper
             string limit = GetTaskExecutionTimeLimit();
             if (limit == "PT0S")
             {
-                message = "ExecutionTimeLimit 已设为 PT0S(无限制)";
+                message = "ExecutionTimeLimit 已设为 PT0S(无限制)［原 PowerShell 路径］";
                 return true;
             }
-            message = "修正计划任务设置失败：ExecutionTimeLimit 仍为 " + (limit == "" ? "(取不到)" : limit)
+            message = "ExecutionTimeLimit 仍为 " + (limit == "" ? "(取不到)" : limit)
                 + "，powershell 退出码 " + code + "。该值默认 PT72H 会在 72 小时后强制终止程序，必须修掉。输出: " + output;
             return false;
         }
 
         /// <summary>
-        /// 查任务的 ExecutionTimeLimit。用 PowerShell 只输出 `PT0S` / `PT72H` 这类 ASCII 值，
-        /// 避开 `schtasks /Query /XML` 的 UTF-16 输出与 .NET 解码不一致问题。
+        /// 查任务的 ExecutionTimeLimit。
+        /// 先用原生 COM（只读、不起子进程）；COM 读不到时才回落 PowerShell。
+        /// 返回值恒为 `PT0S` / `PT72H` 这类 ASCII 值，避开 `schtasks /Query /XML`
+        /// 的 UTF-16 输出与 .NET 解码不一致问题。
         /// </summary>
         public static string GetTaskExecutionTimeLimit()
         {
+            string native = GetTaskExecutionTimeLimitNative();
+            if (native.Length > 0) return native;
+
             string output;
             int code = RunProcess("powershell",
                 "-NoProfile -ExecutionPolicy Bypass -Command \"(Get-ScheduledTask -TaskName '" + TaskName

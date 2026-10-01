@@ -101,6 +101,7 @@ REM ---- response file ----
 >> build.rsp echo /lib:"%WPF%"
 >> build.rsp echo /reference:System.dll
 >> build.rsp echo /reference:System.Core.dll
+>> build.rsp echo /reference:Microsoft.CSharp.dll
 >> build.rsp echo /reference:System.Security.dll
 >> build.rsp echo /reference:System.Windows.Forms.dll
 >> build.rsp echo /reference:System.Drawing.dll
