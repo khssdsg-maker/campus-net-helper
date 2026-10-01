@@ -55,6 +55,7 @@ namespace CampusNetHelper
                 TestAppIcon();
                 TestAccountDeleteNoResurrect();
                 TestSettingRoundTrip();
+                TestVersionCompare();
 
                 W("================ 界面自测 结束 ================");
             }
@@ -1232,6 +1233,47 @@ namespace CampusNetHelper
                 }
                 catch { }
             }
+        }
+
+        /// <summary>
+        /// 版本号比较（C5 的核心逻辑，也是最容易写错的地方）。
+        ///
+        /// ⚠️ 特别是 "2.10.0 vs 2.9.0" 这一条：按字符串比会得出反的结论，
+        ///    结果就是**新版本被漏报**，而且很难发现（要等发到 2.10 才会暴露）。
+        /// </summary>
+        private static void TestVersionCompare()
+        {
+            W("");
+            W("---- 用例：版本号比较 ----");
+
+            bool a = UpdateChecker.Compare("2.2.0", "2.1.1") > 0;
+            W("2.2.0 vs 2.1.1 → " + a + "（期望 True）");
+
+            bool b = UpdateChecker.Compare("2.10.0", "2.9.0") > 0;
+            W("2.10.0 vs 2.9.0 → " + b + "（期望 True —— 按数值比，不是按字符串）");
+
+            bool c = UpdateChecker.Compare("v2.2.0", "2.2.0") == 0;
+            W("v2.2.0 vs 2.2.0 → " + c + "（期望 True，v 前缀要能吃掉）");
+
+            bool d = UpdateChecker.Compare("2.2.1", "2.2.0") > 0;
+            W("2.2.1 vs 2.2.0 → " + d + "（期望 True）");
+
+            bool e = UpdateChecker.Compare("2.1.0", "2.2.0") < 0;
+            W("2.1.0 vs 2.2.0 → " + e + "（期望 True）");
+
+            bool f = UpdateChecker.Compare("乱码", "2.2.0") == 0;
+            W("解析不出来的版本号 → " + f + "（期望 True —— 当成'没有新版'，宁可漏报不误报）");
+
+            bool g = UpdateChecker.Compare("2.2.0-beta", "2.2.0") == 0;
+            W("2.2.0-beta vs 2.2.0 → " + g + "（期望 True，后缀要去掉）");
+
+            bool h = UpdateChecker.Compare("2.2", "2.2.0") == 0;
+            W("2.2 vs 2.2.0 → " + h + "（期望 True，缺的段按 0 算）");
+
+            bool ok = a && b && c && d && e && f && g && h;
+            W("结果：" + (ok
+                ? "通过 —— 按数值段比较、能吃 v 前缀与后缀、解析失败不当成新版本。"
+                : "不通过 —— 版本比较逻辑有问题。"));
         }
 
         private static void TestFirstRunTip()

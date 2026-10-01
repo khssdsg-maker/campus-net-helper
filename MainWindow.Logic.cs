@@ -148,6 +148,7 @@ namespace CampusNetHelper
             ApplyTheme();
             InitTray();
             InitTimers();
+            StartUpdateCheckTimer();   // C5：启动 60 秒后查一次更新（24 小时内只查一次）
             _quality.Updated += OnQualityUpdated;
 
             Visibility = silent ? Visibility.Hidden : Visibility.Visible;
@@ -3277,6 +3278,15 @@ namespace CampusNetHelper
             // 这时候才真的把它打开。这样静默/游戏场景下就不会无预警弹窗。
             trayIcon.BalloonTipClicked += delegate(object s, EventArgs e)
             {
+                // 更新提示优先 —— 用户刚看到的是它，点的也是它
+                if (_pendingUpdateUrl.Length > 0)
+                {
+                    string u = _pendingUpdateUrl;
+                    _pendingUpdateUrl = "";
+                    OpenUrl(u);
+                    return;
+                }
+
                 OpenPendingPortalReauthIfAny();
             };
         }
@@ -3437,6 +3447,120 @@ namespace CampusNetHelper
                 if (trayIcon != null)
                 {
                     trayIcon.ShowBalloonTip(3000, title, msg, System.Windows.Forms.ToolTipIcon.Info);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 待打开的更新下载页。点气泡时才真的去开 ——
+        /// 和"认证页等用户点气泡再开"是同一套克制逻辑（不能自己蹦出浏览器）。
+        /// </summary>
+        private string _pendingUpdateUrl = "";
+
+        /// <summary>
+        /// 启动后延迟查一次更新（只有自动检查开着、且距上次超过 24 小时才查）。
+        ///
+        /// ⚠️ 刻意延迟 60 秒、而且是后台线程：启动那几秒要做的事已经很多了
+        ///（探网、刷界面、可能还要拨号），再塞个网络请求只会让开机更慢。
+        /// </summary>
+        private void StartUpdateCheckTimer()
+        {
+            try
+            {
+                if (!UpdateChecker.Enabled(_settings)) return;
+                if (!UpdateChecker.DueForCheck(_settings)) return;
+
+                System.Windows.Threading.DispatcherTimer t =
+                    new System.Windows.Threading.DispatcherTimer();
+                t.Interval = TimeSpan.FromSeconds(60);
+                t.Tick += delegate(object s, EventArgs e)
+                {
+                    t.Stop();
+                    RunUpdateCheck(false);
+                };
+                t.Start();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("启动更新检查失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 查一次更新。manual=true 时无论有无结果都会给回馈（用户主动点的，不能没反应）。
+        /// </summary>
+        internal void RunUpdateCheck(bool manual)
+        {
+            if (manual)
+            {
+                // 手动检查：用户就等着看结果，先给个"正在查"
+                SetSaveHintSafe("正在检查更新…");
+            }
+
+            UpdateChecker.CheckAsync(delegate(bool hasNew, string latest, string err)
+            {
+                // 回调在线程池线程上 —— 记时间戳和后续 UI 都要回主线程
+                Dispatcher.BeginInvoke(new Action(delegate()
+                {
+                    try
+                    {
+                        UpdateChecker.MarkChecked(_settings);
+
+                        if (err.Length > 0)
+                        {
+                            Log.Info("检查更新失败（静默处理）: " + err);
+                            if (manual)
+                            {
+                                MessageBox.Show(
+                                    "没能连上更新服务器（校园网访问 GitHub 经常不通，这是正常的）。\n\n"
+                                    + "想知道有没有新版，可以自己打开：\n" + UpdateChecker.ReleasesPage,
+                                    "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                            }
+                            return;
+                        }
+
+                        if (hasNew)
+                        {
+                            _pendingUpdateUrl = UpdateChecker.ReleasesPage;
+                            Log.Info("发现新版本: " + latest + "（当前 " + UpdateChecker.CurrentVersion() + "）");
+                            ShowBalloon("发现新版本 " + latest,
+                                "当前是 v" + UpdateChecker.CurrentVersion() + "。点这里打开下载页。");
+
+                            if (manual)
+                            {
+                                MessageBox.Show("发现新版本 " + latest + "。\n\n"
+                                    + "点托盘的气泡可以打开下载页，或者直接访问：\n"
+                                    + UpdateChecker.ReleasesPage,
+                                    "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                            }
+                        }
+                        else
+                        {
+                            Log.Info("检查更新：已是最新（服务端 " + latest + "）");
+                            if (manual)
+                            {
+                                MessageBox.Show("已经是最新版本（v" + UpdateChecker.CurrentVersion() + "）。",
+                                    "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warn("处理更新检查结果失败: " + ex.Message);
+                    }
+                }), System.Windows.Threading.DispatcherPriority.Background);
+            });
+        }
+
+        /// <summary>给设置窗口用的"正在检查更新…"提示（设置窗口可能没开着，所以要判空）。</summary>
+        private void SetSaveHintSafe(string text)
+        {
+            try
+            {
+                if (_settingsWindow != null && _settingsWindow.IsLoaded)
+                {
+                    _settingsWindow.ShowHint(text);
                 }
             }
             catch { }

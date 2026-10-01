@@ -22,6 +22,8 @@ namespace CampusNetHelper
         private CheckBox chkTimeOff;
         private TextBox txtTimeOffStart;
         private TextBox txtTimeOffEnd;
+        /// <summary>检查更新开关（C5）。它跟连接行为完全无关，所以单独存、不进 ApplySettings 那串参数。</summary>
+        private CheckBox chkCheckUpdate;
         private TextBox txtInterval;
         private CheckBox chkKeepAlive;
         private TextBox txtKeepAlive;
@@ -446,6 +448,28 @@ namespace CampusNetHelper
             btnLog.Margin = new Thickness(0, 12, 0, 0);
             stack.Children.Add(btnLog);
 
+            // ---------- 检查更新（C5）----------
+            // 放在「关于」里最自然：用户想找版本信息时，顺手就能检查一下。
+            // 说明写清楚"只提示、不自动装"—— 这是绿色软件的克制，也是用户的安心点。
+            var rowUpd = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+
+            chkCheckUpdate = MakeCheck("自动检查更新（只提示，不会自己下载安装）", true);
+            chkCheckUpdate.Margin = new Thickness(0, 0, 0, 0);
+            chkCheckUpdate.VerticalAlignment = VerticalAlignment.Center;
+            rowUpd.Children.Add(chkCheckUpdate);
+
+            var btnCheckNow = MainWindow.MakeButton("立即检查",
+                Theme.GlassCard, Theme.TextPrimary, Theme.GlassBorder,
+                delegate() { owner.RunUpdateCheck(true); });
+            btnCheckNow.Margin = new Thickness(12, 0, 0, 0);
+            rowUpd.Children.Add(btnCheckNow);
+
+            stack.Children.Add(rowUpd);
+
             var btnSave = MainWindow.MakeButton("保存并校验设置（本页已自动保存）",
                 Theme.Accent, Theme.OnAccent, Theme.Accent, SaveToOwner);
             btnSave.HorizontalAlignment = HorizontalAlignment.Left;
@@ -564,6 +588,12 @@ namespace CampusNetHelper
             if (txtTimeOffEnd != null)
                 txtTimeOffEnd.LostFocus += delegate { RequestAutoSave(); };
 
+            // 检查更新（C5）：跟别的设置没有耦合，改完直接单独存
+            if (chkCheckUpdate != null)
+                chkCheckUpdate.Checked += delegate { SaveCheckUpdateFlag(); };
+            if (chkCheckUpdate != null)
+                chkCheckUpdate.Unchecked += delegate { SaveCheckUpdateFlag(); };
+
             // 数字/文本输入框：失焦时才触发，避免边打字边存
             if (txtInterval != null)
                 txtInterval.LostFocus += delegate { RequestAutoSave(); };
@@ -660,6 +690,36 @@ namespace CampusNetHelper
             lblAutoSaveHint.Text = text;
         }
 
+        /// <summary>给外面用的提示（主窗口做"立即检查更新"时显示"正在检查…"）。</summary>
+        internal void ShowHint(string text)
+        {
+            SetSaveHint(text);
+        }
+
+        /// <summary>
+        /// 存"检查更新"这个开关。
+        ///
+        /// ⚠️ 它没走 ApplySettings 那串参数（2026-10-02）：那个方法有十几个参数，
+        ///    而这个开关跟连接行为**完全无关**，塞进去只会让签名更长、更容易出错。
+        ///    单独读-改-写一次即可（读-合并-写，避免覆盖别处刚改的设置）。
+        /// </summary>
+        private void SaveCheckUpdateFlag()
+        {
+            if (_loading) return;
+            try
+            {
+                System.Collections.Generic.Dictionary<string, string> disk = ConfigStore.LoadSettings();
+                ConfigStore.SetBool(disk, UpdateChecker.EnabledKey, chkCheckUpdate.IsChecked == true);
+                string msg;
+                ConfigStore.SaveSettings(disk, out msg);
+                SetSaveHint("已自动保存 ✓");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("保存检查更新开关失败: " + ex.Message);
+            }
+        }
+
         private static CheckBox MakeCheck(string text, bool initial)
         {
             return new CheckBox
@@ -701,6 +761,8 @@ namespace CampusNetHelper
                 chkTimeOff.IsChecked = owner.TimeOffEnabled();
                 txtTimeOffStart.Text = owner.TimeOffStart();
                 txtTimeOffEnd.Text = owner.TimeOffEnd();
+
+                chkCheckUpdate.IsChecked = UpdateChecker.Enabled(ConfigStore.LoadSettings());
 
                 // 认证方式
                 bool portal = owner.IsPortalMode();
