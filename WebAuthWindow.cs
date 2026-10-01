@@ -1181,6 +1181,12 @@ namespace CampusNetHelper
                 if (type == "hidden" || type == "submit" || type == "button"
                     || type == "image" || type == "reset" || type == "file") continue;
 
+                // ⚠️ disabled / readonly 的控件不参与编号（2026-10-01 审计确认）：
+                //    MatchField 的候选列表本来就把它们排除在外，而这里以前照样计数，
+                //    两边的口径不一致 —— 结果是那些靠"序号"兜底的字段会**整体错位一位**，
+                //    填到隔壁框里去。
+                if (IsDisabled(el)) continue;
+
                 var f = new FieldProfileStore.FieldProfile();
                 f.Name = AttrOf(el, "name");
                 f.Id = AttrOf(el, "id");
@@ -1451,16 +1457,26 @@ namespace CampusNetHelper
                     continue;
                 }
 
-                SetValue(el, value);
-                filled++;
-                done.Add((f.Label.Length > 0 ? f.Label : f.Id) + " = " + MaskForLog(f, value));
+                // ⚠️ SetValue 现在返回 bool（写失败就不算"已填"）—— 2026-10-01 审计确认：
+                //    以前它内部用空 catch 吞异常，外面照样 filled++，
+                //    于是日志和界面都声称"已填 N 项"，页面上其实还是空的。
+                if (SetValue(el, value))
+                {
+                    filled++;
+                    done.Add((f.Label.Length > 0 ? f.Label : f.Id) + " = " + MaskForLog(f, value));
+                }
             }
 
             if (filled == 0)
             {
                 Log.Info("字段档案命中（" + profile.Url + "）但一个字段都没填上 —— 页面结构可能变了");
                 SetStatus("这个网址有字段档案，但一个框都没对上 —— 页面可能改版了，重新扫一次档案吧。");
-                return true;
+
+                // ⚠️ 这里**必须返回 false**（2026-10-01 审计确认）：
+                //    以前返回 true，调用方就认为"档案这条路成功了"直接收工，
+                //    于是下面那段"按 name/id 猜字段"的启发式兜底**永远不会执行** ——
+                //    等于档案一旦对不上，整条自动填表就成了死路（页面改版后尤其明显）。
+                return false;
             }
 
             Log.Info("字段档案填表：" + string.Join("、", done.ToArray()));
@@ -1905,34 +1921,6 @@ namespace CampusNetHelper
             t.Start();
         }
 
-        private static bool ProbeInternet()
-        {
-            try
-            {
-                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(
-                    "http://connect.rom.miui.com/generate_204");
-                req.Method = "GET";
-                req.Timeout = 6000;
-                req.ReadWriteTimeout = 6000;
-                req.AllowAutoRedirect = false;
-                req.KeepAlive = false;
-                req.Proxy = null;
-                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
-                {
-                    return true;
-                }
-            }
-            catch (WebException wex)
-            {
-                // 有响应就说明通了（认证前通常会拿到 302 跳转到认证页）
-                return wex.Response != null;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
         /// <summary>
         /// 判断"网络是否真的通了"。
         ///
@@ -2327,18 +2315,28 @@ namespace CampusNetHelper
         }
 
         /// <summary>
-        /// 给输入框赋值。
+        /// 给输入框赋值，返回**是否真的写进去了**。
+        ///
         /// 注意必须**同时**改 value 属性和触发 change 事件 ——
         /// 有些页面靠 onchange 才把值同步到内部变量，只赋值不触发等于没填。
+        ///
+        /// ⚠️ 2026-10-01 起返回 bool：以前这里从头到尾都是空 catch，
+        ///    写失败（元素已失效、页面已经导航走）也静默通过，调用方照样累加"已填 N 项"，
+        ///    结果日志和界面都在说填好了，页面上却是空的。
         /// </summary>
-        private static void SetValue(WinForms.HtmlElement el, string value)
+        private static bool SetValue(WinForms.HtmlElement el, string value)
         {
-            try { el.SetAttribute("value", value); }
+            bool wrote = false;
+            try { el.SetAttribute("value", value); wrote = true; }
             catch { }
+
+            // 下面几个只是"通知页面值变了"，失败不影响"值有没有写进去"这个事实
             try { el.InvokeMember("focus"); } catch { }
             try { el.InvokeMember("onchange"); } catch { }
             try { el.InvokeMember("onkeyup"); } catch { }
             try { el.InvokeMember("blur"); } catch { }
+
+            return wrote;
         }
 
         private static void ClickElement(WinForms.HtmlElement el)
@@ -2362,6 +2360,24 @@ namespace CampusNetHelper
             if (el == null) return;
             try
             {
+                // ⚠️ 先从这个元素**向上**找它所属的 form（2026-10-01 审计确认）：
+                //    以前不分青红皂白提交 Document 里的**第一个** form ——
+                //    页面上只要还有别的表单（搜索框、友情链接、隐藏表单……），提交的就是错的，
+                //    表现是"点登录没反应"或者"跳到了搜索页"。
+                WinForms.HtmlElement cur = el;
+                int guard = 0;
+                while (cur != null && guard++ < 20)
+                {
+                    if (string.Equals(TagOf(cur), "form", StringComparison.OrdinalIgnoreCase))
+                    {
+                        cur.InvokeMember("submit");
+                        return;
+                    }
+                    try { cur = cur.Parent; }
+                    catch { cur = null; }
+                }
+
+                // 兜底：连所属 form 都找不到（结构太怪），还按老办法提交第一个
                 WinForms.HtmlElementCollection forms = el.Document.GetElementsByTagName("form");
                 if (forms != null && forms.Count > 0) forms[0].InvokeMember("submit");
             }

@@ -19,6 +19,9 @@ namespace CampusNetHelper
         private CheckBox chkNightQuiet;
         private TextBox txtQuietStart;
         private TextBox txtQuietEnd;
+        private CheckBox chkTimeOff;
+        private TextBox txtTimeOffStart;
+        private TextBox txtTimeOffEnd;
         private TextBox txtInterval;
         private CheckBox chkKeepAlive;
         private TextBox txtKeepAlive;
@@ -287,6 +290,47 @@ namespace CampusNetHelper
             });
             stack.Children.Add(rowQuiet);
 
+            // ---------- 定时断网 ----------
+            // 夜间免打扰的镜像场景：熄灯后自动断开、早上自动连回来。
+            // 免打扰是"不动手也不吵"，这个是"真的断掉"—— 有些学校夜里断网，
+            // 提前断开能避免被记一堆异常；也是"自律/家长"场景想要的。
+            chkTimeOff = MakeCheck("定时断网（时段内自动断开，到点自动连回来）", false);
+            stack.Children.Add(chkTimeOff);
+
+            var rowOff = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(24, 8, 0, 0)
+            };
+            rowOff.Children.Add(new TextBlock
+            {
+                Text = "断网时段",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                FontSize = 11
+            });
+            txtTimeOffStart = MakeTimeBox("01:00");
+            rowOff.Children.Add(txtTimeOffStart);
+            rowOff.Children.Add(new TextBlock
+            {
+                Text = "到",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                FontSize = 11,
+                Margin = new Thickness(8, 0, 8, 0)
+            });
+            txtTimeOffEnd = MakeTimeBox("07:30");
+            rowOff.Children.Add(txtTimeOffEnd);
+            rowOff.Children.Add(new TextBlock
+            {
+                Text = "（可跨零点；时段内不重连）",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Theme.TextFaint),
+                FontSize = 11,
+                Margin = new Thickness(8, 0, 0, 0)
+            });
+            stack.Children.Add(rowOff);
+
             stack.Children.Add(new TextBlock
             {
                 Text = "这段时间里程序完全不打扰：不检测网络、不重试拨号、不弹任何提示。"
@@ -488,6 +532,18 @@ namespace CampusNetHelper
             if (chkCloseToTray != null)
                 chkCloseToTray.Unchecked += delegate { RequestAutoSave(); };
 
+            // ⚠️ chkSilent 以前漏挂了（2026-10-01 审计确认）：
+            //    这个页面承诺"改完即存"，唯独这个勾选要点「保存」按钮才生效，
+            //    而且之后还会被加载回填逻辑悄悄改回去，用户完全摸不着头脑。
+            //
+            //    📌 新增任何开关时，这两点必须齐：
+            //       ① 在这里挂 Checked/Unchecked 两个事件
+            //       ② 在加载路径里回填（见 LoadFromOwner / 各处 IsChecked = ...）
+            if (chkSilent != null)
+                chkSilent.Checked += delegate { RequestAutoSave(); };
+            if (chkSilent != null)
+                chkSilent.Unchecked += delegate { RequestAutoSave(); };
+
             // 夜间免打扰：开关和时段都要存
             if (chkNightQuiet != null)
                 chkNightQuiet.Checked += delegate { RequestAutoSave(); };
@@ -497,6 +553,16 @@ namespace CampusNetHelper
                 txtQuietStart.LostFocus += delegate { RequestAutoSave(); };
             if (txtQuietEnd != null)
                 txtQuietEnd.LostFocus += delegate { RequestAutoSave(); };
+
+            // 定时断网（C3）：和免打扰一样的挂法
+            if (chkTimeOff != null)
+                chkTimeOff.Checked += delegate { RequestAutoSave(); };
+            if (chkTimeOff != null)
+                chkTimeOff.Unchecked += delegate { RequestAutoSave(); };
+            if (txtTimeOffStart != null)
+                txtTimeOffStart.LostFocus += delegate { RequestAutoSave(); };
+            if (txtTimeOffEnd != null)
+                txtTimeOffEnd.LostFocus += delegate { RequestAutoSave(); };
 
             // 数字/文本输入框：失焦时才触发，避免边打字边存
             if (txtInterval != null)
@@ -551,6 +617,14 @@ namespace CampusNetHelper
                 if (qs == qe) return;
             }
 
+            string os2 = (txtTimeOffStart.Text ?? "").Trim();
+            string oe = (txtTimeOffEnd.Text ?? "").Trim();
+            if (chkTimeOff.IsChecked == true)
+            {
+                if (!MainWindow.IsValidHm(os2) || !MainWindow.IsValidHm(oe)) return;
+                if (os2 == oe) return;
+            }
+
             try
             {
                 owner.ApplySettingsFromWindowSilent(
@@ -563,6 +637,9 @@ namespace CampusNetHelper
                     chkNightQuiet.IsChecked == true,
                     qs,
                     qe,
+                    chkTimeOff.IsChecked == true,
+                    os2,
+                    oe,
                     (rbPortal != null && rbPortal.IsChecked == true) ? "portal" : "dial",
                     (rbPortalKeep != null && rbPortalKeep.IsChecked == true) ? "keep" : "auto");
 
@@ -621,6 +698,10 @@ namespace CampusNetHelper
                 txtQuietStart.Text = owner.NightQuietStart();
                 txtQuietEnd.Text = owner.NightQuietEnd();
 
+                chkTimeOff.IsChecked = owner.TimeOffEnabled();
+                txtTimeOffStart.Text = owner.TimeOffStart();
+                txtTimeOffEnd.Text = owner.TimeOffEnd();
+
                 // 认证方式
                 bool portal = owner.IsPortalMode();
                 rbDial.IsChecked = !portal;
@@ -672,6 +753,24 @@ namespace CampusNetHelper
                 }
             }
 
+            string os2 = (txtTimeOffStart.Text ?? "").Trim();
+            string oe = (txtTimeOffEnd.Text ?? "").Trim();
+            if (chkTimeOff.IsChecked == true)
+            {
+                if (!MainWindow.IsValidHm(os2) || !MainWindow.IsValidHm(oe))
+                {
+                    MessageBox.Show("定时断网时段请按 24 小时制填写，形如 01:00。",
+                        "设置", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                if (os2 == oe)
+                {
+                    MessageBox.Show("定时断网的开始和结束时间不能一样。",
+                        "设置", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+            }
+
             string note = owner.ApplySettingsFromWindow(
                 chkAutoReconnect.IsChecked == true,
                 chkSilent.IsChecked == true,
@@ -682,6 +781,9 @@ namespace CampusNetHelper
                 chkNightQuiet.IsChecked == true,
                 qs,
                 qe,
+                chkTimeOff.IsChecked == true,
+                os2,
+                oe,
                 (rbPortal.IsChecked == true) ? "portal" : "dial",
                 (rbPortalKeep.IsChecked == true) ? "keep" : "auto");
 

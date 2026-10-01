@@ -155,42 +155,65 @@ namespace CampusNetHelper
         // 读写
         // ==================================================================
 
-        /// <summary>读取全部档案。文件坏了返回空列表（不抛异常，调用方在窗口构造链上）。</summary>
+        /// <summary>
+        /// 读取全部档案。
+        ///
+        /// ⚠️ 与 WebUrlStore 同理（2026-10-01 审计确认）：主文件读不了不能当"空"处理 ——
+        ///    那会让下一次 Save 把用户辛苦教出来的全部字段档案无声冲掉。
+        ///    这个文件同样**没有 .bak 兜底**，所以现在：主文件读不了退到 .bak，
+        ///    两个都读不了才返回空，并让 Save 侧拒绝覆盖。
+        /// </summary>
         public static List<Profile> LoadAll()
         {
-            var list = new List<Profile>();
             try
             {
-                if (!File.Exists(ProfilesPath)) return list;
-                foreach (string line in File.ReadAllLines(ProfilesPath, Encoding.UTF8))
-                {
-                    if (string.IsNullOrEmpty(line) || line.StartsWith("#", StringComparison.Ordinal)) continue;
-
-                    // 行首 "URL=" 的行开一个新档案
-                    if (line.StartsWith("URL=", StringComparison.Ordinal))
-                    {
-                        var p = new Profile();
-                        p.Url = Unescape(line.Substring(4));
-                        list.Add(p);
-                        continue;
-                    }
-                    if (line.StartsWith("AT=", StringComparison.Ordinal))
-                    {
-                        if (list.Count > 0) list[list.Count - 1].SavedAt = Unescape(line.Substring(3));
-                        continue;
-                    }
-                    if (line.StartsWith("F=", StringComparison.Ordinal))
-                    {
-                        if (list.Count == 0) continue;
-                        FieldProfile f = ParseField(line.Substring(2));
-                        if (f != null) list[list.Count - 1].Fields.Add(f);
-                        continue;
-                    }
-                }
+                return ParseFile(ProfilesPath);
             }
             catch (Exception ex)
             {
-                Log.Warn("读取字段档案失败（按空处理）: " + ex.Message);
+                Log.Warn("读取字段档案失败，改用备份: " + ex.Message);
+                try
+                {
+                    return ParseFile(ProfilesPath + SafeFile.BackupSuffix);
+                }
+                catch (Exception ex2)
+                {
+                    Log.Warn("备份也读不了（本次按空处理，且不会覆盖保存）: " + ex2.Message);
+                    return new List<Profile>();
+                }
+            }
+        }
+
+        /// <summary>真正解析文件内容。异常一律向上抛，由 LoadAll 决定怎么兜。</summary>
+        private static List<Profile> ParseFile(string path)
+        {
+            var list = new List<Profile>();
+            if (!File.Exists(path)) return list;   // 不存在是正常的，不是错误
+
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+            {
+                if (string.IsNullOrEmpty(line) || line.StartsWith("#", StringComparison.Ordinal)) continue;
+
+                // 行首 "URL=" 的行开一个新档案
+                if (line.StartsWith("URL=", StringComparison.Ordinal))
+                {
+                    var p = new Profile();
+                    p.Url = Unescape(line.Substring(4));
+                    list.Add(p);
+                    continue;
+                }
+                if (line.StartsWith("AT=", StringComparison.Ordinal))
+                {
+                    if (list.Count > 0) list[list.Count - 1].SavedAt = Unescape(line.Substring(3));
+                    continue;
+                }
+                if (line.StartsWith("F=", StringComparison.Ordinal))
+                {
+                    if (list.Count == 0) continue;
+                    FieldProfile f = ParseField(line.Substring(2));
+                    if (f != null) list[list.Count - 1].Fields.Add(f);
+                    continue;
+                }
             }
             return list;
         }
@@ -227,6 +250,17 @@ namespace CampusNetHelper
                 profile.SavedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
 
                 List<Profile> all = LoadAll();
+
+                // ⚠️ 与 WebUrlStore 同一道闸（2026-10-01 审计确认）：
+                //    读到 0 份、但磁盘上有内容 —— 这是读失败，不是用户删光了。
+                //    继续写就会把用户一格格教出来的字段档案全部冲掉。
+                if (all.Count == 0 && SafeFile.HasRealContent(ProfilesPath))
+                {
+                    message = "现有字段档案读取失败，为防止覆盖原有内容，本次没有保存。请稍后重试。";
+                    Log.Warn("保存字段档案被拒：读到 0 份但文件有内容，判定为读取失败");
+                    return false;
+                }
+
                 int found = -1;
                 for (int i = 0; i < all.Count; i++)
                 {
@@ -297,6 +331,8 @@ namespace CampusNetHelper
                             + Escape(f.AccountField));
                     }
                 }
+                // 写前留一份上一版（这个文件以前没有备份）
+                SafeFile.KeepBackup(ProfilesPath);
                 SafeFile.WriteAtomic(ProfilesPath, sb.ToString(), Encoding.UTF8);
                 return true;
             }
@@ -331,7 +367,11 @@ namespace CampusNetHelper
                 {
                     char n = s[i + 1];
                     if (n == 'p') { sb.Append('|'); i++; continue; }
-                    if (n == 'n') { sb.Append(' '); i++; continue; }
+                    // ⚠️ 这里以前还原成**空格**，而 Escape 侧写的是字面 `\n`
+                    //    —— 存取不对称：含换行的固定值存进去是换行、读出来变空格。
+                    //    而 WebUrlStore 的同名方法还原的是真换行，两处早已分叉
+                    //    （2026-10-01 审计确认）。统一成换行。
+                    if (n == 'n') { sb.Append('\n'); i++; continue; }
                     if (n == '\\') { sb.Append('\\'); i++; continue; }
                 }
                 sb.Append(s[i]);

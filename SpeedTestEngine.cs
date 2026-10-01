@@ -254,6 +254,48 @@ namespace CampusNetHelper
 
         private Thread _worker;
         private volatile bool _cancel;
+
+        /// <summary>
+        /// 正在进行的 HTTP 请求。Cancel() 时对它们逐个 Abort()。
+        ///
+        /// ⚠️ 光置 _cancel 标志不够（2026-10-01 审计确认）：
+        ///    卡在 GetResponse() / Read() 里的线程要等**自身超时**才会醒
+        ///    （下载 10 秒、上传 20 秒），这段时间流量还在跑 ——
+        ///    用户已经点了"停止"，宿舍共享带宽却还在被吃掉。
+        ///
+        /// Abort() 会让那些调用立刻抛 WebException，而现有 catch 本来就把它
+        /// 当"这一片失败"处理，所以打断是安全的（不会变成未捕获异常）。
+        /// </summary>
+        private readonly List<HttpWebRequest> _activeReqs = new List<HttpWebRequest>();
+        private readonly object _reqLock = new object();
+
+        /// <summary>
+        /// 把请求登记进"活动请求"。**必须在 GetResponse() 之前登记** ——
+        /// Cancel 要来得及 Abort 它。配合 using 用，作用域结束自动注销。
+        /// </summary>
+        private IDisposable TrackRequest(HttpWebRequest req)
+        {
+            lock (_reqLock) { _activeReqs.Add(req); }
+            return new RequestToken(this, req);
+        }
+
+        private void UntrackRequest(HttpWebRequest req)
+        {
+            lock (_reqLock) { _activeReqs.Remove(req); }
+        }
+
+        /// <summary>注销凭据。C# 5 没有局部函数，只能写成一个小类。</summary>
+        private sealed class RequestToken : IDisposable
+        {
+            private readonly SpeedTestEngine _owner;
+            private readonly HttpWebRequest _req;
+            public RequestToken(SpeedTestEngine owner, HttpWebRequest req)
+            {
+                _owner = owner;
+                _req = req;
+            }
+            public void Dispose() { _owner.UntrackRequest(_req); }
+        }
         private volatile bool _running;
         private DateTime _lastTick = DateTime.MinValue;
 
@@ -302,7 +344,20 @@ namespace CampusNetHelper
             _worker.Start();
         }
 
-        public void Cancel() { _cancel = true; }
+        public void Cancel()
+        {
+            _cancel = true;
+
+            // ⚠️ 置完标志还要把在途请求掐掉，否则它们会一直拖到自己的超时为止
+            //    （下载 10 秒、上传 20 秒），这期间流量照跑 —— 见 _activeReqs 的说明。
+            HttpWebRequest[] snap;
+            lock (_reqLock) { snap = _activeReqs.ToArray(); }
+
+            for (int i = 0; i < snap.Length; i++)
+            {
+                try { snap[i].Abort(); } catch { }
+            }
+        }
 
         // ==================================================================
         // 主流程
@@ -632,6 +687,7 @@ namespace CampusNetHelper
                             req.Timeout = 10000;
                             req.ReadWriteTimeout = 10000;
 
+                            using (TrackRequest(req))
                             using (WebResponse resp = req.GetResponse())
                             {
                                 using (Stream s = resp.GetResponseStream())
@@ -733,111 +789,6 @@ namespace CampusNetHelper
             return true;
         }
 
-        /// <summary>
-        /// 多连接并发下载测速。
-        ///
-        /// 为什么必须并发：单条 TCP 连接的吞吐上限 ≈ 接收窗口 ÷ 往返延迟。
-        /// 到中科大的延迟约 80ms，单连接实测只能跑出 4 Mbps，
-        /// 而浏览器（LibreSpeed 默认开 4~6 条并发）能跑出 199 Mbps。
-        /// 单连接会把带宽严重低估，所以这里必须开多线程同时下。
-        /// </summary>
-        private bool TryDownload(string url, string name, out double mbps, out double mb)
-        {
-            mbps = 0;
-            mb = 0;
-
-            long total = 0;
-            Stopwatch sw = Stopwatch.StartNew();
-            _lastTick = DateTime.Now;
-
-            StartSampler(SpeedPhase.Download);
-
-            Thread[] workers = new Thread[Streams];
-            for (int i = 0; i < workers.Length; i++)
-            {
-                workers[i] = new Thread(delegate()
-                {
-                    try
-                    {
-                        HttpWebRequest req = MakeRequest(url);
-                        req.Timeout = 12000;
-                        req.ReadWriteTimeout = 12000;
-
-                        using (WebResponse resp = req.GetResponse())
-                        {
-                            using (Stream s = resp.GetResponseStream())
-                            {
-                                // 512KB 读取块 —— 小块（64KB）在高带宽下光是 read 调用开销就很可观，
-                                // 实测把块调大能明显拉高下载读数。
-                                byte[] buf = new byte[524288];
-                                int n;
-
-                                while ((n = s.Read(buf, 0, buf.Length)) > 0)
-                                {
-                                    if (_cancel) break;
-
-                                    // 画波形用（不管预热，收到字节就计入）
-                                    Interlocked.Add(ref _probeBytes, n);
-
-                                    // 预热期内只读不计数 —— 那一段是 TCP 慢启动的虚高
-                                    if (sw.Elapsed.TotalSeconds >= DownloadWarmupSeconds)
-                                    {
-                                        Interlocked.Add(ref total, n);
-                                    }
-
-                                    if (sw.Elapsed.TotalSeconds >= DownloadSeconds) break;
-                                    if (Interlocked.Read(ref total) >= DownloadMaxBytes) break;
-
-                                    if ((DateTime.Now - _lastTick).TotalMilliseconds > 300)
-                                    {
-                                        _lastTick = DateTime.Now;
-                                        double el = sw.Elapsed.TotalSeconds;
-                                        long got = Interlocked.Read(ref total);
-
-                                        Report(SpeedPhase.Download,
-                                            (int)Math.Min(99, el / DownloadSeconds * 100),
-                                            string.Format("正在测试下载速度… {0} MB，{1} Mbps（{2}）",
-                                                Fmt(got / 1e6),
-                                                Fmt(got * 8.0 / Math.Max(0.001, el) / 1e6), name));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    catch { }
-                });
-                workers[i].IsBackground = true;
-                workers[i].Name = "dl" + i;
-                workers[i].Start();
-            }
-
-            foreach (Thread t in workers)
-            {
-                try { t.Join(25000); }
-                catch { }
-            }
-
-            StopSampler();
-            sw.Stop();
-
-            long got2 = Interlocked.Read(ref total);
-            double fullSecs = sw.Elapsed.TotalSeconds;
-
-            // 分子已经不含预热期，分母也要相应减掉，否则速率会被低估
-            double secs = fullSecs - DownloadWarmupSeconds;
-            if (secs < 1.0) secs = fullSecs;
-
-            if (secs < MinUsefulSeconds || got2 < MinUsefulBytes)
-            {
-                if (got2 > 0) Log.Warn("下载测速数据不足（" + name + "）: " + (got2 / 1024) + " KB / " + fullSecs.ToString("0.0") + "s");
-                return false;
-            }
-
-            mbps = got2 * 8.0 / secs / 1e6;
-            mb = got2 / 1e6;
-            return true;
-        }
-
         // ==================================================================
         // 上传
         // ==================================================================
@@ -904,6 +855,7 @@ namespace CampusNetHelper
                         if (c > 0 && sw.Elapsed.TotalSeconds >= UploadStopSeconds) break;
 
                         long chunkSent = 0;
+                        IDisposable reqToken = null;
                         try
                         {
                             HttpWebRequest req = MakeRequest(url);
@@ -913,6 +865,11 @@ namespace CampusNetHelper
                             req.ContentLength = UploadChunkBytes;
                             req.Timeout = 20000;
                             req.ReadWriteTimeout = 20000;
+
+                            // 上传是最需要能被 Cancel 掐断的一条 —— 它超时最长（20 秒），
+                            // 而且正在往外灌数据，点了"停止"还在占上行（2026-10-01 审计确认）。
+                            // 用 try/finally 注销而不是 using 块：免得把下面整段读循环再缩进一层。
+                            reqToken = TrackRequest(req);
 
                             double startedAt = sw.Elapsed.TotalSeconds;
 
@@ -984,6 +941,11 @@ namespace CampusNetHelper
                             Log.Warn("上传测速失败（" + name + "，连接 " + idx + " 第 " + (c + 1)
                                    + " 片）: " + ex.Message);
                             break;
+                        }
+                        finally
+                        {
+                            // 无论正常结束还是异常，都要把它从"活动请求"里摘掉
+                            if (reqToken != null) reqToken.Dispose();
                         }
                     }
                 });

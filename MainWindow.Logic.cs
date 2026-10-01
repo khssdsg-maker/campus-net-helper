@@ -58,6 +58,25 @@ namespace CampusNetHelper
         /// "我明明点了断开，半分钟后它自己又连上了"这种莫名其妙的行为。
         /// </summary>
         private bool _autoReconnectArmed = false;
+
+        /// <summary>
+        /// 连续遇到"限速类"失败的次数（学校风控 / 并发超限）。
+        ///
+        /// ⚠️ 这类失败**越重试越糟**（2026-10-02 审计确认）：风控是按失败次数加码的，
+        ///   默认 30 秒一次的自动重连等于一直在给它续期。
+        ///   所以：命中一次就把间隔拉到 15 分钟，连中 3 次当天不再自动试。
+        ///   拨号成功即归零。
+        /// </summary>
+        private int _rateLimitHits = 0;
+
+        /// <summary>限速静默期：这个时刻之前不自动重连（用户手动点不受影响）。</summary>
+        private DateTime _rateLimitUntil = DateTime.MinValue;
+
+        /// <summary>已经在哪一天因为限速停手了（跨天自动失效）。</summary>
+        private string _rateLimitStopDate = "";
+
+        /// <summary>"已停手"这件事是否已经提示过（只提示一次，别每轮刷屏）。</summary>
+        private bool _rateLimitStopReported = false;
         private HealthWindow _healthWindow = null;
         private SettingsWindow _settingsWindow = null;
         private SpeedTestWindow _speedTestWindow = null;
@@ -125,6 +144,7 @@ namespace CampusNetHelper
             PreviewMouseMove += OnUserActivity;
             PreviewKeyDown += OnUserActivity;
             LoadAll();
+            WeeklyStats.Init();   // 周报统计：把"今天"这条准备好（有旧文件就接着累加）
             ApplyTheme();
             InitTray();
             InitTimers();
@@ -358,7 +378,21 @@ namespace CampusNetHelper
             }
             _settings["History"] = hb.ToString();
 
-            ConfigStore.SaveSettings(_settings, out msg);
+            // ⚠️ 必须「读-合并-写」，不能把 _settings 整个写回去（2026-10-01 审计确认）：
+            //    _settings 是**启动时的快照**，之后永不重读。而设置窗口改主题走的是
+            //    Theme.SavePreference 的"读-改-写"路径 —— 只要之后发生一次连接/断开
+            //    触发到这里，磁盘上的 ThemePreference 就被内存里的旧值覆盖回去了，
+            //    用户重启后发现主题又变回默认，而且怎么改都保持不住。
+            //
+            //    现在：以**磁盘内容**为底，再把内存里这些键覆盖上去（内存值优先）。
+            //    所有配置写入本来都在 UI 线程，没有并发问题。
+            Dictionary<string, string> disk = ConfigStore.LoadSettings();
+            foreach (KeyValuePair<string, string> kv in _settings)
+            {
+                disk[kv.Key] = kv.Value;
+            }
+
+            ConfigStore.SaveSettings(disk, out msg);
             if (!string.IsNullOrEmpty(msg)) Log.Warn(msg);
         }
 
@@ -432,6 +466,11 @@ namespace CampusNetHelper
         /// </summary>
         private int NextRetryDelay()
         {
+            // ⚠️ 限速静默期：直接把间隔拉到 15 分钟（2026-10-02，对应 C2）。
+            //    这不是"放弃"，而是**保护账号** —— 风控按失败次数加码，
+            //    继续 30 秒一次只会让解禁时间越来越远。
+            if (_rateLimitUntil != DateTime.MinValue && DateTime.Now < _rateLimitUntil) return 900;
+
             if (_autoReconnectAttempts == 0) return 3;
             if (_autoReconnectAttempts == 1) return 10;
             return ReconnectInterval();
@@ -444,10 +483,12 @@ namespace CampusNetHelper
         internal string ApplySettingsFromWindow(bool autoReconnect, bool silent, bool closeToTray,
             int interval, bool keepAlive, int keepAliveMinutes,
             bool nightQuiet, string quietStart, string quietEnd,
+            bool timeOff, string timeOffStart, string timeOffEnd,
             string authMode, string portalStartupBehavior)
         {
             ApplySettingsCore(autoReconnect, closeToTray, interval, keepAlive, keepAliveMinutes,
-                nightQuiet, quietStart, quietEnd, authMode, portalStartupBehavior);
+                nightQuiet, quietStart, quietEnd, timeOff, timeOffStart, timeOffEnd,
+                authMode, portalStartupBehavior);
 
             string note = ReconcileStartupCopy(silent);
 
@@ -470,16 +511,19 @@ namespace CampusNetHelper
         internal void ApplySettingsFromWindowSilent(bool autoReconnect, bool silent, bool closeToTray,
             int interval, bool keepAlive, int keepAliveMinutes,
             bool nightQuiet, string quietStart, string quietEnd,
+            bool timeOff, string timeOffStart, string timeOffEnd,
             string authMode, string portalStartupBehavior)
         {
             ApplySettingsCore(autoReconnect, closeToTray, interval, keepAlive, keepAliveMinutes,
-                nightQuiet, quietStart, quietEnd, authMode, portalStartupBehavior);
+                nightQuiet, quietStart, quietEnd, timeOff, timeOffStart, timeOffEnd,
+                authMode, portalStartupBehavior);
         }
 
         /// <summary>设置落盘 + 让"立刻生效"的开关动起来（不含开机自启副本的处理）。</summary>
         private void ApplySettingsCore(bool autoReconnect, bool closeToTray,
             int interval, bool keepAlive, int keepAliveMinutes,
             bool nightQuiet, string quietStart, string quietEnd,
+            bool timeOff, string timeOffStart, string timeOffEnd,
             string authMode, string portalStartupBehavior)
         {
             ConfigStore.SetBool(_settings, "AutoReconnect", autoReconnect);
@@ -490,6 +534,10 @@ namespace CampusNetHelper
             ConfigStore.SetBool(_settings, "NightQuiet", nightQuiet);
             _settings["NightQuietStart"] = quietStart ?? "23:30";
             _settings["NightQuietEnd"] = quietEnd ?? "07:00";
+            // 定时断网（C3）：与夜间免打扰是两套独立的时段
+            ConfigStore.SetBool(_settings, "TimeOff", timeOff);
+            _settings["TimeOffStart"] = timeOffStart ?? "01:00";
+            _settings["TimeOffEnd"] = timeOffEnd ?? "07:30";
 
             // 认证方式：只接受 dial / portal 两个值，其余一律回落 dial（防手改配置写坏）
             _settings["AuthMode"] = string.Equals(authMode, "portal", StringComparison.OrdinalIgnoreCase)
@@ -828,6 +876,10 @@ namespace CampusNetHelper
         {
             bool quiet = InNightQuiet();
 
+            // 定时断网先处理 —— 它是"用户明确要求断开"，优先级高于别的自动动作
+            HandleTimeOff();
+            if (_timeOffActive) return;   // 断网时段内不做任何检测/重连
+
             // 网页认证模式走一条完全不同的路 —— 它没有拨号会话可看，
             // 唯一可靠的判据就是"能不能真的上网"。
             if (IsPortalMode())
@@ -891,7 +943,19 @@ namespace CampusNetHelper
             // 免打扰时段：不检测、不重试、不弹提示（已经连着的网络保持不断）
             if (quiet)
             {
-                if (_state != ConnState.Connected) EnterQuiet();
+                // ⚠️ 必须排除"进行中"的两个状态（2026-10-01 审计确认）：
+                //    拨号正在跑的时候免打扰到点，原来会把它切成 Quiet ——
+                //    而主按钮的 busy 判定只认 Connecting / Disconnecting，
+                //    于是按钮被解禁，用户再点一下就是**第二个 rasdial**
+                //    （两个线程抢同一个连接，结果不可预期）。
+                //    正在拨号就等这一轮跑完：成功自然进 Connected，失败下一轮 tick 再评估。
+                if (_state != ConnState.Connected
+                    && _state != ConnState.Quiet
+                    && _state != ConnState.Connecting
+                    && _state != ConnState.Disconnecting)
+                {
+                    EnterQuiet();
+                }
                 return;
             }
 
@@ -951,7 +1015,15 @@ namespace CampusNetHelper
             // 免打扰时段不动探测（夜里没人看界面，省点电也省得刷日志）
             if (quiet)
             {
-                if (_state != ConnState.Connected && _state != ConnState.Quiet) EnterQuiet();
+                // ⚠️ 同拨号模式那处：正在重新认证（Connecting）时不要切 Quiet，
+                //    否则按钮解禁、用户重复触发一次（2026-10-01 审计确认）。
+                if (_state != ConnState.Connected
+                    && _state != ConnState.Quiet
+                    && _state != ConnState.Connecting
+                    && _state != ConnState.Disconnecting)
+                {
+                    EnterQuiet();
+                }
                 return;
             }
             if (_state == ConnState.Quiet)
@@ -1108,6 +1180,22 @@ namespace CampusNetHelper
 
         private void TryAutoReconnect()
         {
+            // ⚠️ 限速风控当天已经停手 → 不再自动试（2026-10-02，对应 C2）。
+            //    只提示一次，否则每轮 tick 都会喊一遍。
+            //    用户手动点「立即连接」不受此限 —— 人在操作就尊重人。
+            if (_rateLimitStopDate == DateTime.Now.ToString("yyyy-MM-dd"))
+            {
+                if (!_rateLimitStopReported)
+                {
+                    _rateLimitStopReported = true;
+                    ApplyState(ConnState.Error, "疑似被限速，已暂停自动重连",
+                        "连续拨号失败触发了学校/运营商的限速风控。程序今天不再自动重试了"
+                        + "（越试等待时间越长）。过 10 分钟点「立即连接」手动试一次即可。");
+                    AddHistory("自动重连暂停 · 疑似被限速");
+                }
+                return;
+            }
+
             if ((DateTime.Now - _lastAutoTry).TotalSeconds < NextRetryDelay()) return;
             _lastAutoTry = DateTime.Now;
             _autoReconnectAttempts++;
@@ -1505,11 +1593,112 @@ namespace CampusNetHelper
             int e = ParseHm(NightQuietEnd());
             if (s < 0 || e < 0 || s == e) return false;   // 配置不合法就当没开
 
-            DateTime now = DateTime.Now;
-            int cur = now.Hour * 60 + now.Minute;
+            return TimeInRange(DateTime.Now, s, e);
+        }
 
-            if (s < e) return cur >= s && cur < e;        // 同一天内
-            return cur >= s || cur < e;                   // 跨零点
+        /// <summary>
+        /// 判断某个时刻是否落在 [start, end) 这个分钟区间里（**支持跨零点**）。
+        ///
+        /// 夜间免打扰（InNightQuiet）和定时断网（InTimeOff）共用这一个 ——
+        /// 两处各写一份迟早会分叉（这个项目已经在别的地方栽过好几次了）。
+        /// </summary>
+        private static bool TimeInRange(DateTime now, int startHm, int endHm)
+        {
+            int cur = now.Hour * 60 + now.Minute;
+            if (startHm < endHm) return cur >= startHm && cur < endHm;   // 同一天内
+            return cur >= startHm || cur < endHm;                        // 跨零点
+        }
+
+        // ---------- 定时断网（C3）----------
+        // 与夜间免打扰的区别：免打扰是"不动手也不吵"（网络还连着就保持连着），
+        // 这个是"**真的断掉**"—— 熄灯后自动断、早上自动连回来。
+
+        internal bool TimeOffEnabled()
+        {
+            return ConfigStore.GetBool(_settings, "TimeOff", false);
+        }
+
+        internal string TimeOffStart()
+        {
+            return ConfigStore.GetString(_settings, "TimeOffStart", "01:00");
+        }
+
+        internal string TimeOffEnd()
+        {
+            return ConfigStore.GetString(_settings, "TimeOffEnd", "07:30");
+        }
+
+        internal bool InTimeOff()
+        {
+            if (!TimeOffEnabled()) return false;
+
+            int s = ParseHm(TimeOffStart());
+            int e = ParseHm(TimeOffEnd());
+            if (s < 0 || e < 0 || s == e) return false;   // 配置不合法就当没开
+
+            return TimeInRange(DateTime.Now, s, e);
+        }
+
+        /// <summary>当前是否处于"定时断网"时段内（跨 tick 记忆，避免每秒重复动作）。</summary>
+        private bool _timeOffActive = false;
+
+        /// <summary>
+        /// 定时断网（C3）：时段内断开并保持断开，时段结束自动连回来。
+        ///
+        /// 与夜间免打扰的分工 ——
+        ///   · 免打扰 = **不动手也不吵**（网络已经连着的就让它继续连着）
+        ///   · 定时断网 = **真的断掉**
+        /// 两个时段叠加时取"更严格者"：只要有一个处于抑制期就不动手。
+        ///
+        /// 手动操作永远优先：用户在时段内自己点了「立即连接」就让他连
+        ///（不跟用户对着干 —— 直到下一个时段开始才重新接管）。
+        /// </summary>
+        private void HandleTimeOff()
+        {
+            bool inOff = InTimeOff();
+
+            if (inOff)
+            {
+                if (!_timeOffActive)
+                {
+                    _timeOffActive = true;
+                    Log.Info("进入定时断网时段（" + TimeOffStart() + " - " + TimeOffEnd() + "）");
+
+                    if (_state == ConnState.Connected || _state == ConnState.Quiet)
+                    {
+                        AddHistory("定时断网 · " + DateTime.Now.ToString("HH:mm"));
+                        // 参数 false = 不是用户点的 → 不解除自动重连武装（时段结束还要连回来）
+                        DoDisconnect(false);
+                    }
+                    else
+                    {
+                        ApplyState(ConnState.Idle, "定时断网中",
+                            "现在是定时断网时段，" + TimeOffEnd()
+                            + " 会自动恢复。想现在上网就点「立即连接」。");
+                    }
+                }
+
+                // 时段内按住自动重连（用户手动点按钮走的是 StartDial，不受这里影响）
+                _autoReconnectArmed = false;
+                return;
+            }
+
+            if (_timeOffActive)
+            {
+                _timeOffActive = false;
+                Log.Info("定时断网时段结束，恢复自动连接");
+                AddHistory("定时断网结束 · 准备恢复");
+
+                // 重新武装，并清掉退避计时，让下一轮 tick 立刻去连
+                _autoReconnectArmed = true;
+                _lastAutoTry = DateTime.MinValue;
+                _autoReconnectAttempts = 0;
+
+                if (_state == ConnState.Idle || _state == ConnState.Quiet)
+                {
+                    ApplyState(ConnState.Idle, "尚未连接", "定时断网时段已结束，正在恢复…");
+                }
+            }
         }
 
         /// <summary>切到"夜间免打扰"。</summary>
@@ -1546,9 +1735,25 @@ namespace CampusNetHelper
         /// <summary>链路状态缓存有效期。WMI 查询不便宜，别每秒都查。</summary>
         private const int LinkCacheSeconds = 3;
 
-        /// <summary>同步查一次（只在"刚断开""开机""用户点连接"这类一次性场景用，几十毫秒）。</summary>
+        /// <summary>
+        /// 同步查一次链路状态（会走 WMI，几十毫秒）。
+        ///
+        /// ⚠️ 必须先看缓存（2026-10-01 审计确认）：
+        ///    本方法的三个调用点里有**两个在 UI 线程上** ——
+        ///    OnTick 里"发现掉线"那一瞬、以及用户点「立即连接」时。
+        ///    WMI 查询在多网卡机器上要几十毫秒，直接查就是一次可感知的卡顿。
+        ///
+        ///    后台的 RefreshLinkState 本来每 3 秒就会刷一次缓存，
+        ///    所以除非缓存过期（或从没查过，比如刚开机），这里都能零开销拿到新鲜值。
+        /// </summary>
         private bool CheckLinkNow()
         {
+            if (_linkCheckedAt != DateTime.MinValue
+                && (DateTime.Now - _linkCheckedAt).TotalSeconds < LinkCacheSeconds)
+            {
+                return _linkOk;
+            }
+
             try
             {
                 string detail;
@@ -1746,6 +1951,19 @@ namespace CampusNetHelper
 
         private void OnQualityUpdated()
         {
+            // 周报统计：把这次采样的延迟记一笔。
+            // 用外网平均延迟（AvgRtt）—— 用户说的"延迟"就是它。
+            // WeeklyStats 内部带锁，从后台线程直接调是安全的。
+            try
+            {
+                QualitySample qs = _quality.GetSample();
+                if (qs != null && qs.HasData && qs.AvgRtt >= 0)
+                {
+                    WeeklyStats.OnLatencySample((int)qs.AvgRtt, _state == MainWindow.ConnState.Connected);
+                }
+            }
+            catch { }
+
             // 采样跑在后台线程，这里必须切回 UI 线程才能动控件
             try
             {
@@ -1973,6 +2191,16 @@ namespace CampusNetHelper
 
         private void ApplyState(ConnState state, string title, string detail)
         {
+            // ⚠️ 先在 _state 被覆盖**之前**把旧值记下来 —— 周报要靠"Connected → 其它"
+            //    这个转换来数掉线次数。
+            ConnState prevState = _state;
+            if (prevState != state)
+            {
+                // 内存里累加，状态变化时才落盘（不是每秒写 —— 见 WeeklyStats 的说明）
+                WeeklyStats.OnStateChanged(prevState, state);
+                WeeklyStats.Flush();
+            }
+
             _state = state;
 
             bool busy = state == ConnState.Connecting || state == ConnState.Disconnecting;
@@ -2196,6 +2424,11 @@ namespace CampusNetHelper
                             _autoReconnectArmed = true;
                             _autoReconnectAttempts = 0;   // 连上了，重试计数归零
                             _autoDialFailStreak = 0;      // 失败连击也归零（下次失败重新从"第一次"算）
+                            // 连上了就把限速风控那套状态全部清空
+                            _rateLimitHits = 0;
+                            _rateLimitUntil = DateTime.MinValue;
+                            _rateLimitStopDate = "";
+                            _rateLimitStopReported = false;
                             ApplyState(ConnState.Connected, "已连接",
                                 "已通过宽带拨号上网（" + entryName + "）");
                             AddHistory("连接成功 · " + entryName);
@@ -2209,6 +2442,23 @@ namespace CampusNetHelper
 
                             if (auto)
                             {
+                                // ⚠️ C2：识别"越试越糟"的失败（限速风控 / 并发超限）（2026-10-02）。
+                                //    这类失败按失败次数加码，继续 30 秒一次只会让解禁越来越远，
+                                //    所以命中就把间隔拉到 15 分钟，连中 3 次当天停手。
+                                if (DialEngine.IsRateLimitFailure(res.RawOutput))
+                                {
+                                    _rateLimitHits++;
+                                    _rateLimitUntil = DateTime.Now.AddMinutes(15);
+                                    Log.Warn("自动重连遇到限速类失败（第 " + _rateLimitHits
+                                        + " 次），15 分钟内不再自动重试");
+
+                                    if (_rateLimitHits >= 3)
+                                    {
+                                        _rateLimitStopDate = DateTime.Now.ToString("yyyy-MM-dd");
+                                        Log.Warn("限速类失败已连续 " + _rateLimitHits + " 次，今天停止自动重连");
+                                    }
+                                }
+
                                 // 自动重连失败 —— **不弹窗**。
                                 //   弹窗的模态消息循环不阻塞 DispatcherTimer，第一个框还挂着，
                                 //   30 秒后退避到期又弹一个，整夜能堆几十个（2026-10-01 审计确认）。
@@ -2531,7 +2781,31 @@ namespace CampusNetHelper
             _history.Insert(0, item);
             while (_history.Count > 30) _history.RemoveAt(_history.Count - 1);
             RefreshHistoryUi();
-            SaveAll();
+
+            // ⚠️ 以前这里调的是 SaveAll()（2026-10-01 审计确认）——
+            //    SaveAll 会重写 accounts.txt + settings.txt + 两份 .bak，**一共 4 个文件**，
+            //    而历史记录跟账号文件**毫无关系**。连接/断开这类事件一多，就一直在白写盘。
+            //
+            //    现在只把**设置**落盘（历史就存在 settings.txt 的 History 键里）。
+            //    账号文件只在账号真正增删改时写 —— 那些入口本来都会落盘。
+            var hb = new System.Text.StringBuilder();
+            foreach (string h in _history)
+            {
+                if (hb.Length > 0) hb.Append('\u0001');
+                hb.Append(h);
+            }
+            _settings["History"] = hb.ToString();
+
+            // 与 SaveAll 同样的"读-合并-写"：以磁盘为底，避免把别处改过的键覆盖回去
+            //（比如设置窗口刚改的主题，见 SaveAll 里的说明）
+            Dictionary<string, string> disk = ConfigStore.LoadSettings();
+            foreach (KeyValuePair<string, string> kv in _settings)
+            {
+                disk[kv.Key] = kv.Value;
+            }
+            string msg;
+            ConfigStore.SaveSettings(disk, out msg);
+            if (!string.IsNullOrEmpty(msg)) Log.Warn(msg);
         }
 
         internal void RefreshHistoryUi()
@@ -2561,6 +2835,18 @@ namespace CampusNetHelper
         // ==================================================================
         // 子窗口
         // ==================================================================
+
+        /// <summary>打开连接周报窗口。</summary>
+        internal void OpenWeeklyReportWindow()
+        {
+            // ⚠️ 先落一次盘再读：ApplyState 里是"状态变化时写"，
+            //    用户可能刚连上就点周报，不先写的话今天的在线时长还停在上一版。
+            WeeklyStats.Flush();
+
+            WeeklyReportWindow w = new WeeklyReportWindow();
+            w.Owner = this;
+            w.ShowDialog();
+        }
 
         internal void OpenHealthWindow()
         {
@@ -2881,10 +3167,23 @@ namespace CampusNetHelper
             System.Drawing.Icon src = LoadAppIcon();
             if (src == null) return;
 
-            _trayIcOk = BuildStateIcon(src, Dr(Theme.Ok));
-            _trayIcBusy = BuildStateIcon(src, Dr(Theme.Warn));
-            _trayIcErr = BuildStateIcon(src, Dr(Theme.Err));
-            _trayIcIdle = BuildStateIcon(src, System.Drawing.Color.FromArgb(255, 140, 140, 140));
+            try
+            {
+                _trayIcOk = BuildStateIcon(src, Dr(Theme.Ok));
+                _trayIcBusy = BuildStateIcon(src, Dr(Theme.Warn));
+                _trayIcErr = BuildStateIcon(src, Dr(Theme.Err));
+                _trayIcIdle = BuildStateIcon(src, System.Drawing.Color.FromArgb(255, 140, 140, 140));
+            }
+            finally
+            {
+                // ⚠️ 用完要 Dispose（LoadAppIcon 正常路径返回的是 Clone，归我们释放），
+                //    不释放就是每次启动泄漏一个 GDI 图标句柄（2026-10-01 审计确认）。
+                //
+                // ⚠️ 但**不能无脑 Dispose**：LoadAppIcon 取不到图标时返回的是
+                //    SystemIcons.Shield —— 那是**全进程共享**的系统图标实例，
+                //    释放它会让别处（窗口图标、托盘）一起失效。
+                if (!object.ReferenceEquals(src, System.Drawing.SystemIcons.Shield)) src.Dispose();
+            }
         }
 
         /// <summary>
@@ -2925,9 +3224,28 @@ namespace CampusNetHelper
 
         private void InitTray()
         {            trayMenu = new System.Windows.Forms.ContextMenuStrip();
+
+            // ---- 实时信息三项（C4）：全是禁用态，只用来显示 ----
+            trayMiAccount = new System.Windows.Forms.ToolStripMenuItem("账号：—");
+            trayMiAccount.Enabled = false;
+            trayMenu.Items.Add(trayMiAccount);
+
             trayMiStatus = new System.Windows.Forms.ToolStripMenuItem("状态：未连接");
             trayMiStatus.Enabled = false;
             trayMenu.Items.Add(trayMiStatus);
+
+            trayMiSpeed = new System.Windows.Forms.ToolStripMenuItem("速率：—");
+            trayMiSpeed.Enabled = false;
+            trayMenu.Items.Add(trayMiSpeed);
+
+            // ⚠️ 只在**弹出瞬间**刷新那三项（2026-10-02，对应 C4）。
+            //    这里绝不能发任何网络调用 —— 菜单弹出卡顿是最难受的一种卡顿。
+            //    数据全部读现成缓存：账号名 / 状态条文字 / 质量监测的延迟 / 速率标签。
+            trayMenu.Opening += delegate(object s, System.ComponentModel.CancelEventArgs e)
+            {
+                RefreshTrayInfo();
+            };
+
             trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             trayMenu.Items.Add("显示主窗口", null, delegate(object s, EventArgs e) { ShowMainWindow(); });
             trayMiDial = new System.Windows.Forms.ToolStripMenuItem("连接上网", null,
@@ -2963,8 +3281,61 @@ namespace CampusNetHelper
             };
         }
 
+        /// <summary>
+        /// 托盘菜单弹出瞬间刷新顶部那三项实时信息（C4：账号 / 状态+延迟 / 速率）。
+        ///
+        /// ⚠️ 全部读**现成缓存**，这里禁止任何网络调用、也不做耗时计算 ——
+        ///    托盘菜单弹出来卡一下是最难受的一种卡顿（用户只是想"扫一眼"）。
+        ///    数据来源：_current.Name、_lastStateText、质量监测的采样快照、速率标签。
+        /// </summary>
+        private void RefreshTrayInfo()
+        {
+            try
+            {
+                if (trayMiAccount != null)
+                {
+                    trayMiAccount.Text = "账号：" + ((_current != null && _current.Name.Length > 0)
+                        ? _current.Name : "（还没添加）");
+                }
+
+                if (trayMiStatus != null)
+                {
+                    string s = _lastStateText.Length > 0 ? _lastStateText : "未知";
+
+                    // 顺带把延迟/丢包拼上（读缓存，不发请求）
+                    try
+                    {
+                        QualitySample qs = _quality.GetSample();
+                        if (qs != null && qs.HasData)
+                        {
+                            if (qs.AvgRtt >= 0) s += " · 平均 " + qs.AvgRtt + " ms";
+                            if (qs.LossPct > 0) s += " · 丢包 " + qs.LossPct + "%";
+                        }
+                    }
+                    catch { }
+
+                    trayMiStatus.Text = "状态：" + s;
+                }
+
+                if (trayMiSpeed != null)
+                {
+                    string d = DebugSpeedDown();
+                    string u = DebugSpeedUp();
+                    trayMiSpeed.Text = (d.Length == 0 && u.Length == 0)
+                        ? "速率：—"
+                        : "速率：" + d + "　" + u;
+                }
+            }
+            catch (Exception ex)
+            {
+                // 刷新失败也绝不能让菜单打不开
+                Log.Warn("刷新托盘信息失败: " + ex.Message);
+            }
+        }
+
         private void UpdateTrayState(string text)
         {
+            _lastStateText = text ?? "";
             if (trayMiStatus != null) trayMiStatus.Text = "状态：" + (text ?? "");
             if (trayIcon != null)
             {
@@ -3084,6 +3455,7 @@ namespace CampusNetHelper
             _quality.Shutdown();
             _keepAlive.Shutdown();
 
+            WeeklyStats.Flush();   // 周报统计的最后一次落盘
             SaveAll();
             if (trayIcon != null)
             {
@@ -3115,6 +3487,7 @@ namespace CampusNetHelper
                     Log.Info("系统正在关机/注销，立即保存并退出（不缩到托盘）");
                     _quality.Shutdown();
                     _keepAlive.Shutdown();
+                    WeeklyStats.Flush();   // 周报统计的最后一次落盘
                     SaveAll();
                     if (trayIcon != null)
                     {
@@ -3141,6 +3514,7 @@ namespace CampusNetHelper
                 _closing = true;
                 _quality.Shutdown();
                 _keepAlive.Shutdown();
+                WeeklyStats.Flush();   // 周报统计的最后一次落盘
                 SaveAll();
                 if (trayIcon != null)
                 {

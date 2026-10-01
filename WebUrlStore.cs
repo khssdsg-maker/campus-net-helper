@@ -114,45 +114,71 @@ namespace CampusNetHelper
         // 读写
         // ==================================================================
 
-        /// <summary>读取全部网址。文件不存在或坏了都返回空列表（不抛异常）。</summary>
+        /// <summary>
+        /// 读取全部网址。
+        ///
+        /// ⚠️ 必须把「文件不存在」和「文件存在但读不了」分开对待（2026-10-01 审计确认）：
+        ///   前者是正常的（还没存过），返回空没问题；
+        ///   后者是异常（被杀软或备份进程短暂锁住、磁盘出错等）—— 如果也按空返回，
+        ///   紧接着的一次 Save 就只会写入新的一条，**原有条目无声丢光**
+        ///   （最多 20 条，用户攒这些要挺久）。而这个文件以前**没有 .bak 兜底**
+        ///   （accounts.txt 有），丢了就真没了。
+        ///
+        /// 现在的策略：主文件读不了 → 退到 .bak；两个都读不了才按空处理，
+        /// 同时让 Save 侧拒绝覆盖（见 Save 开头那道闸）。
+        /// </summary>
         public static List<Entry> LoadAll()
         {
-            var list = new List<Entry>();
             try
             {
-                if (!File.Exists(UrlsPath)) return list;
-
-                Entry cur = null;
-                foreach (string line in File.ReadAllLines(UrlsPath, Encoding.UTF8))
-                {
-                    if (string.IsNullOrEmpty(line) || line.StartsWith("#", StringComparison.Ordinal)) continue;
-
-                    if (line.StartsWith("U=", StringComparison.Ordinal))
-                    {
-                        cur = new Entry();
-                        cur.Url = Unescape(line.Substring(2));
-                        list.Add(cur);
-                        continue;
-                    }
-                    if (cur == null) continue;
-
-                    if (line.StartsWith("N=", StringComparison.Ordinal)) cur.Name = Unescape(line.Substring(2));
-                    else if (line.StartsWith("T=", StringComparison.Ordinal)) cur.LastUsed = Unescape(line.Substring(2));
-                }
-
-                // 滤掉没网址的残行（文件被截断时可能出现）
-                var ok = new List<Entry>();
-                foreach (Entry e in list)
-                {
-                    if (e.Url != null && e.Url.Trim().Length > 0) ok.Add(e);
-                }
-                return ok;
+                return ParseFile(UrlsPath);
             }
             catch (Exception ex)
             {
-                Log.Warn("读取认证网址清单失败（按空处理）: " + ex.Message);
-                return new List<Entry>();
+                Log.Warn("读取认证网址清单失败，改用备份: " + ex.Message);
+                try
+                {
+                    return ParseFile(UrlsPath + SafeFile.BackupSuffix);
+                }
+                catch (Exception ex2)
+                {
+                    Log.Warn("备份也读不了（本次按空处理，且不会覆盖保存）: " + ex2.Message);
+                    return new List<Entry>();
+                }
             }
+        }
+
+        /// <summary>真正解析文件内容。异常一律向上抛，由 LoadAll 决定怎么兜。</summary>
+        private static List<Entry> ParseFile(string path)
+        {
+            var list = new List<Entry>();
+            if (!File.Exists(path)) return list;   // 不存在是正常的，不是错误
+
+            Entry cur = null;
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+            {
+                if (string.IsNullOrEmpty(line) || line.StartsWith("#", StringComparison.Ordinal)) continue;
+
+                if (line.StartsWith("U=", StringComparison.Ordinal))
+                {
+                    cur = new Entry();
+                    cur.Url = Unescape(line.Substring(2));
+                    list.Add(cur);
+                    continue;
+                }
+                if (cur == null) continue;
+
+                if (line.StartsWith("N=", StringComparison.Ordinal)) cur.Name = Unescape(line.Substring(2));
+                else if (line.StartsWith("T=", StringComparison.Ordinal)) cur.LastUsed = Unescape(line.Substring(2));
+            }
+
+            // 滤掉没网址的残行（文件被截断时可能出现）
+            var ok = new List<Entry>();
+            foreach (Entry e in list)
+            {
+                if (e.Url != null && e.Url.Trim().Length > 0) ok.Add(e);
+            }
+            return ok;
         }
 
         /// <summary>
@@ -175,6 +201,17 @@ namespace CampusNetHelper
             try
             {
                 List<Entry> all = LoadAll();
+
+                // ⚠️ 第二道防线（2026-10-01 审计确认）：
+                //    读到 0 条、但磁盘上明明有内容 —— 这不是"用户把网址删光了"，
+                //    而是**读失败**。这时候继续写就会把原有条目全冲掉，所以直接拒绝。
+                if (all.Count == 0 && SafeFile.HasRealContent(UrlsPath))
+                {
+                    message = "现有网址清单读取失败，为防止覆盖原有内容，本次没有保存。请稍后重试。";
+                    Log.Warn("保存网址被拒：清单读到 0 条但文件有内容，判定为读取失败");
+                    return false;
+                }
+
                 string key = KeyOf(clean);
                 if (key.Length == 0)
                 {
@@ -351,6 +388,9 @@ namespace CampusNetHelper
                     sb.AppendLine("N=" + Escape(e.Name));
                     sb.AppendLine("T=" + Escape(e.LastUsed));
                 }
+                // 写之前留一份上一版 —— 这个文件以前完全没有备份，
+                // 一旦被写坏（或像上面那样被误覆盖）就没有任何挽回余地。
+                SafeFile.KeepBackup(UrlsPath);
                 SafeFile.WriteAtomic(UrlsPath, sb.ToString(), Encoding.UTF8);
                 return true;
             }

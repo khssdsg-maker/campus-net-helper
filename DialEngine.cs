@@ -149,7 +149,9 @@ namespace CampusNetHelper
                     args += " " + EscapeArg(user) + " " + EscapeArg(password ?? "");
                 }
 
-                Process proc = Process.Start(new ProcessStartInfo
+                // ⚠️ 必须 using：Process 持有进程句柄，不 Dispose 就是每次拨号泄漏一个，
+                //    长期挂机会慢慢累积（2026-10-01 审计确认）。
+                using (Process proc = Process.Start(new ProcessStartInfo
                 {
                     FileName = "rasdial.exe",
                     Arguments = args,
@@ -157,35 +159,39 @@ namespace CampusNetHelper
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
-                });
-
-                if (proc == null)
+                }))
                 {
-                    r.Message = "无法启动拨号程序";
-                    return r;
-                }
+                    if (proc == null)
+                    {
+                        r.Message = "无法启动拨号程序";
+                        return r;
+                    }
 
-                string outp = proc.StandardOutput.ReadToEnd();
-                string errp = proc.StandardError.ReadToEnd();
-                if (!proc.WaitForExit(60000))
-                {
-                    try { proc.Kill(); } catch { }
-                    r.Message = "拨号超时（60 秒未返回）";
-                    r.RawOutput = outp + " " + errp;
-                    return r;
-                }
+                    string outp = proc.StandardOutput.ReadToEnd();
+                    string errp = proc.StandardError.ReadToEnd();
+                    if (!proc.WaitForExit(60000))
+                    {
+                        try { proc.Kill(); } catch { }
+                        // Kill 之后要再等一次退出 —— 不等的话句柄还没真正释放，
+                        // 可能留下一个"已 Kill 但仍在系统里"的残留进程。
+                        try { proc.WaitForExit(3000); } catch { }
+                        r.Message = "拨号超时（60 秒未返回）";
+                        r.RawOutput = outp + " " + errp;
+                        return r;
+                    }
 
-                r.ExitCode = proc.ExitCode;
-                r.RawOutput = (outp + " " + errp).Trim();
-                r.Success = proc.ExitCode == 0;
+                    r.ExitCode = proc.ExitCode;
+                    r.RawOutput = (outp + " " + errp).Trim();
+                    r.Success = proc.ExitCode == 0;
 
-                if (r.Success)
-                {
-                    r.Message = "拨号成功，已连接";
-                }
-                else
-                {
-                    r.Message = DescribeError(proc.ExitCode, r.RawOutput, r.Hints);
+                    if (r.Success)
+                    {
+                        r.Message = "拨号成功，已连接";
+                    }
+                    else
+                    {
+                        r.Message = DescribeError(proc.ExitCode, r.RawOutput, r.Hints);
+                    }
                 }
             }
             catch (Exception ex)
@@ -206,7 +212,8 @@ namespace CampusNetHelper
 
             try
             {
-                Process proc = Process.Start(new ProcessStartInfo
+                // ⚠️ 同上：using 保证句柄释放（2026-10-01 审计确认）。
+                using (Process proc = Process.Start(new ProcessStartInfo
                 {
                     FileName = "rasdial.exe",
                     Arguments = EscapeArg(entryName) + " /disconnect",
@@ -214,33 +221,36 @@ namespace CampusNetHelper
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
-                });
-                if (proc == null) { message = "无法启动断开程序"; return false; }
-
-                proc.StandardOutput.ReadToEnd();
-                proc.StandardError.ReadToEnd();
-                if (!proc.WaitForExit(20000))
+                }))
                 {
-                    try { proc.Kill(); } catch { }
-                    message = "断开超时";
+                    if (proc == null) { message = "无法启动断开程序"; return false; }
+
+                    proc.StandardOutput.ReadToEnd();
+                    proc.StandardError.ReadToEnd();
+                    if (!proc.WaitForExit(20000))
+                    {
+                        try { proc.Kill(); } catch { }
+                        try { proc.WaitForExit(3000); } catch { }
+                        message = "断开超时";
+                        return false;
+                    }
+
+                    if (proc.ExitCode == 0)
+                    {
+                        message = "已断开连接";
+                        return true;
+                    }
+
+                    // 704 = 该连接不存在/未建立，对用户而言等同"已经断开了"
+                    if (proc.ExitCode == 704)
+                    {
+                        message = "当前未连接";
+                        return true;
+                    }
+
+                    message = "断开失败（错误码 " + proc.ExitCode + "）";
                     return false;
                 }
-
-                if (proc.ExitCode == 0)
-                {
-                    message = "已断开连接";
-                    return true;
-                }
-
-                // 704 = 该连接不存在/未建立，对用户而言等同"已经断开了"
-                if (proc.ExitCode == 704)
-                {
-                    message = "当前未连接";
-                    return true;
-                }
-
-                message = "断开失败（错误码 " + proc.ExitCode + "）";
-                return false;
             }
             catch (Exception ex)
             {
@@ -267,7 +277,7 @@ namespace CampusNetHelper
         {
             try
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                foreach (NetworkInterface ni in NicCache.GetAll())
                 {
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
                     if (ni.NetworkInterfaceType == NetworkInterfaceType.Ppp) return ni.Name;
@@ -288,7 +298,7 @@ namespace CampusNetHelper
         {
             try
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                foreach (NetworkInterface ni in NicCache.GetAll())
                 {
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
                     if (ni.NetworkInterfaceType != NetworkInterfaceType.Ppp) continue;
@@ -601,6 +611,29 @@ namespace CampusNetHelper
             }
 
             return desc;
+        }
+
+        /// <summary>
+        /// 这次失败是不是"**越重试越糟**"的那一类（限速风控 / 并发超限）。
+        ///
+        /// ⚠️ 为什么要单独判（2026-10-02 审计确认）：
+        ///   这类 691 的机制是"按失败次数加码"—— 你每试一次，等待时间就更长。
+        ///   而程序的自动重连默认 30 秒一次，等于一直在给风控续期，
+        ///   结果就是"越修越连不上，最后要等十几分钟"。
+        ///   所以自动重连遇到这类失败必须拉长间隔、甚至停手；
+        ///   而用户**手动**点连接不受限制（人在操作就尊重人）。
+        ///
+        /// 判定口径与 DetailOf691 的前两类保持一致（限速 + 并发），
+        /// 那两类才是有"静置可解"性质的；欠费/密码错/被暂停重试也没用，但不会越试越糟。
+        /// </summary>
+        public static bool IsRateLimitFailure(string rawOutput)
+        {
+            string low = (rawOutput ?? "").ToLowerInvariant();
+            if (low.Length == 0) return false;
+
+            return Has(low, "so soon", "频繁")
+                || Has(low, "too many connections", "limit users", "concurrency",
+                        "access number is exceed", "并发", "已在线");
         }
 
         /// <summary>

@@ -73,6 +73,7 @@ namespace CampusNetHelper
 
         // ---------- 顶栏 ----------
         internal Button btnOpenHealth;
+        internal Button btnOpenWeekly;
         internal Button btnOpenSettings;
         private Border btnMaximize;
 
@@ -80,6 +81,11 @@ namespace CampusNetHelper
         internal System.Windows.Forms.NotifyIcon trayIcon;
         internal System.Windows.Forms.ContextMenuStrip trayMenu;
         internal System.Windows.Forms.ToolStripMenuItem trayMiStatus;
+        /// <summary>托盘菜单顶部的"实时信息"三项（C4）：账号名 / 速率。状态那项复用 trayMiStatus。</summary>
+        internal System.Windows.Forms.ToolStripMenuItem trayMiAccount;
+        internal System.Windows.Forms.ToolStripMenuItem trayMiSpeed;
+        /// <summary>状态条最近一次的文字 —— 托盘菜单要用，但它跑在另开的事件里。</summary>
+        private string _lastStateText = "";
         internal System.Windows.Forms.ToolStripMenuItem trayMiDial;
         internal System.Windows.Forms.ToolStripMenuItem trayMiDisconnect;
 
@@ -110,7 +116,7 @@ namespace CampusNetHelper
 
         internal const string FontUi = "Microsoft YaHei UI, Microsoft YaHei, Segoe UI";
         internal const string FontMono = "Consolas, Microsoft YaHei UI";
-        internal const string VersionText = "2.1.1";
+        internal const string VersionText = "2.2.0";
 
         // ==================================================================
         // 本校专属默认值
@@ -722,6 +728,10 @@ namespace CampusNetHelper
             };
             btnOpenHealth = MakeGhostButton("网络体检", () => OpenHealthWindow());
             right.Children.Add(btnOpenHealth);
+            // 周报放在体检旁边 —— 两者是同一类"看看网怎么样"的入口
+            btnOpenWeekly = MakeGhostButton("周报", () => OpenWeeklyReportWindow());
+            btnOpenWeekly.Margin = new Thickness(8, 0, 0, 0);
+            right.Children.Add(btnOpenWeekly);
             btnOpenSettings = MakeGhostButton("设置", () => OpenSettingsWindow());
             btnOpenSettings.Margin = new Thickness(8, 0, 0, 0);
             right.Children.Add(btnOpenSettings);

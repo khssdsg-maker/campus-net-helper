@@ -28,6 +28,48 @@ namespace CampusNetHelper
     /// 缓存：主页每秒都会问一次，不能每秒真发一次请求。
     ///   结果缓存 <see cref="CacheMs"/> 毫秒（需要立刻确认真实结果时用 Force 参数穿透缓存）。
     /// </summary>
+    /// <summary>
+    /// 网卡列表的短时缓存。
+    ///
+    /// ⚠️ 为什么需要它（2026-10-01 审计确认）：
+    ///    UI 线程每秒会要 3 次网卡列表（拨号状态检查、参数卡刷新、速率采样各一次），
+    ///    而 NetworkInterface.GetAllNetworkInterfaces() 在**多虚拟网卡**的机器上
+    ///    单次能跑几十到上百毫秒（要枚举 WMI/注册表里的一大堆适配器），
+    ///    叠加起来就是肉眼可见的周期性掉帧。
+    ///
+    ///    1.5 秒的陈旧度对"显示网卡名/速率"这类用途完全没有影响
+    ///   （拔插网线也要 1.5 秒内才反映出来，实际感知不到）。
+    ///
+    /// ⚠️ 测速引擎和 QualityMonitor 的采样路径**故意不用它** ——
+    ///    那两处对准确性要求更高、频率也低，宁可每次拿最新的。
+    /// </summary>
+    internal static class NicCache
+    {
+        private static NetworkInterface[] _list;
+        private static DateTime _at = DateTime.MinValue;
+        private static readonly object _lock = new object();
+
+        public static NetworkInterface[] GetAll()
+        {
+            lock (_lock)
+            {
+                if (_list == null || (DateTime.Now - _at).TotalMilliseconds > 1500)
+                {
+                    try
+                    {
+                        _list = NetworkInterface.GetAllNetworkInterfaces();
+                        _at = DateTime.Now;
+                    }
+                    catch
+                    {
+                        // 拿不到就继续用旧值 —— 比返回 null 让调用方崩要好
+                    }
+                }
+                return _list ?? new NetworkInterface[0];
+            }
+        }
+    }
+
     internal static class NetProbe
     {
         /// <summary>探测目标。公共连通性检测接口，不涉及任何学校内网地址。</summary>
@@ -204,7 +246,7 @@ namespace CampusNetHelper
 
             try
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                foreach (NetworkInterface ni in NicCache.GetAll())
                 {
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
 
@@ -258,7 +300,7 @@ namespace CampusNetHelper
         {
             try
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                foreach (NetworkInterface ni in NicCache.GetAll())
                 {
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
                     if (ni.NetworkInterfaceType != NetworkInterfaceType.Ppp) continue;

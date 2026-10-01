@@ -53,6 +53,8 @@ namespace CampusNetHelper
                 TestPortalAutoReconnect();
                 TestFirstRunTip();
                 TestAppIcon();
+                TestAccountDeleteNoResurrect();
+                TestSettingRoundTrip();
 
                 W("================ 界面自测 结束 ================");
             }
@@ -1097,6 +1099,141 @@ namespace CampusNetHelper
         ///    硬测会得到一个自己都不信的绿灯（这是本文件里重复过好几次的教训）。
         ///    规则对了，剩下的赋值没有歧义；真实观感靠人工看一眼。
         /// </summary>
+        /// <summary>
+        /// 删光账号后重启不"复活"（对应 v2.1.1 修复 2.1 的回归防护）。
+        ///
+        /// 做法：备份真实账号文件 → 造一个测试账号 → 用生产路径 DeleteAccount 删掉 →
+        ///       重新 LoadAccounts（模拟重启）→ 断言读到 0 条且没有 accounts.txt.bad →
+        ///       恢复真实文件。
+        ///
+        /// ⚠️ 它会真的动 accounts.txt（和既有的"认证网址清单"用例一样），
+        ///    靠 finally 恢复；自测默认不往正式日志写。
+        /// </summary>
+        private static void TestAccountDeleteNoResurrect()
+        {
+            W("");
+            W("---- 用例：删光账号后重启不复活 ----");
+
+            string path = ConfigStore.AccountsPath;
+            string bakPath = path + SafeFile.BackupSuffix;
+            string badPath = path + ".bad";
+
+            bool had = System.IO.File.Exists(path);
+            bool hadBak = System.IO.File.Exists(bakPath);
+            string orig = null, origBak = null;
+
+            try
+            {
+                if (had) orig = System.IO.File.ReadAllText(path, Encoding.UTF8);
+                if (hadBak) origBak = System.IO.File.ReadAllText(bakPath, Encoding.UTF8);
+
+                // ① 造一个账号并落盘（此刻 .bak 里会留下含该账号的副本 —— 这正是老 bug 的触发条件）
+                var list = new List<ConfigStore.Account>();
+                var a = new ConfigStore.Account();
+                a.Name = "__selftest_tmp__";
+                a.User = "t";
+                a.Password = "t";
+                list.Add(a);
+                string msg;
+                ConfigStore.SaveAccounts(list, out msg);
+                W("写入一个测试账号 → 现在读到 " + ConfigStore.LoadAccounts().Count + " 条");
+                W("此时 .bak 里有内容 = " + SafeFile.HasRealContent(bakPath)
+                    + "（有才说明触发了'删除→备份→被当成损坏恢复'这条路）");
+
+                // ② 用生产路径删除
+                bool delOk = ConfigStore.DeleteAccount(list, a.Name, out msg);
+                W("DeleteAccount 返回 " + delOk + " :: " + msg);
+                W("删除后 .bak 是否已清掉 = " + (!System.IO.File.Exists(bakPath)) + "（期望 True）");
+
+                // ③ 模拟"重启"：重新读一次
+                int after = ConfigStore.LoadAccounts().Count;
+                W("重新加载（模拟重启）读到 " + after + " 条（期望 0）");
+                W("有没有生成 accounts.txt.bad = " + System.IO.File.Exists(badPath) + "（期望 False）");
+
+                bool ok = delOk && after == 0 && !System.IO.File.Exists(badPath);
+                W("结果：" + (ok
+                    ? "通过 —— 删光后重启不复活，也没留下 .bad 文件。"
+                    : "不通过 —— 账号又回来了，或留下了 .bad（说明删除路径没走 DeleteAccount）。"));
+            }
+            catch (Exception ex)
+            {
+                W("结果：不通过 —— 用例自身出错: " + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    if (had) System.IO.File.WriteAllText(path, orig, Encoding.UTF8);
+                    else if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
+
+                    if (hadBak) System.IO.File.WriteAllText(bakPath, origBak, Encoding.UTF8);
+                    else if (System.IO.File.Exists(bakPath)) System.IO.File.Delete(bakPath);
+
+                    if (System.IO.File.Exists(badPath)) System.IO.File.Delete(badPath);
+                    W("已恢复用户的账号文件");
+                }
+                catch (Exception ex2)
+                {
+                    W("⚠️ 恢复账号文件失败: " + ex2.Message + "（请手工检查 " + path + "）");
+                }
+            }
+        }
+
+        /// <summary>
+        /// 设置项的存取往返（对应 A4 的"逻辑层"，不是完整验证）。
+        ///
+        /// ⚠️ 如实说明它的边界：这条只验**存取链路**（写进去、读得出来、再读还在）。
+        ///    A4 真正的问题是"设置窗口漏挂了 Checked/Unchecked 事件"——
+        ///    那件事发生在 UI 事件上，离屏自测里没有真实窗口、也触发不了用户勾选，
+        ///    断言不出可信的结果（和"静默场景不弹窗"是同一种限制）。
+        ///    **UI 那一半必须人工验**：勾选后直接关窗重开，看状态是否保持。
+        /// </summary>
+        private static void TestSettingRoundTrip()
+        {
+            W("");
+            W("---- 用例：设置项存取往返（逻辑层）----");
+
+            const string key = "Silent";
+            Dictionary<string, string> disk = ConfigStore.LoadSettings();
+            bool had = disk.ContainsKey(key);
+            string orig = ConfigStore.GetString(disk, key, "");
+
+            try
+            {
+                ConfigStore.SetBool(disk, key, true);
+                string msg;
+                ConfigStore.SaveSettings(disk, out msg);
+
+                bool readBack = ConfigStore.GetBool(ConfigStore.LoadSettings(), key, false);
+                W("写入 Silent=true 后重新读取 → " + readBack + "（期望 True）");
+
+                // 再写一次假的，确认能被覆盖
+                var d2 = ConfigStore.LoadSettings();
+                ConfigStore.SetBool(d2, key, false);
+                ConfigStore.SaveSettings(d2, out msg);
+                bool readBack2 = ConfigStore.GetBool(ConfigStore.LoadSettings(), key, true);
+                W("改回 false 后再读 → " + readBack2 + "（期望 False）");
+
+                bool ok = readBack && !readBack2;
+                W("结果：" + (ok
+                    ? "通过 —— 设置项能正确写入并读回。"
+                    : "不通过 —— 存取链路有问题。"));
+                W("⚠️ 提醒：这条**验不到** UI 有没有挂事件；那一半请人工勾选后关窗重开来验。");
+            }
+            finally
+            {
+                try
+                {
+                    var d3 = ConfigStore.LoadSettings();
+                    if (had) d3[key] = orig;
+                    else d3.Remove(key);
+                    string m2;
+                    ConfigStore.SaveSettings(d3, out m2);
+                }
+                catch { }
+            }
+        }
+
         private static void TestFirstRunTip()
         {
             W("");

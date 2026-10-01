@@ -62,7 +62,13 @@ namespace CampusNetHelper
                 if (!File.Exists(path)) return;
                 File.Copy(path, path + BackupSuffix, true);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // ⚠️ 以前这里是空 catch（2026-10-01 审计确认）：磁盘满 / 文件只读 / 被占用时
+                //    备份会**静默缺席** —— 而那恰恰是最需要有一份备份的时刻。
+                //    至少要留一条痕迹，否则真出事时根本不知道"当时备份没做成"。
+                Log.Warn("留备份失败（" + path + "）: " + ex.Message);
+            }
         }
 
         /// <summary>文件里到底有没有"真内容"（空文件、只剩 BOM 的都不算）。</summary>

@@ -519,15 +519,38 @@ namespace CampusNetHelper
                 using (Process proc = Process.Start(psi))
                 {
                     if (proc == null) { output = "(进程启动失败)"; return -1; }
-                    string so = proc.StandardOutput.ReadToEnd();
-                    string se = proc.StandardError.ReadToEnd();
+
+                    // ⚠️ 改成异步读（2026-10-01 顺手加固）：
+                    //    原来是顺序 ReadToEnd(StdOut) → ReadToEnd(StdErr)，
+                    //    子进程输出超过管道缓冲区（约 4KB）时可能互相死锁 ——
+                    //    它在写 stderr 时写满阻塞，而我们在等 stdout 的 EOF，两边一起等。
+                    //    schtasks 输出很小、现实中碰不到，但这是个标准坑，顺手堵上。
+                    StringBuilder so = new StringBuilder();
+                    StringBuilder se = new StringBuilder();
+                    proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+                    {
+                        if (e.Data != null) so.AppendLine(e.Data);
+                    };
+                    proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                    {
+                        if (e.Data != null) se.AppendLine(e.Data);
+                    };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+
                     if (!proc.WaitForExit(20000))
                     {
                         try { proc.Kill(); } catch { }
+                        try { proc.WaitForExit(3000); } catch { }
                         output = "(超时 20s 已终止)";
                         return -2;
                     }
-                    output = ((so ?? "") + (se ?? "")).Trim();
+
+                    // ⚠️ WaitForExit(int) **不保证**异步读的回调已经跑完，
+                    //    必须再调一次无参的 WaitForExit() 才算收齐输出。
+                    try { proc.WaitForExit(); } catch { }
+
+                    output = (so.ToString() + se.ToString()).Trim();
                     return proc.ExitCode;
                 }
             }
