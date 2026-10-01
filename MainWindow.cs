@@ -83,9 +83,22 @@ namespace CampusNetHelper
         internal System.Windows.Forms.ToolStripMenuItem trayMiDial;
         internal System.Windows.Forms.ToolStripMenuItem trayMiDisconnect;
 
+        // 托盘图标的四个状态版本（图形都是同一个 logo，只改色调）。
+        // ⚠️ **预先生成、只切引用**，不要在每次状态变化时现算：
+        //    生成要走 Bitmap.GetHicon()，那是原生句柄，每次都得 DestroyIcon，
+        //    写漏一处就一直泄漏（而这个方法会被高频调用）。
+        private System.Drawing.Icon _trayIcOk;
+        private System.Drawing.Icon _trayIcBusy;
+        private System.Drawing.Icon _trayIcErr;
+        private System.Drawing.Icon _trayIcIdle;
+        /// <summary>当前托盘上挂的是哪一个，避免重复赋值（NotifyIcon 每次赋值都会重绘）。</summary>
+        private ConnState _trayIcShown = ConnState.Idle;
+
         // ---------- 主题相关（需要随主题重绘的元素） ----------
         private Grid _glowLayer;
         private Border _glassRoot;
+        /// <summary>首次使用引导条。没有账号时显示，配过账号后自己消失。见 UpdateFirstRunTip。</summary>
+        private Border _firstRunTip;
         private readonly List<Border> _glassCards = new List<Border>();
         private readonly List<TextBlock> _primaryTexts = new List<TextBlock>();
         private readonly List<TextBlock> _mutedTexts = new List<TextBlock>();
@@ -487,11 +500,14 @@ namespace CampusNetHelper
             };
 
             var content = new Grid();
+            content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 0 顶栏
+            content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 1 状态条
+            // 2 = 首次使用引导条。
+            //    它隐藏时是 Collapsed，Auto 行会缩成 0 高，不会在界面上留一条空档。
             content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            content.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 3 参数卡片
+            content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 4 质量卡
+            content.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // 5 下半部分
 
             _titleBarArea = new Border { Padding = new Thickness(20, 16, 20, 10) };
             _titleBarArea.Child = BuildTopBar();
@@ -503,16 +519,20 @@ namespace CampusNetHelper
             Grid.SetRow(strip, 1);
             content.Children.Add(strip);
 
+            _firstRunTip = BuildFirstRunTip();
+            Grid.SetRow(_firstRunTip, 2);
+            content.Children.Add(_firstRunTip);
+
             var cards = BuildParamCards();
-            Grid.SetRow(cards, 2);
+            Grid.SetRow(cards, 3);
             content.Children.Add(cards);
 
             var quality = BuildQualityCard();
-            Grid.SetRow(quality, 3);
+            Grid.SetRow(quality, 4);
             content.Children.Add(quality);
 
             var body = BuildBody();
-            Grid.SetRow(body, 4);
+            Grid.SetRow(body, 5);
             content.Children.Add(body);
 
             _glassRoot.Child = content;
@@ -571,6 +591,101 @@ namespace CampusNetHelper
         // ==================================================================
         // 顶栏
         // ==================================================================
+
+        /// <summary>
+        /// 首次使用引导条。
+        ///
+        /// ⚠️ 为什么要有它 ——
+        ///    这东西是要发给同学用的，而绝大多数人**不会去翻说明书**。
+        ///    第一次打开只看到「管理账号」「立即连接」几个按钮，不点几下根本不知道从哪开始；
+        ///    再加上没买数字签名、杀毒软件大概率会拦一下 —— 没人告诉他，他可能就直接删了。
+        ///    所以把「先做什么」和「报毒怎么办」直接写在界面上。
+        ///
+        /// ⚠️ 显示条件（见 UpdateFirstRunTip）：
+        ///    ① 还没有任何账号  且  ② 没点过「知道了」
+        ///    第 ① 条是主判据 —— 配过账号的人本来就不需要这提示，
+        ///    所以**不需要额外记「是不是第一次运行」这种状态**，省掉一个可能失真的标记。
+        ///
+        /// ⚠️ 它不在 _glassCards 里，边框色由 ApplyTheme 单独给（要用 Accent 才够醒目）。
+        /// </summary>
+        private Border BuildFirstRunTip()
+        {
+            var b = new Border
+            {
+                Margin = new Thickness(20, 0, 20, 12),
+                Padding = new Thickness(14, 11, 12, 11),
+                CornerRadius = new CornerRadius(10),
+                Background = new SolidColorBrush(Theme.GlassCard),
+                BorderBrush = new SolidColorBrush(Theme.Accent),
+                BorderThickness = new Thickness(1),
+                Visibility = Visibility.Collapsed
+            };
+
+            var g = new Grid();
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var sp = new StackPanel();
+
+            var title = new TextBlock
+            {
+                Text = "第一次用？两步就好",
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Theme.TextPrimary),
+                Margin = new Thickness(0, 0, 0, 5)
+            };
+            _primaryTexts.Add(title);
+            sp.Children.Add(title);
+
+            // ⚠️ 方位词必须准 —— 第一版写的"点右上角「管理账号」"是错的：
+            //    右上角是「网络体检」「设置」，而「管理账号」在**右边那一栏的账号卡片里**。
+            //    新手照着"右上角"去找根本找不到，这条提示就白写了。
+            //    （说明书里用的也是"点右边「管理账号」"，两处保持一致。）
+            var l1 = new TextBlock
+            {
+                Text = "① 点右边「管理账号」→ 从下拉框选你的宽带连接 → 点「导入」→「保存」",
+                FontSize = 12,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                TextWrapping = TextWrapping.Wrap
+            };
+            _mutedTexts.Add(l1);
+            sp.Children.Add(l1);
+
+            var l2 = new TextBlock
+            {
+                Text = "② 回到主界面，点「立即连接」。以后双击打开、点一下就上网。",
+                FontSize = 12,
+                Foreground = new SolidColorBrush(Theme.TextMuted),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 3, 0, 0)
+            };
+            _mutedTexts.Add(l2);
+            sp.Children.Add(l2);
+
+            var l3 = new TextBlock
+            {
+                Text = "⚠️ 杀毒软件报警是正常的 —— 本软件没有购买数字签名，点「仍要运行」或添加信任即可。",
+                FontSize = 12,
+                Foreground = new SolidColorBrush(Theme.Warn),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 7, 0, 0)
+            };
+            sp.Children.Add(l3);
+
+            Grid.SetColumn(sp, 0);
+            g.Children.Add(sp);
+
+            var btn = MakeButton("知道了", Theme.Accent, Theme.OnAccent, Theme.Accent,
+                delegate() { DismissFirstRunTip(); });
+            btn.VerticalAlignment = VerticalAlignment.Top;
+            btn.Margin = new Thickness(14, 0, 0, 0);
+            Grid.SetColumn(btn, 1);
+            g.Children.Add(btn);
+
+            b.Child = g;
+            return b;
+        }
 
         private Grid BuildTopBar()
         {
@@ -1282,6 +1397,15 @@ namespace CampusNetHelper
             foreach (TextBlock t in _mutedTexts)
             {
                 t.Foreground = new SolidColorBrush(Theme.TextMuted);
+            }
+
+            // 首次使用引导条：它**不在** _glassCards 里，边框要单独给 Accent 色。
+            // 放进 _glassCards 的话边框会被统一改成 GlassBorder，就不显眼了 ——
+            // 而这条提示的全部意义就是「第一眼被看见」。
+            if (_firstRunTip != null)
+            {
+                _firstRunTip.Background = new SolidColorBrush(Theme.GlassCard);
+                _firstRunTip.BorderBrush = new SolidColorBrush(Theme.Accent);
             }
 
             // 顶栏按钮

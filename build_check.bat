@@ -45,12 +45,58 @@ if exist "%OUT%" (
   )
 )
 
+REM ---- version resource ----------------------------------------
+REM   Compiles assets\version.rc into version.res, which carries BOTH the
+REM   program icon AND the Win32 version info (the numbers shown in the
+REM   file's Properties -> Details tab).
+REM   csc's /win32res replaces /win32icon entirely, so fall back to
+REM   /win32icon whenever the resource cannot be produced - never lose
+REM   the icon just because the SDK is missing.
+REM
+REM   NOTE: remember to bump the version in BOTH assets\version.rc and
+REM         MainWindow.cs (VersionText), or the About box and the file
+REM         properties will disagree.
+set RESFILE=%~dp0assets\version.res
+set W32ARG=/win32icon:"%~dp0assets\logo.ico"
+
+set RCEXE=
+REM   Prefer the x64 build, fall back to whatever architecture is present.
+REM   (rc.exe only emits a platform-neutral .res, so any architecture works.)
+REM   NOTE: do NOT try to glob the path like "...\bin\*\x64\rc.exe" -
+REM   `dir` only accepts wildcards in the filename part, and the
+REM   parentheses in %ProgramFiles(x86)% break `for /d` parsing.
+REM   Verified working 2026-10-01.
+for /f "delims=" %%F in ('dir /b /s "%ProgramFiles(x86)%\Windows Kits\10\bin\rc.exe" 2^>nul ^| findstr /i /c:"x64"') do set RCEXE=%%F
+if not defined RCEXE (
+  for /f "delims=" %%F in ('dir /b /s "%ProgramFiles(x86)%\Windows Kits\10\bin\rc.exe" 2^>nul') do set RCEXE=%%F
+)
+
+if not defined RCEXE goto no_rc
+if exist "%RESFILE%" del /q "%RESFILE%" >nul 2>&1
+"%RCEXE%" /nologo /fo "%RESFILE%" "%~dp0assets\version.rc" >nul 2>&1
+if not exist "%RESFILE%" goto rc_failed
+set W32ARG=/win32res:"%RESFILE%"
+echo [i] version resource: assets\version.res compiled
+goto rc_done
+
+:rc_failed
+echo [WARN] compiling assets\version.rc failed - exe will have no version info.
+echo        Run rc.exe manually to see the error.
+goto rc_done
+
+:no_rc
+echo [WARN] rc.exe not found (needs Windows SDK) - exe will have no version info.
+echo        The icon is still embedded. Install Windows SDK for version info.
+
+:rc_done
+echo.
+
 REM ---- response file ----
 > build.rsp echo /nologo
 >> build.rsp echo /target:winexe
 >> build.rsp echo /platform:anycpu
 >> build.rsp echo /out:"%OUT%"
->> build.rsp echo /win32icon:"%~dp0assets\logo.ico"
+>> build.rsp echo %W32ARG%
 >> build.rsp echo /lib:"%FW%"
 >> build.rsp echo /lib:"%WPF%"
 >> build.rsp echo /reference:System.dll

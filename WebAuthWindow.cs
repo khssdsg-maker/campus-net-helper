@@ -64,12 +64,30 @@ namespace CampusNetHelper
         private int _loadToken = 0;
 
         /// <summary>
-        /// 「这个文档里没有密码框」这条诊断日志，最后一轮是第几轮加载时写的。
-        /// 
-        /// ⚠️ 存在的理由：补填定时器每 1.2 秒重试一次、一轮最多 12 次，加上
-        ///    DocumentCompleted 也会调一次 —— 这条日志曾经是无条件写的，实测
-        ///    一天下来占了整个日志的 17.9%（108/604 行），把真正的线索全淹了。
+        /// 「可访问文档 N 个」这条日志，最后一轮是第几轮加载时写的。
+        ///
+        /// ⚠️ 存在的理由：补填定时器每 1.2 秒重试一次、一轮最多 12 次 ——
+        ///    这条曾经是无条件写的，实测 2026-09-30 一天占了整个日志的
+        ///    **27.2%（169/622 行）**，是全部日志里最吵的一条（同一秒里最多连着写 6 遍）。
+        ///    文档个数在一轮加载内不会变，记一遍足够。
+        ///
+        /// ⚠️⚠️ 注意它和下面 `_noPwdLoggedToken` 是**两个独立的标记**，别合并 ——
+        ///    2026-10-01 发现第十一批修这里时只加了判断、漏了赋值，
+        ///    导致这条根本没被节流；而一旦补上赋值，又会把「没有密码框」那条
+        ///    永久压掉（同一个 token 被先到的用掉了）。所以必须分开。
+        /// </summary>
+        private int _docsLoggedToken = -1;
+
+        /// <summary>
+        /// 密码框相关的两条诊断（「这个文档里没有密码框」/「密码框是按名字认出来的」），
+        /// 最后一轮是第几轮加载时写的。
+        ///
+        /// ⚠️ 存在的理由：这两条原先都是无条件的，而补填定时器每 1.2 秒重试一次、
+        ///    一轮最多 12 次，加上 DocumentCompleted 也会调一次 —— 实测一天下来
+        ///    「没有密码框」占了整个日志的 17.9%（108/604 行），把真正的线索全淹了。
         ///    同一轮加载里记一遍就够了。
+        ///
+        /// ⚠️ 与 `_docsLoggedToken` 必须分开，原因见上。
         /// </summary>
         private int _noPwdLoggedToken = -1;
 
@@ -1578,8 +1596,13 @@ namespace CampusNetHelper
             //    每轮最多 12 次，实测 2026-09-30 一天占了整个日志的 **27.2%（169/622 行）**，
             //    是全部日志里最吵的一条（同一秒里最多连着写 6 遍）。
             //    文档个数在一轮加载内不会变，记一遍足够。
-            if (_noPwdLoggedToken != _loadToken)
+            //
+            // ⚠️⚠️ 2026-10-01 修：这里原先用的是 `_noPwdLoggedToken`，而且**漏了赋值**
+            //     —— 判断了个寂寞，实际上一次都没节流掉。补赋值时又发现不能复用同一个
+            //     token（会把下面「没有密码框」永久压掉），所以改成独立的 `_docsLoggedToken`。
+            if (_docsLoggedToken != _loadToken)
             {
+                _docsLoggedToken = _loadToken;
                 Log.Info("认证页填表：可访问文档 " + docs.Count + " 个");
             }
 
@@ -1625,6 +1648,22 @@ namespace CampusNetHelper
                         Log.Info("认证页填表：这个文档里没有密码框 —— " + DescribeDoc(all));
                     }
                     continue;
+                }
+
+                // 密码框是**按名字猜**出来的（页面上没有 type="password"）→ 记一笔。
+                // 平时不写（能正常识别就没什么可说），只在真的用了降级路径时记，
+                // 以后有人报"填到别的框里去了"，这条日志能直接指出问题出在哪。
+                // 复用同一个节流标记，避免每轮加载都刷一遍。
+                if (_noPwdLoggedToken != _loadToken)
+                {
+                    string pwType = AttrOf(pw, "type").ToLowerInvariant();
+                    if (!"password".Equals(pwType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _noPwdLoggedToken = _loadToken;
+                        Log.Info("认证页填表：密码框是按名字认出来的（页面上没有 type=password）"
+                            + " —— type=\"" + pwType + "\" name=\"" + AttrOf(pw, "name")
+                            + "\" id=\"" + AttrOf(pw, "id") + "\"");
+                    }
                 }
 
                 WinForms.HtmlElement us = FindUserInput(all, pw);
@@ -1995,14 +2034,54 @@ namespace CampusNetHelper
             return AttrTrue(el, "disabled") || AttrTrue(el, "readonly");
         }
 
+        /// <summary>
+        /// 密码框的推断顺序：
+        ///   ① 标准做法：type="password"（绝大多数认证页都是这样）
+        ///   ② 退一步：name / id 里带 pwd / pass 的输入框
+        ///
+        /// ⚠️ 为什么必须有第 ② 层 ——
+        ///     2026-09-30 学校换了新版认证页，它的密码框**不是** type="password"：
+        ///     实测 `input=4 password=0`，整页一个 password 类型的框都没有。
+        ///     只认 type 的话这里必然返回 null，而调用方拿到 null 会
+        ///     **直接放弃整轮自动填表**（见 1612 行附近），
+        ///     于是新认证页在"用户没配过字段档案"时**一个字都填不进去**。
+        ///     实测 9-30 一整天记了 109 次"这个文档里没有密码框"。
+        ///
+        ///     但它的 name 是 `SSOPWD` —— 名字里明写着 PWD，程序只是没去认。
+        ///
+        /// 第 ② 层只在前一层完全找不到时才启用，所以**不会影响原本能正常识别的页面**。
+        /// 万一猜错（把密码填进别的框），用户一眼能看出来，且可用「字段档案」手动纠正。
+        /// </summary>
         private static WinForms.HtmlElement FindPasswordInput(List<WinForms.HtmlElement> all)
         {
+            // ① 标准做法：type="password"
             foreach (WinForms.HtmlElement el in all)
             {
                 if (TagOf(el) != "input") continue;
                 if (!"password".Equals(AttrOf(el, "type"), StringComparison.OrdinalIgnoreCase)) continue;
                 if (IsDisabled(el)) continue;
                 return el;
+            }
+
+            // ② 降级：按 name / id 的名字猜
+            string[] keys = new string[] { "pwd", "pass", "password", "mima" };
+            foreach (WinForms.HtmlElement el in all)
+            {
+                if (TagOf(el) != "input") continue;
+                if (IsDisabled(el)) continue;
+
+                // 排除明显不可能是密码的控件类型
+                string type = AttrOf(el, "type").ToLowerInvariant();
+                if (type == "checkbox" || type == "radio" || type == "submit"
+                    || type == "button" || type == "reset" || type == "file"
+                    || type == "image" || type == "hidden") continue;
+
+                string id = (AttrOf(el, "id") + " " + AttrOf(el, "name")).ToLowerInvariant();
+                if (id.Length == 0) continue;
+                foreach (string k in keys)
+                {
+                    if (id.IndexOf(k, StringComparison.Ordinal) >= 0) return el;
+                }
             }
             return null;
         }

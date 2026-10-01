@@ -51,6 +51,8 @@ namespace CampusNetHelper
                 TestWebUrlStore();
                 TestKeepAliveLogQuiet();
                 TestPortalAutoReconnect();
+                TestFirstRunTip();
+                TestAppIcon();
 
                 W("================ 界面自测 结束 ================");
             }
@@ -1087,6 +1089,73 @@ namespace CampusNetHelper
         ///   ④ 恢复正常 → 记 1 条（带"此前连续失败 N 次"）
         ///   ⑤ 恢复后继续成功 → 又安静下来
         /// </summary>
+        /// <summary>
+        /// 首次使用引导条该不该显示。
+        ///
+        /// ⚠️ 只测**判定规则**（MainWindow.ShouldShowFirstRunTip），不测 WPF 的
+        ///    Visibility —— 离屏窗口上"看起来是不是可见"本身就不可靠，
+        ///    硬测会得到一个自己都不信的绿灯（这是本文件里重复过好几次的教训）。
+        ///    规则对了，剩下的赋值没有歧义；真实观感靠人工看一眼。
+        /// </summary>
+        private static void TestFirstRunTip()
+        {
+            W("");
+            W("---- 用例：首次使用引导条的显示规则 ----");
+
+            // 新手现场：一个账号都没配过，也没点过「知道了」→ 该显示
+            bool a = MainWindow.ShouldShowFirstRunTip(0, false);
+            W("没账号 + 没点过「知道了」→ " + a + "（期望 True，这是最该出现的时候）");
+
+            // 配过账号 → 不需要引导
+            bool b = MainWindow.ShouldShowFirstRunTip(1, false);
+            W("有 1 个账号 → " + b + "（期望 False，配过就不用教了）");
+
+            // 点过「知道了」→ 尊重用户，别再烦
+            bool c = MainWindow.ShouldShowFirstRunTip(0, true);
+            W("没账号 + 点过「知道了」→ " + c + "（期望 False，点了就得认）");
+
+            // 两个条件都不满足 → 更不该显示
+            bool d = MainWindow.ShouldShowFirstRunTip(3, true);
+            W("有 3 个账号 + 点过「知道了」→ " + d + "（期望 False）");
+
+            // 边界：账号数正好从 0 变 1（刚导入第一个账号那一刻）
+            bool e = MainWindow.ShouldShowFirstRunTip(1, false);
+            W("刚导入第一个账号 → " + e + "（期望 False，提示应当立刻自己消失）");
+
+            bool ok = a && !b && !c && !d && !e;
+            W("结果：" + (ok
+                ? "通过 —— 只在「真的还没配过账号」时出现，配过或点过「知道了」都不打扰。"
+                : "失败 —— 判定规则不对，检查 ShouldShowFirstRunTip"));
+        }
+
+        /// <summary>
+        /// 程序图标能不能正常取到（而不是静默退回系统盾牌），
+        /// 以及四张托盘状态图能不能生成。
+        ///
+        /// ⚠️ 这是一条**回归测试**：2026-10-01 换构建方式（/win32icon → /win32res）
+        ///    带出过一次真实事故 —— assets/logo.ico 的帧全是 PNG 压缩格式，
+        ///    .NET Framework 的 System.Drawing 解不了，于是静默退回
+        ///    SystemIcons.Shield，托盘上挂着一个**用户根本不认识的蓝色盾牌**。
+        ///    当时是靠人肉截托盘才发现的 —— 这种事不该再发生第二次，
+        ///    所以把判据写成断言：以后构建方式或图标文件一变，这里立刻报出来。
+        /// </summary>
+        private static void TestAppIcon()
+        {
+            W("");
+            W("---- 用例：程序图标可用（没退回系统盾牌）----");
+
+            bool isShield = MainWindow.DebugIconIsFallbackShield();
+            W("图标是否退化成系统默认盾牌 → " + isShield + "（期望 False）");
+            W("取到的图标尺寸 → " + MainWindow.DebugAppIconInfo());
+            W("四张托盘状态图 → " + MainWindow.DebugTrayIconShapes());
+
+            bool ok = !isShield;
+            W("结果：" + (ok
+                ? "通过 —— 取到的是程序自己的 logo，能正常着色出四种状态。"
+                : "失败 —— 图标取值退化成系统盾牌，托盘上会是个用户不认识的图标。"
+                  + "多半是 ico 的帧格式（PNG 压缩）和读取方式对不上。"));
+        }
+
         private static void TestKeepAliveLogQuiet()
         {
             W("");

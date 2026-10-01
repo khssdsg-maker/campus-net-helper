@@ -2240,10 +2240,69 @@ namespace CampusNetHelper
             RefreshQuickSwitch();
         }
 
+        /// <summary>
+        /// 「首次使用引导条」该不该显示。规则只有两条，都写在这里。
+        ///
+        /// 判定规则：**还没有任何账号** 且 **没点过「知道了」**。
+        ///
+        /// 为什么拿「没有账号」当主判据 ——
+        ///   配过账号的人本来就不需要这提示，而这个条件是天然准确的，
+        ///   不用额外维护一个「是不是第一次运行」的标记。那种标记一旦写歪就是永久性的错：
+        ///   要么该显示的永远不显示，要么用户关不掉。
+        ///
+        /// ⚠️ 为什么抽成 static 纯函数（而不是直接写在 UpdateFirstRunTip 里）——
+        ///    真正的显示还要经过 WPF 的 Visibility，而「离屏窗口上的可见性」这件事
+        ///    本身就不太可靠（这也是为什么"静默场景不弹窗"那条至今只能人工验，
+        ///    自测里只能做机制检查）。把**判定规则**单独拎出来，就能被自测直接断言；
+        ///    规则对了，剩下的"赋不赋值给 Visibility"就没有歧义了。
+        ///
+        /// 调用时机：① 窗口初始化（ApplyTheme → RefreshQuickSwitch）
+        ///           ② 账号增删之后（见 RefreshQuickSwitch 开头）
+        /// </summary>
+        internal static bool ShouldShowFirstRunTip(int accountCount, bool dismissed)
+        {
+            // 有账号 = 已经配过，不需要引导
+            // 点过「知道了」 = 用户明确表示不需要，尊重他，别再烦
+            return accountCount == 0 && !dismissed;
+        }
+
+        /// <summary>按当前账号数与「知道了」标记，刷新引导条的显示与否。</summary>
+        internal void UpdateFirstRunTip()
+        {
+            if (_firstRunTip == null) return;
+
+            bool dismissed = ConfigStore.GetBool(_settings, "FirstRunTipDismissed", false);
+            int n = (_accounts == null) ? 0 : _accounts.Count;
+
+            _firstRunTip.Visibility = ShouldShowFirstRunTip(n, dismissed)
+                ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        /// <summary>用户点了引导条上的「知道了」—— 记下来，以后不再显示。</summary>
+        private void DismissFirstRunTip()
+        {
+            ConfigStore.SetBool(_settings, "FirstRunTipDismissed", true);
+
+            string msg;
+            if (!ConfigStore.SaveSettings(_settings, out msg) && !string.IsNullOrEmpty(msg))
+            {
+                // 存不上也不拦着用户干别的 —— 大不了下次再弹一次，不影响功能
+                Log.Warn("保存「首次提示已关闭」失败: " + msg);
+            }
+
+            UpdateFirstRunTip();
+            Log.Info("用户关闭了首次使用引导");
+        }
+
         internal void RefreshQuickSwitch()
         {
             if (quickSwitchPanel == null) return;
             quickSwitchPanel.Children.Clear();
+
+            // ⚠️ 必须放在下面那个 `return` **之前** ——
+            //    没有账号时函数会提前返回，写到最后就永远执行不到（而"没有账号"恰好
+            //    正是这个提示最该出现的时候）。
+            UpdateFirstRunTip();
 
             if (_accounts.Count == 0)
             {
@@ -2407,16 +2466,302 @@ namespace CampusNetHelper
         /// 这样不用额外维护一份资源文件；取不到就退回系统图标，
         /// 绝不能因为图标问题让程序起不来。
         /// </summary>
+        [System.Runtime.InteropServices.DllImport("shell32.dll",
+            CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern uint ExtractIconExW(string lpszFile, int nIconIndex,
+            IntPtr[] phiconLarge, IntPtr[] phiconSmall, uint nIcons);
+
+        /// <summary>
+        /// 取程序自身的图标（托盘、窗口都用它）。
+        ///
+        /// ⚠️ 为什么不用 Icon.ExtractAssociatedIcon（2026-10-01 换掉的原实现）——
+        ///    assets/logo.ico 的帧**全部是 PNG 压缩格式**（16~256 共 7 帧）。
+        ///    而 .NET Framework 的 System.Drawing **解不了 PNG 压缩的图标帧**
+        ///    （GDI+ 的老限制，.NET Core 3.0 才修好）。它会抛异常，
+        ///    被 catch 吞掉后返回 SystemIcons.Shield —— 表现就是托盘上挂着一个
+        ///    **蓝色盾牌**，用户根本认不出那是校园网助手。
+        ///
+        ///    这个坑以前不显形：csc 的 /win32icon 会先把图转成 BMP 再嵌入；
+        ///    换成 /win32res（为了带版本号）之后，rc.exe 是**原样嵌入 PNG** 的，
+        ///    于是 .NET 解不动了 —— 属于换构建方式带出来的回归，实测才发现。
+        ///
+        ///    改用 ExtractIconEx 拿 HICON：那是系统已经解析好的位图句柄，
+        ///    不经过 .NET 的 ICO 解析，PNG 帧照样能用。
+        /// </summary>
         private static System.Drawing.Icon LoadAppIcon()
+        {
+            string exe = null;
+            try { exe = System.Reflection.Assembly.GetEntryAssembly().Location; }
+            catch { }
+
+            if (!string.IsNullOrEmpty(exe))
+            {
+                IntPtr[] large = new IntPtr[1];
+                IntPtr[] small = new IntPtr[1];
+                try
+                {
+                    uint n = ExtractIconExW(exe, 0, large, small, 1);
+                    IntPtr h = (large[0] != IntPtr.Zero) ? large[0] : small[0];
+                    if (n > 0 && h != IntPtr.Zero)
+                    {
+                        System.Drawing.Icon ic;
+                        using (System.Drawing.Icon tmp = System.Drawing.Icon.FromHandle(h))
+                        {
+                            // FromHandle 只是包了一层，h 一释放它就没用了 —— 必须 Clone
+                            ic = (System.Drawing.Icon)tmp.Clone();
+                        }
+                        // 这两个句柄是 ExtractIconEx 给我们的，得自己还回去
+                        if (large[0] != IntPtr.Zero) DestroyIcon(large[0]);
+                        if (small[0] != IntPtr.Zero) DestroyIcon(small[0]);
+                        return ic;
+                    }
+                    if (large[0] != IntPtr.Zero) DestroyIcon(large[0]);
+                    if (small[0] != IntPtr.Zero) DestroyIcon(small[0]);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("用 ExtractIconEx 取程序图标失败: " + ex.Message);
+                }
+
+                // 兜底：老的 .NET 方式（对 BMP 格式的 ico 有效，PNG 的会抛异常）
+                try
+                {
+                    System.Drawing.Icon ico = System.Drawing.Icon.ExtractAssociatedIcon(exe);
+                    if (ico != null) return ico;
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("ExtractAssociatedIcon 也失败（多半是 PNG 压缩的 ico）: " + ex.Message);
+                }
+            }
+
+            Log.Warn("取不到程序图标，退回系统默认盾牌");
+            return System.Drawing.SystemIcons.Shield;
+        }
+
+        /// <summary>
+        /// 给自测用：程序图标是不是**退回了系统默认盾牌**（也就是取值失败）。
+        ///
+        /// ⚠️ 判据是「和有系统盾牌逐像素比一遍」而不是看尺寸 ——
+        ///    盾牌和真 logo 都可能是 32×32，光看尺寸分辨不出来。
+        ///    这个回归曾经真的发生过：assets/logo.ico 全是 PNG 压缩帧，
+        ///    换成 /win32res 之后 .NET 的 System.Drawing 解不了，
+        ///    于是静默退回盾牌，托盘上挂着一个用户根本不认识的图标。
+        ///    加了这条断言，以后换构建方式或换图标文件时会立刻报警。
+        /// </summary>
+        internal static bool DebugIconIsFallbackShield()
         {
             try
             {
-                string exe = System.Reflection.Assembly.GetEntryAssembly().Location;
-                System.Drawing.Icon ico = System.Drawing.Icon.ExtractAssociatedIcon(exe);
-                if (ico != null) return ico;
+                using (System.Drawing.Bitmap a = LoadAppIcon().ToBitmap())
+                using (System.Drawing.Bitmap b = System.Drawing.SystemIcons.Shield.ToBitmap())
+                {
+                    if (a.Width != b.Width || a.Height != b.Height) return false;
+                    for (int y = 0; y < a.Height; y++)
+                    {
+                        for (int x = 0; x < a.Width; x++)
+                        {
+                            if (a.GetPixel(x, y) != b.GetPixel(x, y)) return false;
+                        }
+                    }
+                    return true;   // 一模一样 → 就是盾牌
+                }
             }
-            catch { }
-            return System.Drawing.SystemIcons.Shield;
+            catch (Exception ex)
+            {
+                Log.Warn("比较程序图标失败: " + ex.Message);
+                return true;   // 取不到也算有问题
+            }
+        }
+
+        /// <summary>给自测用：程序图标的尺寸，用来确认确实取到了真图标。</summary>
+        internal static string DebugAppIconInfo()
+        {
+            try
+            {
+                // ⚠️ 这里**故意不 Dispose**：LoadAppIcon 失败时返回的是
+                //    SystemIcons.Shield 这个**共享实例**，Dispose 它会波及全进程。
+                System.Drawing.Icon ic = LoadAppIcon();
+                return ic.Width + "x" + ic.Height;
+            }
+            catch (Exception ex)
+            {
+                return "取图标失败: " + ex.Message;
+            }
+        }
+
+        /// <summary>给自测用：四张状态图标有没有生成出来（托盘配色是否可用）。</summary>
+        internal static string DebugTrayIconShapes()
+        {
+            string exe = null;
+            try { exe = System.Reflection.Assembly.GetEntryAssembly().Location; } catch { }
+            System.Drawing.Icon src = LoadAppIcon();
+            string[] names = new string[] { "绿", "橙", "红", "灰" };
+            System.Drawing.Color[] tints = new System.Drawing.Color[]
+            {
+                Dr(Theme.Ok), Dr(Theme.Warn), Dr(Theme.Err),
+                System.Drawing.Color.FromArgb(255, 140, 140, 140)
+            };
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < tints.Length; i++)
+            {
+                if (i > 0) sb.Append(" / ");
+                try
+                {
+                    System.Drawing.Icon ic = BuildStateIcon(src, tints[i]);
+                    sb.Append(names[i]).Append("=").Append(ic == null ? "null"
+                        : ic.Width + "x" + ic.Height);
+                }
+                catch (Exception ex)
+                {
+                    sb.Append(names[i]).Append("=失败(").Append(ex.Message).Append(")");
+                }
+            }
+            return sb.ToString();
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr handle);
+
+        private static System.Drawing.Color Dr(System.Windows.Media.Color c)
+        {
+            return System.Drawing.Color.FromArgb(c.A, c.R, c.G, c.B);
+        }
+
+        /// <summary>
+        /// 把 logo 图标单色化成指定颜色，用来表示连接状态。
+        ///
+        /// ⚠️ 为什么不是「直接往目标色混」（第一版就是这么做的，被推翻了）——
+        ///    logo 的底色是蓝的，加法混色会把蓝一起带进来：混绿得到的是**青色**、
+        ///    混红得到的是**紫红**，颜色不纯、语义就糊了。
+        ///    离线按 16px（托盘的真实尺寸）渲染对比过，"青"和"绿"根本分不清。
+        ///
+        ///    改成「先取明度、再用目标色乘上去」后，颜色是纯的，
+        ///    同时**保留了 logo 的明暗层次**（学士帽仍然是亮的、底仍然是暗的），
+        ///    缩到 16px 也还认得出是什么图形。
+        ///
+        /// ⚠️ floor 给最暗处留一点亮度：
+        ///    纯乘法会把暗部直接压成黑块，而托盘底色偏深，那就彻底看不见了。
+        ///
+        /// ⚠️ 句柄归属：GetHicon() 拿到的原生句柄**必须由我们 DestroyIcon**，
+        ///    否则每次调用泄漏一个。这里返回的是 Clone，脱离原生句柄独立存在。
+        /// </summary>
+        private static System.Drawing.Icon BuildStateIcon(System.Drawing.Icon src,
+            System.Drawing.Color tint)
+        {
+            if (src == null) return null;
+            const float floor = 0.25f;   // 最暗处也保留 25% 的目标色亮度
+            const int SZ = 32;           // 见下面关于尺寸的注释
+
+            try
+            {
+                // ⚠️ 必须**先缩小再逐像素处理**，不能拿原图直接干：
+                //    logo.ico 是 256×256，GetPixel/SetPixel 是出了名的慢，
+                //    65536 像素 × 两次调用 × 4 张图 ≈ 半秒的启动卡顿。
+                //    托盘图标实际只用得到 16~32px，先重采样到 32×32 再处理：
+                //    1024 像素 × 4 张 ≈ 几毫秒，而且缩放本身带了插值，边缘还更顺。
+                using (System.Drawing.Bitmap srcBmp = src.ToBitmap())
+                using (System.Drawing.Bitmap bmp = new System.Drawing.Bitmap(SZ, SZ))
+                {
+                    using (System.Drawing.Graphics g = System.Drawing.Graphics.FromImage(bmp))
+                    {
+                        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                        g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                        g.Clear(System.Drawing.Color.Transparent);
+                        g.DrawImage(srcBmp, 0, 0, SZ, SZ);
+                    }
+
+                    for (int y = 0; y < SZ; y++)
+                    {
+                        for (int x = 0; x < SZ; x++)
+                        {
+                            System.Drawing.Color p = bmp.GetPixel(x, y);
+                            if (p.A == 0) continue;   // 全透明像素不碰
+
+                            // 先算明度（人眼对绿最敏感、对蓝最迟钝，所以不是简单取平均）
+                            float gray = p.R * 0.299f + p.G * 0.587f + p.B * 0.114f;
+                            float f = floor + (1f - floor) * (gray / 255f);
+
+                            int r = (int)(tint.R * f);
+                            int g2 = (int)(tint.G * f);
+                            int b = (int)(tint.B * f);
+                            bmp.SetPixel(x, y, System.Drawing.Color.FromArgb(p.A,
+                                r > 255 ? 255 : r, g2 > 255 ? 255 : g2, b > 255 ? 255 : b));
+                        }
+                    }
+
+                    IntPtr h = bmp.GetHicon();
+                    try
+                    {
+                        using (System.Drawing.Icon tmp = System.Drawing.Icon.FromHandle(h))
+                        {
+                            // FromHandle 只是包了一层，h 一释放它就没用了 —— 必须 Clone
+                            return (System.Drawing.Icon)tmp.Clone();
+                        }
+                    }
+                    finally
+                    {
+                        DestroyIcon(h);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("生成状态图标失败: " + ex.Message);
+                return src;   // 配色挂了也不能变成没图标，退回原图
+            }
+        }
+
+        /// <summary>
+        /// 一次生成四张状态图标备用（进程内只做一次）。
+        /// 颜色语义跟界面上那套保持一致（见 Theme.Ok/Warn/Err）：
+        ///     已连接 → 绿　　连接中/断开中 → 橙　　出错 → 红　　其余（未连/待机/免打扰）→ 灰
+        /// </summary>
+        private void InitTrayIcons()
+        {
+            System.Drawing.Icon src = LoadAppIcon();
+            if (src == null) return;
+
+            _trayIcOk = BuildStateIcon(src, Dr(Theme.Ok));
+            _trayIcBusy = BuildStateIcon(src, Dr(Theme.Warn));
+            _trayIcErr = BuildStateIcon(src, Dr(Theme.Err));
+            _trayIcIdle = BuildStateIcon(src, System.Drawing.Color.FromArgb(255, 140, 140, 140));
+        }
+
+        /// <summary>
+        /// 按当前连接状态切换托盘图标。
+        ///
+        /// ⚠️ 先把 _state 归成四类再比，不直接比 _state：
+        ///    WaitingLink / Quiet / Disconnecting 这些状态共用同一张图，
+        ///    直接比的话每切一次状态就要往 NotifyIcon.Icon 赋一次值 ——
+        ///    而 NotifyIcon 每次赋值都会让托盘重绘，白白闪一下。
+        /// </summary>
+        private void UpdateTrayIcon()
+        {
+            if (trayIcon == null || _trayIcOk == null) return;
+
+            ConnState bucket;
+            System.Drawing.Icon want;
+            if (_state == ConnState.Connected)
+            {
+                bucket = ConnState.Connected; want = _trayIcOk;
+            }
+            else if (_state == ConnState.Connecting || _state == ConnState.Disconnecting)
+            {
+                bucket = ConnState.Connecting; want = _trayIcBusy;
+            }
+            else if (_state == ConnState.Error)
+            {
+                bucket = ConnState.Error; want = _trayIcErr;
+            }
+            else
+            {
+                bucket = ConnState.Idle; want = _trayIcIdle;
+            }
+
+            if (bucket == _trayIcShown) return;
+            _trayIcShown = bucket;
+            trayIcon.Icon = want;
         }
 
         private void InitTray()
@@ -2438,9 +2783,13 @@ namespace CampusNetHelper
             trayMenu.Items.Add("退出程序", null,
                 delegate(object s, EventArgs e) { Dispatcher.Invoke(delegate() { ExitApp(); }); });
 
+            // 先生成四张状态图标（绿/橙/红/灰），后面只切引用
+            InitTrayIcons();
+
             trayIcon = new System.Windows.Forms.NotifyIcon
             {
-                Icon = LoadAppIcon(),
+                // 刚启动时还没连上，直接挂灰色那张；连上后由 UpdateTrayIcon 换掉
+                Icon = _trayIcIdle != null ? _trayIcIdle : LoadAppIcon(),
                 Text = "校园网助手",
                 ContextMenuStrip = trayMenu,
                 Visible = true
@@ -2464,6 +2813,10 @@ namespace CampusNetHelper
                 if (t.Length > 60) t = t.Substring(0, 60);
                 trayIcon.Text = t;
             }
+
+            // 顺带把图标色调也切过去 —— 这样不用打开窗口、也不用把鼠标移上去看提示，
+            // 扫一眼托盘就知道通没通（绿=已连，灰=没连，橙=在连，红=出错）。
+            UpdateTrayIcon();
             if (trayMiDial != null)
             {
                 trayMiDial.Enabled = _state != ConnState.Connected && _state != ConnState.Connecting;

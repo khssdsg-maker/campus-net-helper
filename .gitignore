@@ -10,6 +10,8 @@ release/
 *.suo
 .vs/
 build.rsp
+# 版本资源是编译产物（源文件 assets/version.rc 才是要提交的）
+assets/version.res
 
 # 内部文档（含校内信息，不要公开）
 HANDOVER.md
