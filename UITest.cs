@@ -58,6 +58,7 @@ namespace CampusNetHelper
                 TestVersionCompare();
                 TestCaptchaAssist();
                 TestCaptchaPipeline();
+                TestCaptchaOcr();
 
                 W("================ 界面自测 结束 ================");
             }
@@ -1382,6 +1383,84 @@ namespace CampusNetHelper
         ///   ② 必须在 Show() **之前**把地址换成测试页：窗口的 Loaded 事件会按
         ///      txtUrl.Text 去导航，晚一步就会先跑去真认证页。
         /// </summary>
+        /// <summary>
+        /// 用例：验证码识别（C9 第二阶段，只填候选、绝不提交）。
+        ///
+        /// 为什么必须有这个用例：识别是一堆阈值 + 一千多个模板拼出来的，
+        /// 改任何一处都可能悄悄退化，而"能不能编译"完全反映不出这种事。
+        /// 这里用**真实样本**量出准确率，低于验收线就报红。
+        ///
+        /// 样本目录按顺序找，第一个存在的就用：
+        ///   ① 环境变量 CNH_OCR_FIXTURES —— 开发期量自己拉的样本
+        ///   ② %TEMP%\cnh-ocr-fixtures   —— 同上，不设环境变量时用
+        ///   ③ 用户样本目录 captcha-samples —— 他平时登录时程序自己攒的
+        /// 一个都没有就**跳过**（不算失败）—— 不能因为没样本就让正常自测变红。
+        /// </summary>
+        private static void TestCaptchaOcr()
+        {
+            W("");
+            W("---- 用例：验证码识别（C9 第二阶段）----");
+
+            int n = CaptchaOcr.TemplateCount;
+            W("模板库条数 = " + n + "（期望 1152）");
+            if (n != 1152)
+            {
+                W("!! 模板库条数不对 —— 模板数据可能没编进来，或被生成脚本改坏了");
+                return;
+            }
+            W("OK 模板库能加载");
+
+            string dir = Environment.GetEnvironmentVariable("CNH_OCR_FIXTURES");
+            string src = "环境变量 CNH_OCR_FIXTURES";
+            if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir))
+            {
+                dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cnh-ocr-fixtures");
+                src = "%TEMP%\\cnh-ocr-fixtures";
+            }
+            if (!System.IO.Directory.Exists(dir))
+            {
+                dir = CaptchaAssist.SamplesDir;
+                src = "用户样本目录 captcha-samples";
+            }
+            if (!System.IO.Directory.Exists(dir))
+            {
+                W("结果：跳过 —— 三个样本目录都不存在（最后一个试的是 " + src + "）。");
+                W("      往任一目录放几张「文件名以 4 位答案结尾」的 PNG 就能量准确率。");
+                return;
+            }
+
+            string err;
+            CaptchaOcr.Accuracy a = CaptchaOcr.MeasureDirectory(dir, out err);
+            if (err.Length > 0) { W("结果：跳过 —— " + err); return; }
+
+            W("样本目录 = " + dir + "（来自 " + src + "）");
+            W("样本 " + a.Images + " 张 / 共 " + a.CharTotal + " 位字符");
+            W("");
+            W("① 识别能力（不看闸门，总是取 top1）");
+            W("   字符准确率 = " + a.RawCharOk + "/" + a.CharTotal
+                + " = " + a.RawCharRate.ToString("P1") + "   （验收线 70%）");
+            W("");
+            W("② 实际填给用户的（过闸门才填）");
+            W("   填入 " + a.FilledChars + "/" + a.CharTotal + " 位 = "
+                + a.FillRate.ToString("P1") + " 的位");
+            W("   填入的位里对 " + a.FilledOk + "/" + a.FilledChars
+                + " = " + a.FillCharRate.ToString("P1"));
+            W("   4 位全达标的图 " + a.ImagesAllFilled + "/" + a.Images
+                + " 张（覆盖 " + a.FillImageCoverage.ToString("P1") + "）");
+            W("   这些图里 4 位全对 " + a.ImagesAllFilledOk + "/" + a.ImagesAllFilled
+                + " = " + a.FillImageRate.ToString("P1"));
+
+            if (a.CharTotal < 40)
+            {
+                W("样本偏少（<10 张），只报数不下结论。");
+                return;
+            }
+            if (a.RawCharRate < 0.70)
+                W("!! 识别字符准确率 " + a.RawCharRate.ToString("P1") + " 低于验收线 70%");
+            else
+                W("OK 识别字符准确率 " + a.RawCharRate.ToString("P1") + " 达标（验收线 70%）");
+        }
+
         private static void TestCaptchaPipeline()
         {
             W("");

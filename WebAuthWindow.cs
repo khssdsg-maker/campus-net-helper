@@ -78,6 +78,9 @@ namespace CampusNetHelper
         private Image imgCaptcha;
         private TextBlock lblCaptchaHint;
 
+        /// <summary>C9 第二阶段：「自动填写」按钮。没有验证码时整行折叠，它也一起藏起来。</summary>
+        private Button btnOcrCaptcha;
+
         /// <summary>当前这张验证码的原始 PNG 字节。采集样本要用它（必须和用户填的那 4 位是同一张）。</summary>
         private byte[] _captchaPng;
 
@@ -539,6 +542,17 @@ namespace CampusNetHelper
             btnNewCaptcha.VerticalAlignment = VerticalAlignment.Top;
             btnNewCaptcha.ToolTip = "让页面重新要一张验证码图（页面上的那格也会跟着变）";
             rowCaptcha.Children.Add(btnNewCaptcha);
+
+            // C9 第二阶段：「自动填写」——识别出候选**填进框**，仅此而已。
+            // ⚠️ 这个按钮绝不会点登录、也不会调用任何 submit。识别错一位就会在学校端
+            //    记一次登录失败，而学校普遍对连续失败有次数限制，所以提交权只能在人手里。
+            //    红线写在 CaptchaAssist 的类注释和 CaptchaOcr 的类注释里。
+            btnOcrCaptcha = MainWindow.MakeGhostButton("自动填写", OnCaptchaOcr);
+            btnOcrCaptcha.FontSize = 12;
+            btnOcrCaptcha.Margin = new Thickness(8, 0, 0, 0);
+            btnOcrCaptcha.VerticalAlignment = VerticalAlignment.Top;
+            btnOcrCaptcha.ToolTip = "认出这 4 位并填进输入框（可能错，请核对后再自己点登录）";
+            rowCaptcha.Children.Add(btnOcrCaptcha);
 
             var btnAgainCaptcha = MainWindow.MakeGhostButton("重新抠图", delegate()
             {
@@ -1043,6 +1057,88 @@ namespace CampusNetHelper
             catch (Exception ex)
             {
                 SetCaptchaHint("换图失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// C9 第二阶段：「自动填写」。认出这 4 位，写进页面的验证码框，然后**停手**。
+        ///
+        /// ⚠️ 三条不能破的规矩（对应 CaptchaOcr 类注释里的红线）：
+        ///   1. **绝不提交**。这个方法从头到尾没有任何 submit / InvokeMember("click") /
+        ///      表单回传。填完就结束，点「登录」永远是用户的事。
+        ///      验收时会专门审查"全项目有没有自动提交验证码的路径"，这里就是重点。
+        ///   2. **绝不重新请求 /CheckCode**。认的是 `_captchaPng` ——
+        ///      也就是页面**已经显示给用户的**那一张（TryCaptureCaptcha 里
+        ///      用 canvas 从内存位图取的）。重新请求会把 session 里的答案换掉，
+        ///      用户照图填必错。
+        ///   3. **认不准就不填**。置信度不足时一位都不写，并明确告诉用户手动填；
+        ///      绝不"填个大概"——填错一位就会在学校端记一次登录失败。
+        /// </summary>
+        private void OnCaptchaOcr()
+        {
+            try
+            {
+                if (_captchaPng == null || _captchaPng.Length == 0)
+                {
+                    SetCaptchaHint("还没取到验证码图，稍等一下再点。");
+                    return;
+                }
+
+                CaptchaOcr.Result r = CaptchaOcr.RecognizePng(_captchaPng);
+
+                if (r.Error.Length > 0)
+                {
+                    SetCaptchaHint("识别不可用（" + r.Error + "），请手动填写。");
+                    Log.Warn("验证码识别失败: " + r.Error);
+                    return;
+                }
+
+                if (r.AcceptedCount == 0)
+                {
+                    SetCaptchaHint("这张认不准，没有替你填 —— 请手动填写。");
+                    Log.Info("验证码识别：置信度不足，未填入（最小 margin="
+                             + r.MinMargin.ToString("0.###") + "）");
+                    return;
+                }
+
+                // 把候选写进页面输入框（只写值，不触发任何提交）
+                if (!FillCaptchaBox(r.Text))
+                {
+                    SetCaptchaHint("识别出来了，但写进输入框失败 —— 请手动填写。");
+                    return;
+                }
+
+                // 让"用户填了什么"的监听立刻刷新一次，免得提示语自相矛盾
+                PollCaptchaTyped();
+                SetCaptchaHint(CaptchaOcr.DescribeForUser(r));
+                Log.Info("验证码识别：已填入候选 " + r.Text
+                         + "（达标 " + r.AcceptedCount + "/4，最小 margin="
+                         + r.MinMargin.ToString("0.###") + "）");
+            }
+            catch (Exception ex)
+            {
+                SetCaptchaHint("识别出错：" + ex.Message + "，请手动填写。");
+                Log.Warn("验证码识别异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>把文字写进页面的验证码输入框。只赋值，不做任何提交动作。</summary>
+        private bool FillCaptchaBox(string text)
+        {
+            if (browser == null || browser.Document == null) return false;
+            try
+            {
+                object docObj = browser.Document;
+                WinForms.HtmlDocument doc = docObj as WinForms.HtmlDocument;
+                if (doc == null) return false;
+                doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildFillJs(text) });
+                object ret = doc.InvokeScript("__cnhCaptchaFill");
+                return ret != null && ret.ToString() == "OK";
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("写入验证码输入框失败: " + ex.Message);
+                return false;
             }
         }
 
@@ -2515,11 +2611,14 @@ namespace CampusNetHelper
         ///   而学校普遍对"连续登录失败"有次数限制，反复失败可能把账号锁一段时间。
         ///   所以宁可停手，让用户自己看一眼验证码、填进去、点登录。
         ///
-        /// 这里**刻意不做验证码自动识别**：
-        ///   ① 识别验证码等于绕过它 —— 它的存在就是为了挡住自动化，这是它的设计意图；
-        ///   ② 现在学校多用滑块 / 点选 / 行为验证（极验、腾讯验证码那一类），
-        ///      根本不是图片字符，OCR 也认不出来。
-        ///   结论：这件事交给用户，只在界面上把话说明白。
+        /// 验证码的识别：**做，但只做到"填候选"，绝不提交**（C9 第二阶段）。
+        ///   ① 「自动填写」按钮认出的 4 位只写进输入框，点「登录」永远是用户的事。
+        ///      本项目从未、也不会出现提交验证码的代码路径 —— 这是对用户的承诺，
+        ///      也是验收时要专门审查的一条。
+        ///   ② 识别本身不破坏"人在操作"这件事：认不准就一位都不填（见 CaptchaOcr.MinMargin），
+        ///      认出来也明确提示"可能错，请核对"。真正的提交动作仍然只有人手能做。
+        ///   ③ 注意区分：这里 HasCaptcha 是"填账号密码那条自动路径"的闸门 ——
+        ///      那条路径**依然只填不提交**，与「自动填写」按钮是两码事。
         /// </summary>
         private static bool HasCaptcha(List<WinForms.HtmlElement> all)
         {

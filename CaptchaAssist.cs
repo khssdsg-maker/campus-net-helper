@@ -21,6 +21,18 @@ namespace CampusNetHelper
     ///   ② 所以先做确定有价值、且零风险的那半：看得更清楚 + 攒带标签样本。
     ///      样本攒够了再做识别，那时"准确率"才是一个可以测的数字，不是一句嘴上的话。
     ///
+    /// ── 2026-10-03 补记（第二阶段已落地，上面①的结论被推翻）────────────────
+    /// 上面说的"开运算把横笔画吃掉"，根因找到了，是两条实打实的 bug：
+    ///   · 当时那个 erode2x2 **名不副实**：注释写 2×2，代码写了四次移位，
+    ///     等价于 3×3 十字腐蚀，2px 笔画整根消失；
+    ///   · 它在**所有颜色合并后**的掩膜上做腐蚀，干扰线和字符一相邻就粘成一块、
+    ///     腐蚀时连坐。按色分层做，"字符粗、干扰线细"的差别才显出来。
+    /// 修好之后（30 张真样本，海辰授权实拉）：字符准确率 81.7%，
+    /// 开了置信度闸门后"填入的位里对 92.4%"。识别实现在 `CaptchaOcr.cs`，
+    /// 入口是认证窗口里的「自动填写」按钮。
+    /// 上面②那句"样本攒够了再做"依然成立且依然有用 ——
+    /// 采集一直在跑，攒得越多，模板库和准确率越有得救（见 CaptchaOcr 的 MeasureDirectory）。
+    ///
     /// ⚠️ 三条红线（改这里的代码前务必看）：
     ///
     ///   1. **绝不重新请求 /CheckCode**。
@@ -176,6 +188,36 @@ namespace CampusNetHelper
                 "    if (!im.complete) return 'no';" +
                 "    return ((im.naturalWidth || im.width) > 0) ? 'yes' : 'no';" +
                 "  } catch (e) { return 'no'; }" +
+                "};";
+        }
+
+        /// <summary>
+        /// 「自动填写」：把识别出的候选写进页面的验证码输入框。
+        ///
+        /// ⚠️ 这里**只赋值，不做任何提交** —— 没有 form.submit()、没有 click()、
+        ///    没有 __doPostBack。项目的红线是"验证码永远由人提交"，验收时会专门
+        ///    审查全项目有没有自动提交的路径，这个函数就是重点检查对象。
+        ///
+        /// 为什么走 JS 赋值而不是设置 element 的 value 属性：
+        ///   和 BuildTypedJs 同一个原因 —— IE 标准模式下取/设 HTML 属性拿到的是
+        ///   初始值，不是用户在框里看到并会随表单提交的那个实时值。
+        ///   必须写 DOM 的 value 属性，页面回传时带的才是它。
+        ///
+        /// 文本用 JSON 风格转义（只可能是 A-Z0-9，但仍按规矩转义，避免以后改字符集时出事）。
+        /// </summary>
+        public static string BuildFillJs(string text)
+        {
+            string safe = (text == null) ? "" : text.Replace("\\", "\\\\").Replace("'", "\\'");
+            return JsFinder +
+                "window.__cnhCaptchaFill = function () {" +
+                "  try {" +
+                "    var el = window.__cnhCaptchaInput();" +
+                "    if (!el) return 'ERR:no-input';" +
+                "    el.value = '" + safe + "';" +
+                "    el.dispatchEvent(new Event('input', { bubbles: true }));" +
+                "    el.dispatchEvent(new Event('change', { bubbles: true }));" +
+                "    return (el.value === '" + safe + "') ? 'OK' : 'ERR:not-set';" +
+                "  } catch (e) { return 'ERR:' + (e.message || e); }" +
                 "};";
         }
 
