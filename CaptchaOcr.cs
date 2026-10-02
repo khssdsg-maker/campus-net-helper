@@ -228,11 +228,23 @@ namespace CampusNetHelper
             public int AcceptedCount;
 
             /// <summary>
-            /// **四位全部**达到闸门。这才是"可以填"的条件 —— 要么 4 位都给，要么一位都不给。
-            /// 往输入框里塞 "A?3?" 这种残句对用户毫无意义，只会让人以为程序坏了。
-            /// （这也与准确率的实测口径一致：那个 72.7% 就是按"整图填"量的。）
+            /// **四位全部**达到闸门。保留此判据供诊断与自测用；
+            /// 现在的填写策略已改成"总是填 top1 四位"，不再要求它为真（见 FillCandidate）。
             /// </summary>
             public bool AllAccepted { get { return AcceptedCount == 4; } }
+
+            /// <summary>
+            /// 相对最没把握的那一位（0~3），没有可用槽位时为 -1。
+            ///
+            /// 为什么要它：改成"总是填 4 位"之后用户必须核对，但**注意力有限**。
+            /// 把最可疑的那一位点出来，他就能盯着那儿看，而不用 4 位平均用力。
+            /// 这是"总是填"能成立的前提 —— 否则等于把 4 个可能错的字符丢给他自己分辨，
+            /// 反而更累。
+            /// </summary>
+            public int WeakestIndex = -1;
+
+            /// <summary>最弱那一位的 margin（-1 表示没有）。</summary>
+            public double WeakestMargin = -1;
 
             /// <summary>达标位里最小的 margin（整体置信度）。</summary>
             public double MinMargin = -1;
@@ -243,17 +255,22 @@ namespace CampusNetHelper
         /// <summary>
         /// **唯一允许写进验证码输入框的东西。** 返回空串 = 什么都别填。
         ///
-        /// 三重闸门，缺一不可：
+        /// 策略（2026-10-03 海辰拍板）：**总是把 4 位 top1 候选填进去**，
+        /// 再由 DescribeForUser 点名最可疑的那一位让他重点核对。
+        /// 理由是划算：4 位里平均 3.3 位是对的，全填出来他改一两下就好；
+        /// 而"有一位没把握就整张不填"会让他 63% 的时候一个字都拿不到，等于没帮上忙。
+        ///
+        /// 两道闸门（比"四位全部达标"宽松，但绝不放 '?' 进输入框）：
         ///   ① 识别本身没出错
-        ///   ② 四位全部达标（AllAccepted）—— 不做"填一半"
-        ///   ③ 结果确实由 4 位字母数字组成 —— 兜底，确保 '?' 这类字符
-        ///      在任何情况下都不可能进输入框
-        /// 之所以做成一个函数而不是散在调用处判断：这样**自测能直接断言这条不变量**。
+        ///   ② 结果确实由 **4 位字母数字**组成 —— 任何一位连观测都没取到（那会是 '?'）
+        ///      就整体不填。验证码框只认这 36 个字符，塞别的进去毫无意义。
+        ///
+        /// 做成一个函数而不是散在调用处判断，是为了让**自测能直接断言这条不变量** ——
+        /// 2026-10-03 那个"框里出现 A?3?"的事故，就是因为没把它做成可断言的。
         /// </summary>
         public static string FillCandidate(Result r)
         {
             if (r == null || r.Error.Length > 0) return "";
-            if (!r.AllAccepted) return "";
             return CaptchaAssist.IsValidCaptchaText(r.Text) ? r.Text : "";
         }
 
@@ -294,6 +311,8 @@ namespace CampusNetHelper
                 char[] outChars = new char[4];
                 int acc = 0;
                 double minMargin = double.MaxValue;
+                int weakest = -1;
+                double weakestMargin = double.MaxValue;
                 for (int i = 0; i < 4; i++)
                 {
                     SlotResult s = res.Slots[i];
@@ -303,6 +322,15 @@ namespace CampusNetHelper
                         continue;
                     }
                     outChars[i] = s.Best;
+
+                    // 最弱的一位：不管它有没有达标都比一比 ——
+                    // 现在是"总是填 4 位"，提示语要能指出该重点核对哪一位。
+                    if (s.Margin < weakestMargin)
+                    {
+                        weakestMargin = s.Margin;
+                        weakest = i;
+                    }
+
                     if (s.Accepted)
                     {
                         acc++;
@@ -312,6 +340,8 @@ namespace CampusNetHelper
                 res.Text = new string(outChars);
                 res.AcceptedCount = acc;
                 res.MinMargin = (acc > 0) ? minMargin : -1;
+                res.WeakestIndex = weakest;
+                res.WeakestMargin = (weakest >= 0) ? weakestMargin : -1;
                 return res;
             }
             catch (Exception ex)
@@ -601,16 +631,13 @@ namespace CampusNetHelper
             public int Images;
             public int CharTotal;
 
-            /// <summary>不管闸门、直接取 top1 时的字符正确数（= 识别能力本身）。</summary>
-            public int RawCharOk;
-
-            /// <summary>达到闸门、真会填进框里的位数。</summary>
+            /// <summary>真被填进框里的位数（现在策略是"总是填 4 位"，所以基本等于 CharTotal）。</summary>
             public int FilledChars;
 
             /// <summary>填进去的位里对的位数。</summary>
             public int FilledOk;
 
-            /// <summary>4 位全部达标的图数 / 其中 4 位全对的图数。</summary>
+            /// <summary>填得进去的图数 / 其中 4 位全对的图数。</summary>
             public int ImagesAllFilled;
             public int ImagesAllFilledOk;
 
@@ -621,11 +648,23 @@ namespace CampusNetHelper
             /// </summary>
             public int FillViolations;
 
-            public double RawCharRate { get { return CharTotal == 0 ? 0 : (double)RawCharOk / CharTotal; } }
+            /// <summary>
+            /// 提示语点名"最可疑的那一位"的点名质量：
+            ///   FlaggedWrong —— 填错了的图里，被点名的那一位**确实**是错的（点对了）
+            ///   FlaggedTotal —— 填错了的图里，被点名了的总数
+            /// 这个数很要紧：如果点名的位置经常不是错的那个，那这句提示就是在误导人，
+            /// 还不如不点。所以要量，不能想当然。
+            /// </summary>
+            public int FlaggedWrong;
+            public int FlaggedTotal;
+
             public double FillRate { get { return CharTotal == 0 ? 0 : (double)FilledChars / CharTotal; } }
             public double FillCharRate { get { return FilledChars == 0 ? 0 : (double)FilledOk / FilledChars; } }
             public double FillImageRate { get { return ImagesAllFilled == 0 ? 0 : (double)ImagesAllFilledOk / ImagesAllFilled; } }
             public double FillImageCoverage { get { return Images == 0 ? 0 : (double)ImagesAllFilled / Images; } }
+
+            /// <summary>点名命中率：出错时，点名的那一位真是错的那一位的比例。</summary>
+            public double FlagHitRate { get { return FlaggedTotal == 0 ? 0 : (double)FlaggedWrong / FlaggedTotal; } }
         }
 
         /// <summary>
@@ -633,10 +672,11 @@ namespace CampusNetHelper
         /// 标签取文件名（去掉扩展名）的**最后 4 个字符**，正好同时适配
         /// cc-000-SK84.png 和 yyyyMMdd-HHmmss-fff-SK84.png 两种命名。
         ///
-        /// 同时给出两组数，缺一组都会误导人：
-        ///   ① RawCharRate —— 不看闸门、总是取 top1，衡量"识别能力"本身
-        ///   ② FillCharRate / FillImageRate —— 真会填进框里的那部分有多准
-        /// 只报 ① 会掩盖"其实大部分时候不敢填"；只报 ② 会变成自说自话。
+        /// 报三组数，缺一组都会误导人：
+        ///   ① 填入的位里对多少 —— 识别能力 + 现在总是填，这就是用户体验到的准确率
+        ///   ② 整图全对率 —— 用户"改了 0 下"就能过的比例
+        ///   ③ 点名命中率 —— 提示语让他重点看的那一位，是不是真的就是错的
+        /// 另外无条件断言"绝不放非字母数字进输入框"（FillViolations 必须为 0）。
         /// </summary>
         public static Accuracy MeasureDirectory(string dir, out string error)
         {
@@ -675,30 +715,36 @@ namespace CampusNetHelper
                     acc.FillViolations++;
 
                 acc.Images++;
-                bool allFilled = true, allFilledOk = true;
+
+                // 现在的策略是"总是填 4 位"：FillCandidate 非空就算填进去了。
+                bool didFill = (fill.Length != 0);
+                bool allOk = true;
                 for (int k = 0; k < 4; k++)
                 {
                     acc.CharTotal++;
                     SlotResult s = r.Slots[k];
+                    bool charOk = (s != null && s.Best == label[k]);
+                    if (!charOk) allOk = false;
 
-                    if (s != null && s.Best == label[k]) acc.RawCharOk++;
-
-                    if (s != null && s.Accepted)
+                    if (didFill)
                     {
                         acc.FilledChars++;
-                        if (s.Best == label[k]) acc.FilledOk++;
-                        else allFilledOk = false;
-                    }
-                    else
-                    {
-                        allFilled = false;
-                        allFilledOk = false;
+                        if (charOk) acc.FilledOk++;
                     }
                 }
-                if (allFilled)
+
+                if (didFill)
                 {
                     acc.ImagesAllFilled++;
-                    if (allFilledOk) acc.ImagesAllFilledOk++;
+                    if (allOk) acc.ImagesAllFilledOk++;
+                    else if (r.WeakestIndex >= 0)
+                    {
+                        // 出错了，看点名的那一位是不是真的就是错的那一位
+                        acc.FlaggedTotal++;
+                        if (r.Slots[r.WeakestIndex] == null
+                            || r.Slots[r.WeakestIndex].Best != label[r.WeakestIndex])
+                            acc.FlaggedWrong++;
+                    }
                 }
             }
 
@@ -710,14 +756,32 @@ namespace CampusNetHelper
         // 给界面用的一句话结论（措辞见红线 2/3：永远提醒"要你核对"）
         // ==================================================================
 
+        /// <summary>
+        /// 提示语。措辞原则见红线 2/3：**永远提醒"要你核对"**，绝不暗示已经填对了。
+        ///
+        /// 现在会点名最可疑的那一位 —— 这是"总是填 4 位"能成立的前提：
+        /// 用户注意力有限，告诉他该重点盯哪儿，比让他 4 位平均用力有用得多。
+        ///
+        /// ⚠️ 但点名**只是提示，不是保证**。实测（30 张样本）点名命中率 60%，
+        ///    随机点名是 25% —— 有用，但远不到"点中的那位就是唯一的错"。
+        ///    所以每句话都必须带"4 位都请核对"，绝不能写成"其余没问题"。
+        ///    写错这一句的代价是：用户信了提示、漏看别处、提交、学校端记一次登录失败。
+        /// </summary>
         public static string DescribeForUser(Result r)
         {
             if (r == null) return "识别失败，请手动填写。";
             if (r.Error.Length > 0) return "识别不可用（" + r.Error + "），请手动填写。";
-            if (!r.AllAccepted)
-                return "这张认不准（4 位里有把握的只有 " + r.AcceptedCount
-                     + " 位），没有替你填 —— 请手动填写。";
-            return "已填入识别候选（可能错），请核对后手动点登录。";
+            if (FillCandidate(r).Length == 0) return "这张认不出来，请手动填写。";
+
+            // 第几位 = 人从 1 数起
+            string pos = (r.WeakestIndex >= 0) ? ("第 " + (r.WeakestIndex + 1) + " 位") : "某一位";
+
+            if (r.WeakestMargin < 0.05)
+                return "已填入识别候选（可能错）。相对最没把握的是" + pos
+                     + "，4 位都请核对，尤其它。";
+            if (r.WeakestMargin < 0.15)
+                return "已填入识别候选（可能错）。" + pos + "相对不稳，4 位都请核对。";
+            return "已填入识别候选（可能错），4 位都请核对后手动点登录。";
         }
     }
 }

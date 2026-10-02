@@ -1478,6 +1478,7 @@ namespace CampusNetHelper
             if (n != 1152)
             {
                 W("!! 模板库条数不对 —— 模板数据可能没编进来，或被生成脚本改坏了");
+                W("结果：失败 —— 模板库条数 " + n + "，期望 1152");
                 return;
             }
             W("OK 模板库能加载");
@@ -1508,34 +1509,47 @@ namespace CampusNetHelper
             W("样本目录 = " + dir + "（来自 " + src + "）");
             W("样本 " + a.Images + " 张 / 共 " + a.CharTotal + " 位字符");
             W("");
-            W("① 识别能力（不看闸门，总是取 top1）");
-            W("   字符准确率 = " + a.RawCharOk + "/" + a.CharTotal
-                + " = " + a.RawCharRate.ToString("P1") + "   （验收线 70%）");
-            W("");
-            W("② 实际填给用户的（过闸门才填）");
-            W("   填入 " + a.FilledChars + "/" + a.CharTotal + " 位 = "
-                + a.FillRate.ToString("P1") + " 的位");
-            W("   填入的位里对 " + a.FilledOk + "/" + a.FilledChars
-                + " = " + a.FillCharRate.ToString("P1"));
-            W("   4 位全达标的图 " + a.ImagesAllFilled + "/" + a.Images
+            W("① 填给用户的候选准不准（策略：总是填 4 位 top1）");
+            W("   填得进去的图 " + a.ImagesAllFilled + "/" + a.Images
                 + " 张（覆盖 " + a.FillImageCoverage.ToString("P1") + "）");
-            W("   这些图里 4 位全对 " + a.ImagesAllFilledOk + "/" + a.ImagesAllFilled
-                + " = " + a.FillImageRate.ToString("P1"));
+            W("   填入的位里对 " + a.FilledOk + "/" + a.FilledChars
+                + " = " + a.FillCharRate.ToString("P1") + "   （验收线 70%）");
+            W("   其中 4 位全对（用户一下都不用改）" + a.ImagesAllFilledOk + "/"
+                + a.ImagesAllFilled + " = " + a.FillImageRate.ToString("P1"));
+            W("");
+            W("② 点名质量：出错时，点名让他重点看的那一位，真是错的那一位吗");
+            W("   " + a.FlaggedWrong + "/" + a.FlaggedTotal
+                + " = " + a.FlagHitRate.ToString("P1")
+                + "   （越高越好；若明显偏低，这句提示就是在误导人，应去掉）");
             W("");
             W("③ 不变量：填进输入框的只能是「空串」或「4 位字母数字」");
             W("   违规次数 = " + a.FillViolations + "（必须为 0）");
-            if (a.FillViolations > 0)
-                W("!! 有内容会被填进输入框却不是 4 位字母数字 —— 用户会看到问号之类的东西");
 
+            // ⚠️ 每个用例都必须打一行"结果："，否则它不会进入通过/失败统计 ——
+            //    release_sync.py 就是数这一行来判断自测过没过的。
+            //    （2026-10-03 踩到：新用例忘了打印，于是"15/15 通过"里根本没有它。）
+            if (a.FillViolations > 0)
+            {
+                W("!! 有内容会被填进输入框却不是 4 位字母数字 —— 用户会看到问号之类的东西");
+                W("结果：失败 —— 填入内容不变量被破坏 " + a.FillViolations + " 次");
+                return;
+            }
             if (a.CharTotal < 40)
             {
                 W("样本偏少（<10 张），只报数不下结论。");
+                W("结果：通过（样本少，只验了不变量）—— " + a.Images + " 张样本");
                 return;
             }
-            if (a.RawCharRate < 0.70)
-                W("!! 识别字符准确率 " + a.RawCharRate.ToString("P1") + " 低于验收线 70%");
-            else
-                W("OK 识别字符准确率 " + a.RawCharRate.ToString("P1") + " 达标（验收线 70%）");
+            if (a.FillCharRate < 0.70)
+            {
+                W("!! 填入字符准确率 " + a.FillCharRate.ToString("P1") + " 低于验收线 70%");
+                W("结果：失败 —— 填入字符准确率 " + a.FillCharRate.ToString("P1") + " 低于 70%");
+                return;
+            }
+            W("OK 填入字符准确率 " + a.FillCharRate.ToString("P1") + " 达标（验收线 70%）");
+            W("结果：通过 —— 填入字符准确率 " + a.FillCharRate.ToString("P1")
+                + "、整图全对 " + a.FillImageRate.ToString("P1")
+                + "、不变量违规 0 次（" + a.Images + " 张样本）");
         }
 
         private static void TestCaptchaPipeline()
