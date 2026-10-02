@@ -105,8 +105,15 @@ namespace CampusNetHelper
         /// </summary>
         private const int MaxShift = 10;
 
-        /// <summary>判"这个色是不是本槽的字符色"用的种子下限（2x2 腐蚀后剩几个像素）。</summary>
-        private const int MinSeeds = 2;
+        /// <summary>
+        /// 曾经用来判"这个色是不是本槽的字符色"的种子下限（2x2 腐蚀后剩几个像素）。
+        ///
+        /// ⚠️ 2026-10-03 已**不再使用**，留着是为了让后来的人知道这里踩过什么坑：
+        ///    当时拿"种子数 &lt; 2 就放弃这一位"当闸门，结果海辰反馈
+        ///    "我看得非常清楚，它却说无法识别" —— 种子少只代表笔画不够粗，
+        ///    不代表这里没有字符。放弃的唯一正当理由是"根本没有墨迹"。
+        /// </summary>
+        // private const int MinSeeds = 2;
 
         /// <summary>
         /// 置信度闸门：4 位里**最小**的那个 (top1 - top2) 差值。
@@ -302,6 +309,23 @@ namespace CampusNetHelper
             return CaptchaAssist.IsValidCaptchaText(r.Text) ? r.Text : "";
         }
 
+        /// <summary>
+        /// 有几位连字符都没切出来（Text 里是 '?'）。
+        ///
+        /// 为什么要单独数这个：只有它 &gt; 0 时 FillCandidate 才会返回空串。
+        /// 而旧代码把这种情况也写成"置信度不足"，害得日志和现实对不上 ——
+        /// 海辰反馈"看得清却说认不出"，我照日志去查"置信度"，方向一开始就错了。
+        /// 现在把"没切出字符"和"认出来但没把握"分开报。
+        /// </summary>
+        public static int UnreadableCount(Result r)
+        {
+            if (r == null) return 4;
+            int n = 0;
+            for (int i = 0; i < r.Text.Length; i++)
+                if (r.Text[i] == '?') n++;
+            return n;
+        }
+
         // ==================================================================
         // 入口
         // ==================================================================
@@ -494,17 +518,29 @@ namespace CampusNetHelper
             // ---- 1. 选色：窗口内哪个色的"粗像素"最多，哪个就是这个字符 ----
             // 判据是 2x2 腐蚀后的存活像素数（种子）。实测字符有 20~50 个种子，
             // 干扰线 0~2 个 —— 这是全流程里最干净的一个判别量。
+            //
+            // ⚠️ 2026-10-03 改了"放弃"的条件（海辰反馈"我看得很清楚，它却说无法识别"）：
+            //    以前是"种子数 < 2 就放弃这一位"，那是错的门槛 ——
+            //    种子少只说明"这条笔画不够粗"，不等于"这里没有字符"。
+            //    放弃的条件只应该是"这里根本没有墨迹"。
+            //    猜错的代价是他核对时改一个字符；什么都不给的代价是他整张手敲。
+            //    这两者不对等，所以宁可猜。选中色相同时按像素数多者优先。
             int bestColor = -1;
             int bestSeeds = -1;
-            int[] seedsOf = new int[PaletteNames.Length];
+            int bestPixels = -1;
             for (int k = 0; k < PaletteNames.Length; k++)
             {
                 int s = CountSeeds(cls, w, h, x0, x1, k);
-                seedsOf[k] = s;
-                if (s > bestSeeds) { bestSeeds = s; bestColor = k; }
+                int px = CountPixels(cls, w, h, x0, x1, k);
+                if (s > bestSeeds || (s == bestSeeds && px > bestPixels))
+                {
+                    bestSeeds = s;
+                    bestPixels = px;
+                    bestColor = k;
+                }
             }
             sr.Seeds = bestSeeds;
-            if (bestColor < 0 || bestSeeds < MinSeeds) return sr;   // 这槽是空的（页面改版/图没画完）
+            if (bestColor < 0 || bestPixels < 6) return sr;   // 真没东西可认
             sr.Color = PaletteNames[bestColor];
 
             // ---- 2. 取观测：窗口内该色的全部像素，裁到墨迹外框 ----
@@ -516,7 +552,7 @@ namespace CampusNetHelper
             int aw, ah, aArea;
             if (!BuildObs(cls, w, h, x0, x1, bestColor, out aRows, out aw, out ah, out aArea))
                 return sr;
-            if (aArea < 20) return sr;      // 太小，不像字符
+            if (aArea < 8) return sr;      // 只剩零星几个像素，认了也是瞎猜
 
             // ---- 3. 与模板库比对 ----
             double[] bestScore = new double[CaptchaTemplates.Charset.Length];
@@ -570,6 +606,22 @@ namespace CampusNetHelper
                     if (cls[i + w + 1] != color) continue;
                     n++;
                 }
+            }
+            return n;
+        }
+
+        /// <summary>
+        /// 窗口内某个色有多少像素。用来给选色做平手裁决 ——
+        /// 两个色种子数一样时，像素多的那个更可能是字符（干扰线又细又短）。
+        /// </summary>
+        private static int CountPixels(int[] cls, int w, int h, int x0, int x1, int color)
+        {
+            int n = 0;
+            for (int y = 0; y < h; y++)
+            {
+                int baseIdx = y * w;
+                for (int x = x0; x < x1; x++)
+                    if (cls[baseIdx + x] == color) n++;
             }
             return n;
         }
@@ -799,6 +851,10 @@ namespace CampusNetHelper
         {
             if (r == null) return "识别失败，请手动填写。";
             if (r.Error.Length > 0) return "识别不可用（" + r.Error + "），请手动填写。";
+
+            int unread = UnreadableCount(r);
+            if (unread > 0)
+                return "这张有 " + unread + " 个字符没认出来（图已存本机备查），请手动填写。";
             if (FillCandidate(r).Length == 0) return "这张认不出来，请手动填写。";
 
             // 第几位 = 人从 1 数起

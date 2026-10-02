@@ -1096,14 +1096,31 @@ namespace CampusNetHelper
                 // ⚠️ 要填什么**只能**问 FillCandidate()，不能直接用 r.Text。
                 //    2026-10-03 的教训：直接用 Text 会把 "A?3?" 填进验证码框
                 //    （逐位闸门放过 2 位，Text 里就留着 '?'）。用户看到问号一脸问号。
-                //    FillCandidate 要求四位全部达标，且结果必须是 4 位字母数字。
+                //    现在策略是"总是填 4 位 top1"，只有某位连字符都没切出来才整体不填。
                 string fill = CaptchaOcr.FillCandidate(r);
                 if (fill.Length == 0)
                 {
+                    int unread = CaptchaOcr.UnreadableCount(r);
+
+                    // 失败必须留证。2026-10-03 海辰说"我看得很清楚，它却说无法识别"，
+                    // 而失败的那张图当时没留下来 —— 我只能靠日志猜，方向一开始就偏了。
+                    // 这里补上：把原图存到 captcha-fails\（与带答案的样本目录分开，
+                    // 免得没答案的图被当成带标签样本污染准确率统计）。
+                    if (CaptchaAssist.SampleCollectEnabled(ConfigStore.LoadSettings()))
+                    {
+                        string ferr;
+                        CaptchaAssist.SaveFailImage(_captchaPng, unread + "unread", out ferr);
+                    }
+
                     SetCaptchaHint(CaptchaOcr.DescribeForUser(r));
-                    Log.Info("验证码识别：置信度不足，未填入（达标 "
-                             + r.AcceptedCount + "/4，最小 margin="
-                             + r.MinMargin.ToString("0.###") + "）");
+
+                    // 日志要把"没切出字符"和"认出来但没把握"分开说 ——
+                    // 旧版一律写"置信度不足"，害得排查的人（就是我）往错的方向找。
+                    Log.Info("验证码识别：未填入 —— "
+                             + (unread > 0 ? ("有 " + unread + " 位没切出字符")
+                                           : "结果不是 4 位字母数字")
+                             + "（识别到 \"" + r.Text + "\"，达标 " + r.AcceptedCount
+                             + "/4，最小 margin=" + r.MinMargin.ToString("0.###") + "）");
                     return;
                 }
 

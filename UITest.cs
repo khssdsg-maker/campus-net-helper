@@ -1483,6 +1483,57 @@ namespace CampusNetHelper
             }
             W("OK 模板库能加载");
 
+            // ---- 不依赖样本的确定性检查 ----
+            // 用一张纯白图造出"4 位一个都切不出来"的极端情况，验证两件事：
+            //   ① 不会硬猜（UnreadableCount 必须是 4）
+            //   ② 更不会把非字母数字填进输入框（FillCandidate 必须是空串）
+            // 这一条不需要任何样本文件就能跑，所以它永远在守着那条不变量。
+            try
+            {
+                using (System.Drawing.Bitmap blank = new System.Drawing.Bitmap(80, 24))
+                {
+                    using (System.Drawing.Graphics g = System.Drawing.Graphics.FromImage(blank))
+                        g.Clear(System.Drawing.Color.White);
+                    CaptchaOcr.Result rb = CaptchaOcr.Recognize(blank);
+                    int ur = CaptchaOcr.UnreadableCount(rb);
+                    string fb = CaptchaOcr.FillCandidate(rb);
+                    W("空白图：未切出=" + ur + "（期望 4）FillCandidate=\"" + fb
+                        + "\"（期望空串）Text=\"" + rb.Text + "\"");
+                    if (ur != 4 || fb.Length != 0)
+                    {
+                        W("!! 空白图不该被硬猜出内容，更不该有任何东西被填进去");
+                        W("结果：失败 —— 空白图破坏了「绝不填非法字符」这条不变量");
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                W("!! 空白图检查异常: " + ex.Message);
+            }
+
+            // ---- 失败留证机制本身要能用 ----
+            // 这是我下次排查的唯一凭据，它自己坏了就白搭。
+            // 只碰 captcha-fails 目录，写完立刻删掉，不留痕迹。
+            try
+            {
+                int before = CaptchaAssist.CountFails();
+                string ferr;
+                string fpath = CaptchaAssist.SaveFailImage(new byte[] { 1, 2, 3 }, "selftest", out ferr);
+                int after = CaptchaAssist.CountFails();
+                bool wrote = (fpath.Length > 0) && System.IO.File.Exists(fpath);
+                if (wrote) System.IO.File.Delete(fpath);
+                int back = CaptchaAssist.CountFails();
+                W("失败留证：写成功=" + wrote + " 计数 " + before + "→" + after
+                    + "→" + back + "（期望 +1 后回到原值）");
+                if (!wrote || after != before + 1 || back != before)
+                    W("!! 失败留证不正常 —— 下次再遇到认不出就没有凭据可查了");
+            }
+            catch (Exception ex)
+            {
+                W("!! 失败留证检查异常: " + ex.Message);
+            }
+
             string dir = Environment.GetEnvironmentVariable("CNH_OCR_FIXTURES");
             string src = "环境变量 CNH_OCR_FIXTURES";
             if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir))

@@ -355,8 +355,7 @@ namespace CampusNetHelper
             {
                 if (!Directory.Exists(SamplesDir)) return 0;
                 return Directory.GetFiles(SamplesDir, "*.png").Length;
-            }
-            catch { return 0; }
+            }            catch { return 0; }
         }
 
         /// <summary>
@@ -423,6 +422,98 @@ namespace CampusNetHelper
                 if (stem[i] < '0' || stem[i] > '9') return false;
             }
             return IsValidCaptchaText(stem.Substring(20));
+        }
+
+        // ==================================================================
+        // 识别失败时留下的图（诊断用）
+        //
+        // 为什么要单独存一份：2026-10-03 海辰反馈"我看得很清楚，它却说无法识别"，
+        // 而**那张失败的图没留下来**，我只能靠猜 —— 这不可接受。
+        // 失败样本必须留证，否则同一个问题会反复发生、反复查不到。
+        //
+        // ⚠️ 故意放在**另一个目录**（captcha-fails），不能混进 captcha-samples：
+        //    那个目录里文件名末 4 位是"标准答案"，自测要靠它量准确率。
+        //    失败图没有答案，混进去会被当成带标签样本，把准确率算歪。
+        //
+        // 与样本采集共用同一个开关 —— 用户关掉采集，这里也一起关。
+        // ==================================================================
+
+        private const string FailDirName = "captcha-fails";
+
+        /// <summary>失败图保留条数上限。一张约 1.4KB，200 张 ≈ 280KB。</summary>
+        public const int KeepNewestFails = 200;
+
+        public static string FailsDir
+        {
+            get { return Path.Combine(ConfigStore.AppDataDir, FailDirName); }
+        }
+
+        /// <summary>
+        /// 存一张"没认出来"的验证码原图。note 写清楚当时的情况（几位没切出来）。
+        /// 文件名：fail-yyyyMMdd-HHmmss-fff-&lt;note&gt;.png
+        /// </summary>
+        public static string SaveFailImage(byte[] png, string note, out string error)
+        {
+            error = "";
+            if (png == null || png.Length == 0) { error = "没有图片数据"; return ""; }
+            try
+            {
+                Directory.CreateDirectory(FailsDir);
+                string safe = (note == null) ? "" : note.Replace(" ", "").Replace("/", "_");
+                string name = "fail-"
+                            + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture)
+                            + "-" + safe + ".png";
+                string path = Path.Combine(FailsDir, name);
+                File.WriteAllBytes(path, png);
+                PruneFails(KeepNewestFails);
+                Log.Info("验证码识别失败，已留存图片: " + name);
+                return path;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return "";
+            }
+        }
+
+        /// <summary>只清自己这个目录里、以 fail- 开头的 png，别的一概不碰。</summary>
+        public static int PruneFails(int keepNewest)
+        {
+            try
+            {
+                if (keepNewest < 20) return 0;
+                if (!Directory.Exists(FailsDir)) return 0;
+                string[] files = Directory.GetFiles(FailsDir, "fail-*.png");
+                if (files.Length <= keepNewest) return files.Length;
+
+                List<string> list = new List<string>(files);
+                list.Sort(delegate(string a, string b)
+                {
+                    return string.CompareOrdinal(Path.GetFileName(b), Path.GetFileName(a));
+                });
+                for (int i = keepNewest; i < list.Count; i++)
+                {
+                    try
+                    {
+                        if (string.Equals(Path.GetDirectoryName(list[i]), FailsDir,
+                                          StringComparison.OrdinalIgnoreCase))
+                            File.Delete(list[i]);
+                    }
+                    catch { }
+                }
+                return keepNewest;
+            }
+            catch { return 0; }
+        }
+
+        public static int CountFails()
+        {
+            try
+            {
+                if (!Directory.Exists(FailsDir)) return 0;
+                return Directory.GetFiles(FailsDir, "fail-*.png").Length;
+            }
+            catch { return 0; }
         }
     }
 }
