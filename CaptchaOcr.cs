@@ -5,6 +5,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 
 namespace CampusNetHelper
 {
@@ -114,17 +115,24 @@ namespace CampusNetHelper
         /// 同一字符干净时 0.9、被线穿过时 0.7，拿绝对值当阈值会把好字符也挡掉。
         /// 而"第一名比第二名强多少"衡量的是**这一位本身有多含糊**。
         ///
-        /// 为什么取 4 位的最小值而不是逐位填：任务书要求"置信度不足就什么都不填"。
-        /// 往输入框里填 "A?3?" 这种残句对用户毫无意义，还会让他以为程序坏了。
-        /// 要么 4 位都给候选，要么一位都不给。
+        /// 单看"这一位值不值得信"的阈值：top1 与 top2 得分之差。
         ///
-        /// 0.03 是实测选的（30 张真实样本，位移半径 10）：
-        ///     阈值    填入张数   填入后整图全对率
-        ///     0.00     30/30        46.7%     ← 总是填，等于没闸门
-        ///     0.02     16           68.8%
-        ///     0.03     11           72.7%     ← 取这个：填入后全对率过 70% 验收线
-        ///     0.05      5           80.0%     ← 更准但只帮到 1/6 的人
-        /// 再往上（0.08）样本只剩 2 张，数字已经没有意义了。
+        /// 为什么用"差值"而不是"top1 的绝对值"：绝对分受干扰线多少影响很大，
+        /// 同一字符干净时 0.9、被线穿过时 0.7，拿绝对值当阈值会把好字符也挡掉。
+        /// 而"第一名比第二名强多少"衡量的是**这一位本身有多含糊**。
+        ///
+        /// ⚠️ 现在它**不再决定"填不填"** —— 2026-10-03 起策略改成"总是填 4 位 top1"
+        ///    （见 FillCandidate）。它现在的用途有两个：
+        ///      ① 统计 AcceptedCount，供诊断与自测
+        ///      ② 提示语里点名"最没把握的那一位"时，用它分档决定措辞的强弱
+        ///
+        /// 0.03 这个数是实测选的（30 张真实样本，位移半径 10）：
+        ///     阈值    判定达标的张数   这些张里整图全对率
+        ///     0.00     30/30              46.7%
+        ///     0.02     16                 68.8%
+        ///     0.03     11                 72.7%
+        ///     0.05      5                 80.0%
+        /// 再往上（0.08）样本只剩 2 张，数字已经没有意义。
         /// </summary>
         public const double MinMargin = 0.03;
 
@@ -146,7 +154,10 @@ namespace CampusNetHelper
             if (_loaded) return;
             _loaded = true;
 
-            byte[] d = CaptchaTemplates.Data();
+            // 模板数据是 deflate 压缩后再 base64 存的 —— 必须先解压。
+            // 不压的话 .NET 的 UTF-16 字符串常量会把这 67.5KB 撑成约 380KB 的 exe 增量
+            // （实测：压缩后 exe 少掉约 300KB）。
+            byte[] d = Inflate(CaptchaTemplates.Data());
             List<byte> idx = new List<byte>();
             List<uint[]> rows = new List<uint[]>();
             List<int> ws = new List<int>();
@@ -183,6 +194,23 @@ namespace CampusNetHelper
             _w = ws.ToArray();
             _h = hs.ToArray();
             _area = ar.ToArray();
+        }
+
+        /// <summary>
+        /// 解开 CaptchaTemplates 里那份 deflate 压缩过的模板数据。
+        /// System.IO.Compression 本来就在 build.rsp 的引用清单里（零依赖约束不受影响）。
+        /// </summary>
+        private static byte[] Inflate(byte[] packed)
+        {
+            using (MemoryStream src = new MemoryStream(packed))
+            using (DeflateStream ds = new DeflateStream(src, CompressionMode.Decompress))
+            using (MemoryStream dst = new MemoryStream())
+            {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = ds.Read(buf, 0, buf.Length)) > 0) dst.Write(buf, 0, n);
+                return dst.ToArray();
+            }
         }
 
         private static int PopCount(uint v)
