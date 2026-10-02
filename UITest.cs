@@ -38,6 +38,13 @@ namespace CampusNetHelper
 
         public static string Run()
         {
+            // ⚠️ 自测会开认证窗口、会写设置与历史 —— 那些都是**用户的真实数据**。
+            //    2026-10-03 实测踩到：跑完自测，settings.txt 里的 WebAuthUrl 变成了
+            //    http://127.0.0.1:43792/login（自测临时起的小站，早就关了），
+            //    历史里也多出好几条假的"认证有效"。上一轮只清了网址清单，漏了设置。
+            //    所以这里改成整体兜底：跑之前把数据目录快照一份，跑完**原样放回**。
+            //    新加用例不必再各自记得清场 —— 要的是"默认安全"，不是"记得小心"。
+            DataSnapshot snap = new DataSnapshot(ConfigStore.AppDataDir);
             try
             {
                 W("================ 界面自测 开始 ================");
@@ -66,7 +73,72 @@ namespace CampusNetHelper
             {
                 W("!! 自测自身异常: " + ex);
             }
+            finally
+            {
+                bool restored = snap.Restore();
+                W("");
+                W("用户数据已还原 = " + restored + "（快照 " + snap.FileCount + " 个文件）");
+            }
             return Report.ToString();
+        }
+
+        /// <summary>
+        /// 自测期间用户数据文件的快照。跑完把数据目录恢复到跑之前的样子：
+        ///   · 跑之前就有的文件 -> 按原字节写回
+        ///   · 自测期间新建的文件 -> 删掉
+        /// 只处理数据目录下的**文件**；logs\ 与 captcha-samples\ 是子目录，不受影响
+        /// （自测本来就要读用户的验证码样本来量准确率）。
+        /// </summary>
+        private sealed class DataSnapshot
+        {
+            private readonly string _dir;
+            private readonly Dictionary<string, byte[]> _files = new Dictionary<string, byte[]>();
+
+            public DataSnapshot(string dir)
+            {
+                _dir = dir;
+                try
+                {
+                    if (!System.IO.Directory.Exists(dir)) return;
+                    string[] all = System.IO.Directory.GetFiles(dir);
+                    for (int i = 0; i < all.Length; i++)
+                    {
+                        try { _files[System.IO.Path.GetFileName(all[i])] = System.IO.File.ReadAllBytes(all[i]); }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+
+            public int FileCount { get { return _files.Count; } }
+
+            public bool Restore()
+            {
+                try
+                {
+                    if (!System.IO.Directory.Exists(_dir)) return false;
+
+                    // 先删掉自测期间新产生的文件
+                    string[] now = System.IO.Directory.GetFiles(_dir);
+                    for (int i = 0; i < now.Length; i++)
+                    {
+                        string name = System.IO.Path.GetFileName(now[i]);
+                        if (!_files.ContainsKey(name))
+                        {
+                            try { System.IO.File.Delete(now[i]); } catch { }
+                        }
+                    }
+
+                    // 再把快照按原字节写回
+                    foreach (KeyValuePair<string, byte[]> kv in _files)
+                    {
+                        try { System.IO.File.WriteAllBytes(System.IO.Path.Combine(_dir, kv.Key), kv.Value); }
+                        catch { }
+                    }
+                    return true;
+                }
+                catch { return false; }
+            }
         }
 
         /// <summary>
