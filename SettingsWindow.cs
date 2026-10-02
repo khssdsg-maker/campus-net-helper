@@ -24,6 +24,8 @@ namespace CampusNetHelper
         private TextBox txtTimeOffEnd;
         /// <summary>检查更新开关（C5）。它跟连接行为完全无关，所以单独存、不进 ApplySettings 那串参数。</summary>
         private CheckBox chkCheckUpdate;
+        /// <summary>验证码样本采集开关（C9）。同上，单独存。</summary>
+        private CheckBox chkCaptchaSample;
         private TextBox txtInterval;
         private CheckBox chkKeepAlive;
         private TextBox txtKeepAlive;
@@ -470,6 +472,24 @@ namespace CampusNetHelper
 
             stack.Children.Add(rowUpd);
 
+            // ---------- 验证码样本采集（C9）----------
+            // 和"检查更新"一样，跟连接行为完全无关，所以单独存、不进 ApplySettings 那串参数。
+            // 默认**开着** —— 关着就永远攒不到带标签的样本，识别那一步也就无从谈起。
+            // 但必须给一个明确的开关和一句实话：只存本机、不联网。
+            var rowCap = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(0, 10, 0, 0)
+            };
+            chkCaptchaSample = MakeCheck("记下验证码样本（只存本机，不联网上传）", true);
+            chkCaptchaSample.Margin = new Thickness(0, 0, 0, 0);
+            chkCaptchaSample.VerticalAlignment = VerticalAlignment.Center;
+            chkCaptchaSample.ToolTip = "登录成功时，把「当时那张验证码图 + 你填的 4 位」存到本机，"
+                + "用于以后做验证码识别。存在 %AppData%\\CampusNetHelper\\captcha-samples\\，"
+                + "不上传、不影响登录。随时可以关掉。";
+            rowCap.Children.Add(chkCaptchaSample);
+            stack.Children.Add(rowCap);
+
             var btnSave = MainWindow.MakeButton("保存并校验设置（本页已自动保存）",
                 Theme.Accent, Theme.OnAccent, Theme.Accent, SaveToOwner);
             btnSave.HorizontalAlignment = HorizontalAlignment.Left;
@@ -594,6 +614,12 @@ namespace CampusNetHelper
             if (chkCheckUpdate != null)
                 chkCheckUpdate.Unchecked += delegate { SaveCheckUpdateFlag(); };
 
+            // 验证码样本采集（C9）：同上，单独存
+            if (chkCaptchaSample != null)
+                chkCaptchaSample.Checked += delegate { SaveCaptchaSampleFlag(); };
+            if (chkCaptchaSample != null)
+                chkCaptchaSample.Unchecked += delegate { SaveCaptchaSampleFlag(); };
+
             // 数字/文本输入框：失焦时才触发，避免边打字边存
             if (txtInterval != null)
                 txtInterval.LostFocus += delegate { RequestAutoSave(); };
@@ -697,6 +723,27 @@ namespace CampusNetHelper
         }
 
         /// <summary>
+        /// 存"验证码样本采集"这个开关。做法和 SaveCheckUpdateFlag 完全一致
+        /// （同样与连接行为无关，同样单独读-合并-写）。
+        /// </summary>
+        private void SaveCaptchaSampleFlag()
+        {
+            if (_loading) return;
+            try
+            {
+                System.Collections.Generic.Dictionary<string, string> disk = ConfigStore.LoadSettings();
+                ConfigStore.SetBool(disk, CaptchaAssist.SampleCollectKey, chkCaptchaSample.IsChecked == true);
+                string msg;
+                ConfigStore.SaveSettings(disk, out msg);
+                SetSaveHint("已自动保存 ✓");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("保存验证码采集开关失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 存"检查更新"这个开关。
         ///
         /// ⚠️ 它没走 ApplySettings 那串参数（2026-10-02）：那个方法有十几个参数，
@@ -763,6 +810,7 @@ namespace CampusNetHelper
                 txtTimeOffEnd.Text = owner.TimeOffEnd();
 
                 chkCheckUpdate.IsChecked = UpdateChecker.Enabled(ConfigStore.LoadSettings());
+                chkCaptchaSample.IsChecked = CaptchaAssist.SampleCollectEnabled(ConfigStore.LoadSettings());
 
                 // 认证方式
                 bool portal = owner.IsPortalMode();

@@ -6,6 +6,7 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using System.Windows.Forms.Integration;
 using Microsoft.Win32;
@@ -62,6 +63,45 @@ namespace CampusNetHelper
 
         private bool _autoDoneThisLoad = false;
         private int _loadToken = 0;
+
+        // ------------------------------------------------------------------
+        // 验证码辅助（C9 第一阶段：放大 + 换一张 + 带标签采集）
+        // 细节见 CaptchaAssist.cs 的类注释；这里只放"界面状态"。
+        // ------------------------------------------------------------------
+
+        /// <summary>放大后的验证码图。原图只有 80×24，放大是为了让人一眼看清。</summary>
+        private const int CaptchaZoomWidth = 320;    // 80 × 4
+        private const int CaptchaZoomHeight = 96;    // 24 × 4
+
+        /// <summary>验证码那一行（页面没有验证码时整行折叠，不留空档）。</summary>
+        private StackPanel rowCaptcha;
+        private Image imgCaptcha;
+        private TextBlock lblCaptchaHint;
+
+        /// <summary>当前这张验证码的原始 PNG 字节。采集样本要用它（必须和用户填的那 4 位是同一张）。</summary>
+        private byte[] _captchaPng;
+
+        /// <summary>用户当前填在验证码框里的内容（每秒读一次）。</summary>
+        private string _captchaTyped = "";
+
+        /// <summary>每秒读一次"用户填了什么"。</summary>
+        private DispatcherTimer _captchaTypedTimer;
+
+        /// <summary>等图片真正下载完再抠图的短轮询。</summary>
+        private DispatcherTimer _captchaPoll;
+        private int _captchaPollLeft = 0;
+
+        /// <summary>手动点「重新抠图」失败时不要把整行藏掉（用户是主动来要结果的，得给他回话）。</summary>
+        private bool _captchaPollKeepRow = false;
+
+        /// <summary>
+        /// 本轮加载是否已经判定过样本。
+        ///
+        /// 为什么需要：判定样本用的是"上一轮填的验证码 + 这次页面跳转"，
+        /// 而 DocumentCompleted 可能因为 iframe 多次触发；同一次跳转只该判一次，
+        /// 否则会在几毫秒内连着存两条一样的样本。
+        /// </summary>
+        private bool _sampleTriedThisLoad = false;
 
         /// <summary>
         /// 「可访问文档 N 个」这条日志，最后一轮是第几轮加载时写的。
@@ -204,6 +244,13 @@ namespace CampusNetHelper
             {
                 try
                 {
+                    if (_captchaPoll != null) _captchaPoll.Stop();
+                    if (_captchaTypedTimer != null) _captchaTypedTimer.Stop();
+                }
+                catch { }
+
+                try
+                {
                     if (browser != null)
                     {
                         browser.Stop();
@@ -265,7 +312,8 @@ namespace CampusNetHelper
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 2 账号/密码
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 3 自动关闭
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 4 状态
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });  // 5 浏览器
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 5 验证码辅助（可折叠）
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });  // 6 浏览器
 
             // ---------- 第 1 行：认证网址 ----------
             // ⚠️ 这一行只放"下拉框 + 输入框 + 打开 + 存"。
@@ -451,7 +499,67 @@ namespace CampusNetHelper
             Grid.SetRow(statusBox, 4);
             root.Children.Add(statusBox);
 
-            // ---------- 第 6 行：浏览器 ----------
+            // ---------- 第 6 行：验证码辅助（页面没有验证码时整行折叠） ----------
+            // 为什么放在浏览器**上面**：验证码在网页里往往要滚动才看得见，
+            // 抠出来放大贴在窗口上方，用户不用在页面里找它。
+            rowCaptcha = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(0, 0, 0, 8),
+                Visibility = Visibility.Collapsed
+            };
+            rowCaptcha.Children.Add(MakeLabel("验证码"));
+
+            // 背景固定白：验证码图本身就是白底，跟着主题变会把它衬得看不清。
+            var shotWrap = new Border
+            {
+                Background = new SolidColorBrush(Colors.White),
+                BorderBrush = new SolidColorBrush(Theme.GlassBorder),
+                BorderThickness = new Thickness(1),
+                Width = CaptchaZoomWidth,
+                Height = CaptchaZoomHeight
+            };
+            imgCaptcha = new Image
+            {
+                Width = CaptchaZoomWidth,
+                Height = CaptchaZoomHeight,
+                Stretch = Stretch.Fill,
+                ToolTip = "这是页面上的验证码，放大 4 倍显示。看不清就点右边「换一张」"
+            };
+            // ⚠️ 必须用平滑（HighQuality）缩放，别改成 NearestNeighbor：
+            //    原图只有 80×24、干扰线本身就是 1px，最近邻会把噪点一起放大成方块，
+            //    实测比"页面自带的显示"更难认（2026-10-02 拿真图四种方案并排比过）。
+            RenderOptions.SetBitmapScalingMode(imgCaptcha, BitmapScalingMode.HighQuality);
+            shotWrap.Child = imgCaptcha;
+            rowCaptcha.Children.Add(shotWrap);
+
+            var btnNewCaptcha = MainWindow.MakeGhostButton("换一张", OnCaptchaRefresh);
+            btnNewCaptcha.FontSize = 12;
+            btnNewCaptcha.Margin = new Thickness(10, 0, 0, 0);
+            btnNewCaptcha.VerticalAlignment = VerticalAlignment.Top;
+            btnNewCaptcha.ToolTip = "让页面重新要一张验证码图（页面上的那格也会跟着变）";
+            rowCaptcha.Children.Add(btnNewCaptcha);
+
+            var btnAgainCaptcha = MainWindow.MakeGhostButton("重新抠图", delegate()
+            {
+                _captchaPollKeepRow = true;
+                StartCaptchaPoll(4);
+            });
+            btnAgainCaptcha.FontSize = 12;
+            btnAgainCaptcha.Margin = new Thickness(8, 0, 0, 0);
+            btnAgainCaptcha.VerticalAlignment = VerticalAlignment.Top;
+            btnAgainCaptcha.ToolTip = "页面自己刷新过图就点它，重新取一次当前的图";
+            rowCaptcha.Children.Add(btnAgainCaptcha);
+
+            lblCaptchaHint = MakeHint("");
+            lblCaptchaHint.Margin = new Thickness(12, 4, 0, 0);
+            lblCaptchaHint.MaxWidth = 300;
+            rowCaptcha.Children.Add(lblCaptchaHint);
+
+            Grid.SetRow(rowCaptcha, 5);
+            root.Children.Add(rowCaptcha);
+
+            // ---------- 第 7 行：浏览器 ----------
             browser = new System.Windows.Forms.WebBrowser();
             browser.ScriptErrorsSuppressed = true;
             browser.DocumentCompleted += OnDocumentCompleted;
@@ -473,7 +581,7 @@ namespace CampusNetHelper
                 BorderThickness = new Thickness(1),
                 Child = host
             };
-            Grid.SetRow(frame, 5);
+            Grid.SetRow(frame, 6);
             root.Children.Add(frame);
 
             Content = root;
@@ -770,6 +878,395 @@ namespace CampusNetHelper
         }
 
         // ==================================================================
+        // 验证码辅助：抠图 / 放大 / 换一张 / 采集样本
+        //
+        // 三条红线写在 CaptchaAssist.cs 的类注释里，这里只重复最要命的一条：
+        // **绝不自己带 cookie 重新请求 /CheckCode** —— 门户把答案绑在 session 上，
+        // 重请求会把页面正在显示的那张图作废，用户照图填必然错。
+        // 所以这里所有取图动作都只针对"页面已经加载好的那张图"。
+        // ==================================================================
+
+        /// <summary>等图片下载完再抠图（每 0.7 秒试一次，最多 rounds 次）。</summary>
+        private void StartCaptchaPoll(int rounds)
+        {
+            if (rowCaptcha == null) return;      // 窗口已经关掉了
+
+            if (_captchaPoll == null)
+            {
+                _captchaPoll = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
+                _captchaPoll.Tick += delegate(object s, EventArgs e)
+                {
+                    _captchaPollLeft--;
+                    if (TryCaptureCaptcha())
+                    {
+                        _captchaPoll.Stop();
+                        return;
+                    }
+                    if (_captchaPollLeft <= 0)
+                    {
+                        _captchaPoll.Stop();
+                        if (!_captchaPollKeepRow) HideCaptchaRow();
+                    }
+                };
+            }
+            _captchaPollLeft = rounds;
+            _captchaPoll.Start();
+        }
+
+        /// <summary>
+        /// 从页面里抠出验证码图并放大显示。页面没有验证码、或图还没下载完 → 返回 false。
+        /// </summary>
+        private bool TryCaptureCaptcha()
+        {
+            if (browser == null || imgCaptcha == null) return false;
+
+            string raw;
+            try
+            {
+                WinForms.HtmlDocument doc = browser.Document;
+                if (doc == null) return false;
+
+                doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildExtractJs() });
+                object ret = doc.InvokeScript("__cnhCaptchaCap");
+                raw = ret == null ? "" : ret.ToString();
+            }
+            catch (Exception ex)
+            {
+                // 只在最后一次尝试时留痕，否则这个轮询会自己把日志刷爆
+                if (_captchaPollLeft <= 1) Log.Warn("验证码取图脚本调用失败: " + ex.Message);
+                return false;
+            }
+
+            int w, h;
+            string b64, err;
+            if (!CaptchaAssist.TryParseShot(raw, out w, out h, out b64, out err))
+            {
+                // 「页面上本来就没有验证码」「图还没加载完」都是正常情况，不记日志
+                bool normal = err.IndexOf("no-img", StringComparison.Ordinal) >= 0
+                           || err.IndexOf("not-ready", StringComparison.Ordinal) >= 0;
+                if (!normal && _captchaPollLeft <= 1) Log.Warn("验证码取图失败: " + err);
+                return false;
+            }
+
+            try
+            {
+                byte[] png = Convert.FromBase64String(b64);
+                _captchaPng = png;
+                _captchaTyped = "";
+
+                imgCaptcha.Source = BitmapFrame.Create(
+                    new System.IO.MemoryStream(png), BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+
+                rowCaptcha.Visibility = Visibility.Visible;
+                SetCaptchaHint("看不清就点「换一张」。");
+
+                // 新的一张图 = 一次新的采集机会
+                _sampleTriedThisLoad = false;
+                StartCaptchaTypedWatch();
+
+                Log.Info("验证码已抠出（原图 " + w + "×" + h + "）");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("验证码图显示失败: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>每秒读一次"用户填了什么"——纯本地 DOM 读取，不发网络请求。</summary>
+        private void StartCaptchaTypedWatch()
+        {
+            if (_captchaTypedTimer == null)
+            {
+                _captchaTypedTimer = new DispatcherTimer(DispatcherPriority.Background);
+                _captchaTypedTimer.Interval = TimeSpan.FromSeconds(1);
+                _captchaTypedTimer.Tick += delegate(object s, EventArgs e) { PollCaptchaTyped(); };
+            }
+            if (!_captchaTypedTimer.IsEnabled) _captchaTypedTimer.Start();
+        }
+
+        private void PollCaptchaTyped()
+        {
+            try
+            {
+                if (_captchaPng == null || browser == null) return;
+                WinForms.HtmlDocument doc = browser.Document;
+                if (doc == null) return;
+
+                doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildTypedJs() });
+                object ret = doc.InvokeScript("__cnhCaptchaTyped");
+                string raw = ret == null ? "" : ret.ToString();
+
+                string v;
+                if (!CaptchaAssist.TryParseTyped(raw, out v)) return;
+                if (v == _captchaTyped) return;
+                _captchaTyped = v;
+
+                if (CaptchaAssist.IsValidCaptchaText(v))
+                    SetCaptchaHint("已填 4 位。登录成功后会把它记成一条样本。");
+                else if (v.Length == 0)
+                    SetCaptchaHint("看不清就点「换一张」。");
+                else
+                    SetCaptchaHint("已填 " + v.Length + " / 4 位。");
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 「换一张」：让**页面自己**重新加载验证码图（同时清空用户已填的值）。
+        ///
+        /// 为什么不是程序去请求：见 CaptchaAssist.BuildRefreshJs 的注释 ——
+        /// 只有让页面自己请求，服务端换的答案和页面换的图才是同一个动作。
+        /// </summary>
+        private void OnCaptchaRefresh()
+        {
+            try
+            {
+                WinForms.HtmlDocument doc = browser == null ? null : browser.Document;
+                if (doc == null) { SetCaptchaHint("页面还没加载好。"); return; }
+
+                doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildRefreshJs() });
+                object ret = doc.InvokeScript("__cnhCaptchaFresh");
+                string s = ret == null ? "" : ret.ToString();
+                if (s != "OK") { SetCaptchaHint("换图失败：" + s); return; }
+
+                // 图换了 → 之前抠的那张作废（它对应的答案已经不是这个 session 的了）
+                _captchaPng = null;
+                _captchaTyped = "";
+                SetCaptchaHint("已向服务器要了一张新的，正在重新取图…");
+
+                _captchaPollKeepRow = true;   // 这次是用户主动要的，失败了也要把话说清楚
+                StartCaptchaPoll(20);         // 新图要重新下载，给足 14 秒
+                Log.Info("用户点了「换一张」，已让页面重新加载验证码");
+            }
+            catch (Exception ex)
+            {
+                SetCaptchaHint("换图失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 判定"上一次提交是不是真的登上去了"；是的话把「验证码图 + 用户填的 4 位」
+        /// 存成一条**带标签**的样本。
+        ///
+        /// 为什么挂在"页面又跳转了"这个时刻：用户是在**页面上**点登录的，
+        /// 程序没有提交动作（也不允许有），所以只能从"页面自己跳走了"这个现象入手。
+        ///
+        /// 三道闸门，缺一条就不记（**宁缺毋滥** —— 标签错了比没有样本更糟，
+        /// 它会把以后做的模板库带歪）：
+        ///   ① 程序在跳转**之前**认为"已经通着" → 这次跳转不是登录带来的，不算证据
+        ///   ② 跳转后 4 秒，网络**真的**通了（用全局唯一那份判据 NetProbe.Online）
+        ///   ③ 跳转后的页面上**已经没有验证码了**（说明真的离开了登录页，
+        ///      而不是提交失败留在原地重刷了一张图）
+        /// </summary>
+        private void MaybeRecordSample()
+        {
+            try
+            {
+                if (_sampleTriedThisLoad) return;
+                if (_captchaPng == null || !CaptchaAssist.IsValidCaptchaText(_captchaTyped)) return;
+                if (!CaptchaAssist.SampleCollectEnabled(ConfigStore.LoadSettings())) return;
+                if (NetProbe.OnlineStale()) return;      // 闸门 ①（UI 线程上只能用这个，见 NetProbe 注释）
+
+                _sampleTriedThisLoad = true;
+
+                byte[] png = _captchaPng;               // 快照：接下来页面会变，这两个值必须锁住
+                string typed = _captchaTyped;
+
+                Thread t = new Thread(delegate()
+                {
+                    try
+                    {
+                        Thread.Sleep(4000);             // 认证生效要一点时间
+                        if (!NetProbe.Online(true)) return;          // 闸门 ②
+
+                        bool stillCaptcha = false;
+                        try
+                        {
+                            Dispatcher.Invoke(new Action(delegate()
+                            {
+                                stillCaptcha = PageHasCaptchaNow();  // 闸门 ③
+                            }));
+                        }
+                        catch { }
+                        if (stillCaptcha) return;
+
+                        string err;
+                        string path = CaptchaAssist.SaveSample(png, typed, out err);
+                        if (path.Length == 0) return;
+
+                        try
+                        {
+                            Dispatcher.BeginInvoke(new Action(delegate()
+                            {
+                                SetCaptchaHint("已记下一条样本（共 " + CaptchaAssist.CountSamples() + " 条）。");
+                            }));
+                        }
+                        catch { }
+                    }
+                    catch { }
+                });
+                t.IsBackground = true;
+                t.Start();
+            }
+            catch { }
+        }
+
+        /// <summary>当前页面上还有没有验证码图（用来判断"是不是还停在登录页"）。</summary>
+        private bool PageHasCaptchaNow()
+        {
+            try
+            {
+                WinForms.HtmlDocument doc = browser == null ? null : browser.Document;
+                if (doc == null) return false;
+
+                WinForms.HtmlElementCollection imgs = doc.GetElementsByTagName("img");
+                for (int i = 0; i < imgs.Count; i++)
+                {
+                    object src = imgs[i].GetAttribute("src");
+                    if (src != null && src.ToString().IndexOf("CheckCode", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private void HideCaptchaRow()
+        {
+            _captchaPng = null;
+            _captchaTyped = "";
+            if (_captchaTypedTimer != null) _captchaTypedTimer.Stop();
+            if (rowCaptcha != null) rowCaptcha.Visibility = Visibility.Collapsed;
+        }
+
+        private void SetCaptchaHint(string text)
+        {
+            if (lblCaptchaHint != null) lblCaptchaHint.Text = text;
+        }
+
+        // ------------------------------------------------------------------
+        // 自测探针（只有 UITest 用；产品逻辑不依赖它们）
+        //
+        // 为什么必须能**离线**自测这条链路：
+        //   抠图是"JS 注入 → canvas → base64 → 解码 → 显示"五段接力，
+        //   任何一段断了都只会表现为"图不出现"，光看代码看不出来；
+        //   而依赖真机 + 校园网才能跑的自测，等于没自测（放假/没连网就跑不了）。
+        //   所以 UITest 会造一张本地页面来驱动这个真实窗口。
+        // ------------------------------------------------------------------
+
+        internal void LoadUrlForTest(string url)
+        {
+            if (txtUrl != null) txtUrl.Text = url;
+            Navigate(url, false);
+        }
+
+        /// <summary>自测用：把取图脚本的**原始返回**原样交出来（含 ERR:xxx 的真实原因）。
+        /// 自测期间日志是静默的，失败原因只能这样带回报告里 —— 否则"图不出现"
+        /// 就成了一句没法排查的话。</summary>
+        internal string RawExtractForTest()
+        {
+            try
+            {
+                WinForms.HtmlDocument doc = (browser == null) ? null : browser.Document;
+                if (doc == null) return "(没有 document)";
+
+                object ret = null;
+                string err = "";
+                try
+                {
+                    doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildExtractJs() });
+                    ret = doc.InvokeScript("__cnhCaptchaCap");
+                }
+                catch (Exception ex) { err = " 调用异常: " + ex.GetType().Name + ": " + ex.Message; }
+
+                if (ret == null) return "(返回 null)" + err;
+                string s = ret.ToString();
+                int bar = s.IndexOf('|');
+                return (bar > 0 ? s.Substring(0, bar) + "…" : s) + err;
+            }
+            catch (Exception ex) { return "(异常) " + ex.GetType().Name + ": " + ex.Message; }
+        }
+
+        /// <summary>自测用：当前页面的地址。</summary>
+        internal string PageUrlForTest()
+        {
+            try { return (browser == null || browser.Url == null) ? "" : browser.Url.ToString(); }
+            catch { return ""; }
+        }
+
+        /// <summary>自测用：页面上有几个 img、它们的 src 长什么样（确认页面到底加载没有）。</summary>
+        internal string PageProbeForTest()
+        {
+            try
+            {
+                WinForms.HtmlDocument doc = (browser == null) ? null : browser.Document;
+                if (doc == null) return "(没有 document)";
+
+                WinForms.HtmlElementCollection imgs = doc.GetElementsByTagName("img");
+                System.Text.StringBuilder sb = new System.Text.StringBuilder();
+                sb.Append("img 数 = " + imgs.Count);
+                for (int i = 0; i < imgs.Count; i++)
+                {
+                    object src = imgs[i].GetAttribute("src");
+                    string t = (src == null) ? "" : src.ToString();
+                    string head = t.Length > 22 ? t.Substring(0, 22) : t;
+                    sb.Append(" [").Append(i).Append("] id=").Append(imgs[i].GetAttribute("id"))
+                      .Append(" srcHead=").Append(head).Append(" len=").Append(t.Length);
+                }
+                return sb.ToString();
+            }
+            catch (Exception ex) { return "(异常) " + ex.Message; }
+        }
+
+        /// <summary>自测用：直接触发一次「换一张」（省得靠模拟点按钮）。</summary>
+        internal void RefreshCaptchaForTest()
+        {
+            OnCaptchaRefresh();
+        }
+
+        internal bool CaptchaRowVisibleForTest()
+        {
+            return rowCaptcha != null && rowCaptcha.Visibility == Visibility.Visible;
+        }
+
+        internal int CaptchaPixelWidthForTest()
+        {
+            BitmapSource b = (imgCaptcha == null) ? null : (imgCaptcha.Source as BitmapSource);
+            return b == null ? 0 : b.PixelWidth;
+        }
+
+        internal int CaptchaPixelHeightForTest()
+        {
+            BitmapSource b = (imgCaptcha == null) ? null : (imgCaptcha.Source as BitmapSource);
+            return b == null ? 0 : b.PixelHeight;
+        }
+
+        internal string CaptchaHintForTest()
+        {
+            return lblCaptchaHint == null ? "" : lblCaptchaHint.Text;
+        }
+
+        /// <summary>自测用：直接往页面的验证码框里塞一个值（模拟用户敲完 4 位），
+        /// 然后立刻走一次"读用户填了什么"，省掉那 1 秒的等待。</summary>
+        internal bool TypeCaptchaForTest(string text)
+        {
+            try
+            {
+                WinForms.HtmlDocument doc = (browser == null) ? null : browser.Document;
+                if (doc == null) return false;
+
+                string js = "var el = document.getElementById('MainContent_TextBoxCC');"
+                          + " if (el) el.value = '" + (text ?? "").Replace("'", "") + "';";
+                doc.InvokeScript("eval", new object[] { js });
+                PollCaptchaTyped();
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // ==================================================================
         // 调试：导出内嵌浏览器看到的页面结构
         // ==================================================================
 
@@ -954,6 +1451,7 @@ namespace CampusNetHelper
 
             _autoDoneThisLoad = false;
             _submittedThisLoad = false;
+            _sampleTriedThisLoad = false;
             _loadToken++;
             SetStatus("正在打开认证页…");
             if (lblFound != null) lblFound.Text = "";
@@ -1020,6 +1518,15 @@ namespace CampusNetHelper
             // 每次文档加载完都刷一下页面上「登录成功自动关闭」那个勾选框的实际状态，
             // 让界面和配置保持一致。
             SyncAutoCloseCheckbox();
+
+            // ⚠️ 顺序要紧：这里判定的是**上一轮**填的验证码（页面刚刚跳走了，
+            //    说明用户点过登录）。必须排在"重新抠本页的图"之前 ——
+            //    一旦开始抠新页面的图，上一轮的那张就被覆盖了，样本也就配不上对。
+            MaybeRecordSample();
+
+            // 页面换了，上一轮的图作废，重新抠一次（扣不到就说明本页没有验证码）
+            _captchaPollKeepRow = false;
+            StartCaptchaPoll(5);
 
             if (_autoDoneThisLoad) return;
 

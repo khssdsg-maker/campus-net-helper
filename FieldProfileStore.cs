@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -254,7 +254,10 @@ namespace CampusNetHelper
                 // ⚠️ 与 WebUrlStore 同一道闸（2026-10-01 审计确认）：
                 //    读到 0 份、但磁盘上有内容 —— 这是读失败，不是用户删光了。
                 //    继续写就会把用户一格格教出来的字段档案全部冲掉。
-                if (all.Count == 0 && SafeFile.HasRealContent(ProfilesPath))
+                //
+                // ⚠️ 判据同样换成 HasDataLines（2026-10-02 修，理由见 SafeFile 注释）：
+                //    表头是 '#' 注释，不算数据 —— 用字节数判会把"删光"误判成"读失败"。
+                if (all.Count == 0 && SafeFile.HasDataLines(ProfilesPath))
                 {
                     message = "现有字段档案读取失败，为防止覆盖原有内容，本次没有保存。请稍后重试。";
                     Log.Warn("保存字段档案被拒：读到 0 份但文件有内容，判定为读取失败");

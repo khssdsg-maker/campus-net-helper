@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Text;
 using System.Windows;
@@ -56,6 +56,8 @@ namespace CampusNetHelper
                 TestAccountDeleteNoResurrect();
                 TestSettingRoundTrip();
                 TestVersionCompare();
+                TestCaptchaAssist();
+                TestCaptchaPipeline();
 
                 W("================ 界面自测 结束 ================");
             }
@@ -1274,6 +1276,310 @@ namespace CampusNetHelper
             W("结果：" + (ok
                 ? "通过 —— 按数值段比较、能吃 v 前缀与后缀、解析失败不当成新版本。"
                 : "不通过 —— 版本比较逻辑有问题。"));
+        }
+
+        /// <summary>
+        /// 用例：验证码辅助里的纯逻辑（C9）。
+        ///
+        /// 为什么这批必须自测：取图的**解析**和**样本标签的闸门**都属于
+        /// "错了也不会报错"的类型 ——
+        ///   · 解析错一位 → 只是图不显示，没人知道为什么；
+        ///   · 标签闸门松一点 → 会把用户填错的值当成答案存下来，
+        ///     而**错标签比没有样本更糟**（以后拿它做模板会把模板带歪）。
+        /// 这类逻辑只有抽成纯函数直接断言才靠得住，扔给真机手测是测不出来的。
+        /// </summary>
+        private static void TestCaptchaAssist()
+        {
+            W("");
+            W("---- 用例：验证码辅助的解析与样本闸门 ----");
+
+            int w = 0, h = 0;
+            string b64, err;
+
+            bool a = CaptchaAssist.TryParseShot(
+                "OK|80x24|475,385,155,47|data:image/png;base64,iVBORw0KGgo=", out w, out h, out b64, out err);
+            W("正常返回 → " + a + "，尺寸 " + w + "x" + h + "，数据长 " + b64.Length
+                + "（期望 True / 80x24 / 24）");
+
+            bool b = !CaptchaAssist.TryParseShot("ERR:not-ready", out w, out h, out b64, out err);
+            W("图还没加载完 → " + b + "，原因 " + err + "（期望 True，即判定为失败）");
+
+            bool c = !CaptchaAssist.TryParseShot(
+                "OK|80x24|1,2,3,4|不是图片", out w, out h, out b64, out err);
+            W("返回里没有图片数据 → " + c + "（期望 True）");
+
+            bool d = !CaptchaAssist.TryParseShot("", out w, out h, out b64, out err);
+            W("空返回 → " + d + "（期望 True）");
+
+            bool e = !CaptchaAssist.TryParseShot(
+                "OK|0x0|1,2,3,4|data:image/png;base64,AA", out w, out h, out b64, out err);
+            W("尺寸为 0 → " + e + "（期望 True —— 拿不到尺寸就不能当成功）");
+
+            bool f = CaptchaAssist.IsValidCaptchaText("Ab12");
+            bool g = !CaptchaAssist.IsValidCaptchaText("Ab1");
+            bool hh = !CaptchaAssist.IsValidCaptchaText("AB12!");
+            bool i = CaptchaAssist.IsValidCaptchaText(" AB12 ");
+            W("标签闸门：Ab12=" + f + "（True）／Ab1=" + g + "（True，长度不对要拦）／"
+                + "AB12!=" + hh + "（True，非字母数字要拦）／带空格=" + i + "（True，trim 后合法）");
+
+            bool j = CaptchaAssist.IsSampleFileName("20261002-214530-123-AB12.png");
+            bool k = !CaptchaAssist.IsSampleFileName("accounts.txt");
+            bool l = !CaptchaAssist.IsSampleFileName("20261002-214530-123-AB1.png");
+            bool m = !CaptchaAssist.IsSampleFileName("20261002_214530_123_AB12.png");
+            W("样本文件名判定：正常=" + j + "（True）／accounts.txt=" + k + "（True，不能碰）／"
+                + "标签只有 3 位=" + l + "（True）／分隔符不对=" + m + "（True）");
+
+            // 结构性断言：取图脚本里**不允许**出现改 src / 主动发请求的写法。
+            // 这是"绝不重新请求 /CheckCode"那条红线的第一道机械闸门 ——
+            // 以后谁手滑往取图脚本里塞一句 im.src = …，这里立刻报警。
+            string extract = CaptchaAssist.BuildExtractJs();
+            bool n = extract.IndexOf("im.src =", StringComparison.Ordinal) < 0
+                  && extract.IndexOf("XMLHttpRequest", StringComparison.Ordinal) < 0
+                  && extract.IndexOf("new Image", StringComparison.Ordinal) < 0;
+            W("取图脚本不含改 src／发请求的写法 → " + n + "（期望 True）");
+
+            bool o = extract.IndexOf("drawImage", StringComparison.Ordinal) >= 0;
+            bool p = CaptchaAssist.BuildRefreshJs().IndexOf("im.src", StringComparison.Ordinal) >= 0;
+            W("取图走 drawImage=" + o + "（True）／换一张确实改 src=" + p
+                + "（True —— 换图必须让页面自己去请求，程序不能替代）");
+
+            // —— 真写一次文件，然后**立刻删掉** ——
+            //   只验证"写得出来、名字合规、目录建得起来"（纯逻辑测不到这一段，
+            //   而路径写错/目录建不起来这类问题恰恰是上了机才炸的那种）。
+            //   ⚠️ 写完必须删：假样本混进将来的识别素材里是有害的，
+            //   "标签对了但图是假的"比没有样本更糟。
+            string werr;
+            string saved = CaptchaAssist.SaveSample(Encoding.UTF8.GetBytes("not-a-real-png"), "ZZ99", out werr);
+            bool wrote = saved.Length > 0 && System.IO.File.Exists(saved);
+            bool named = wrote && CaptchaAssist.IsSampleFileName(System.IO.Path.GetFileName(saved));
+            W("真写一条样本 → 写出 = " + wrote + "，文件名合规 = " + named + "（期望 True / True）");
+            bool deleted = false;
+            try { if (wrote) { System.IO.File.Delete(saved); deleted = !System.IO.File.Exists(saved); } }
+            catch { }
+            W("  已立刻删除 = " + deleted + "（期望 True —— 绝不能把假样本留在素材目录里）");
+
+            bool ok = a && b && c && d && e && f && g && hh && i && j && k && l && m && n && o && p
+                      && wrote && named && deleted;
+            W("结果：" + (ok
+                ? "通过 —— 异常返回能挡住、标签闸门够严、取图脚本里没有发请求的写法。"
+                : "不通过 —— 见上面逐项。"));
+        }
+
+        /// <summary>
+        /// 用例：验证码抠图链路（C9）—— **离线**跑，用本地测试页驱动真实认证窗口。
+        ///
+        /// 为什么要这么测：
+        ///   抠图是"注入 JS → canvas → base64 → 解码 → 显示"五段接力，
+        ///   任何一段断了都只表现为"图不出现"，读代码看不出来；
+        ///   而要靠真机 + 校园网才能跑的自测等于没自测（没连校园网时跑不了）。
+        ///   所以这里现造一张本地页面（图里就是"验证码"三个字的替代：一张彩色小图），
+        ///   让真实窗口去抠它 —— 链路断在哪一段都会立刻暴露。
+        ///
+        /// ⚠️ 两个坑，写在这里免得后人踩：
+        ///   ① **假图必须用与真图不同的尺寸**（这里 64×20，真图 80×24）。
+        ///      因为真机的认证页上也有验证码，万一窗口先加载了真页面，
+        ///      尺寸一致就分不清拿到的到底是哪张图 —— 那就是"看起来通过了"的假阳性。
+        ///   ② 必须在 Show() **之前**把地址换成测试页：窗口的 Loaded 事件会按
+        ///      txtUrl.Text 去导航，晚一步就会先跑去真认证页。
+        /// </summary>
+        private static void TestCaptchaPipeline()
+        {
+            W("");
+            W("---- 用例：验证码抠图链路（离线）----");
+
+            MainWindow mw = null;
+            WebAuthWindow wa = null;
+            System.Net.HttpListener srv = null;
+            System.Threading.Thread serverThread = null;
+            bool stopServer = false;
+            int port = 0;
+
+            try
+            {
+                // ---- 本地小站：路径名照抄真实门户（/login、/CheckCode），走的是同一条路 ----
+                // ⚠️ 必须用 http://，不能用 file://（2026-10-02 实测踩到）：
+                //    窗口的 Navigate 会给没写协议的地址自动补 http://，
+                //    于是 file:///C:/... 被拼成 http://file///C:/... → IE 报错页，
+                //    抠到的两个 img 是 IE 错误页自带的图标（诊断信息里能一眼看到）。
+                System.Random rnd = new System.Random();
+                for (int i = 0; i < 12 && srv == null; i++)
+                {
+                    int p = 41000 + rnd.Next(0, 8000);
+                    try
+                    {
+                        System.Net.HttpListener l = new System.Net.HttpListener();
+                        l.Prefixes.Add("http://127.0.0.1:" + p + "/");
+                        l.Start();
+                        srv = l;
+                        port = p;
+                    }
+                    catch { }
+                }
+                if (srv == null)
+                {
+                    W("结果：跳过 —— 本机起不了监听端口（环境问题，不是功能问题）。");
+                    return;
+                }
+
+                byte[] pngA = MakeTestCaptchaPng(64, 20);   // 首张：64×20
+                byte[] pngB = MakeTestCaptchaPng(60, 18);   // 「换一张」之后服务端给的那张：60×18
+                string html = "<html><body>"
+                    + "<img id='MainContent_ImageCC' src='/CheckCode'>"
+                    + "<input type='text' id='MainContent_TextBoxCC' maxlength='4'>"
+                    + "</body></html>";
+                W("本地测试站 = http://127.0.0.1:" + port + "/login（/CheckCode 首张 64×20，带 ?t= 时给 60×18）");
+
+                serverThread = new System.Threading.Thread(delegate()
+                {
+                    while (!stopServer)
+                    {
+                        try
+                        {
+                            System.Net.HttpListenerContext ctx = srv.GetContext();
+                            string q = (ctx.Request.Url.Query == null) ? "" : ctx.Request.Url.Query.Trim();
+                            bool fresh = q.Length > 1;      // 带 ?t= 就是「换一张」要的那张
+                            byte[] body;
+                            string type;
+                            if (ctx.Request.Url.AbsolutePath.ToLowerInvariant().IndexOf("checkcode") >= 0)
+                            {
+                                body = fresh ? pngB : pngA;
+                                type = "image/png";
+                            }
+                            else
+                            {
+                                body = Encoding.UTF8.GetBytes(html);
+                                type = "text/html; charset=utf-8";
+                            }
+                            ctx.Response.ContentType = type;
+                            ctx.Response.ContentLength64 = body.Length;
+                            ctx.Response.OutputStream.Write(body, 0, body.Length);
+                            ctx.Response.Close();
+                        }
+                        catch { if (stopServer) break; }
+                    }
+                });
+                serverThread.IsBackground = true;
+                serverThread.Start();
+
+                mw = new MainWindow(false);
+                mw.Left = -4000;
+                mw.Top = -4000;
+                mw.ShowInTaskbar = false;
+                mw.Show();
+                Pump();
+
+                wa = new WebAuthWindow(mw);
+                wa.Left = -4000;
+                wa.Top = -4000;
+                wa.ShowInTaskbar = false;
+                // ⚠️ 顺序不能反：先换地址，再 Show（见上面的坑 ②）
+                wa.LoadUrlForTest("http://127.0.0.1:" + port + "/login");
+                wa.Show();
+
+                bool shown = false;
+                int pw = 0, ph = 0;
+                for (int i = 0; i < 40; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(250);
+                    shown = wa.CaptchaRowVisibleForTest();
+                    pw = wa.CaptchaPixelWidthForTest();
+                    ph = wa.CaptchaPixelHeightForTest();
+                    if (shown && pw == 64 && ph == 20) break;
+                }
+                W("抠图行出现 = " + shown + "，取到的图像素 = " + pw + "×" + ph
+                    + "（期望 True / 64×20 —— 尺寸对得上才说明拿的是测试页那张图）");
+
+                // 失败时把现场说清楚（自测期间日志是静默的，只能这样带回来）
+                if (!shown || pw != 64)
+                {
+                    W("  诊断·当前页面 = " + wa.PageUrlForTest());
+                    W("  诊断·页面元素 = " + wa.PageProbeForTest());
+                    W("  诊断·取图脚本返回 = " + wa.RawExtractForTest());
+                }
+
+                // 用户填值那一路：页面里塞值 → 我们得读得到，并且认出"填满了"
+                bool typedOk = wa.TypeCaptchaForTest("AB12");
+                string hint = wa.CaptchaHintForTest();
+                W("模拟填入 AB12 → 调用成功 = " + typedOk + "，界面提示 = \"" + hint
+                    + "\"（期望含「已填 4 位」）");
+                bool hintOk = hint.IndexOf("已填 4 位", StringComparison.Ordinal) >= 0;
+
+                // 填不满 4 位时不该被当成"可以记样本"
+                wa.TypeCaptchaForTest("AB");
+                string hint2 = wa.CaptchaHintForTest();
+                W("只填 2 位 → 提示 = \"" + hint2 + "\"（期望「2 / 4」而不是「已填 4 位」）");
+                bool hint2Ok = hint2.IndexOf("2 / 4", StringComparison.Ordinal) >= 0;
+
+                // ---- 「换一张」：必须真的换成服务端新给的那张，且已填的值要清掉 ----
+                wa.RefreshCaptchaForTest();
+                int pw2 = pw, ph2 = ph;
+                for (int i = 0; i < 40; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(250);
+                    pw2 = wa.CaptchaPixelWidthForTest();
+                    ph2 = wa.CaptchaPixelHeightForTest();
+                    if (pw2 == 60 && ph2 == 18) break;
+                }
+                string hint3 = wa.CaptchaHintForTest();
+                bool refreshed = pw2 == 60 && ph2 == 18;
+                bool cleared = hint3.IndexOf("4 位", StringComparison.Ordinal) < 0;
+                W("换一张之后 → 图像素 = " + pw2 + "×" + ph2 + "（期望 60×18）／提示 = \"" + hint3 + "\"");
+                W("  已填的值被清掉 = " + cleared + "（期望 True —— 图换了旧答案就作废，留着只会害人填错）");
+
+                bool ok = shown && pw == 64 && ph == 20 && typedOk && hintOk && hint2Ok && refreshed && cleared;
+                W("结果：" + (ok
+                    ? "通过 —— 抠图放大、读用户填写、位数不够不误判、换一张真的换了图并清空旧值。"
+                    : "不通过 —— 见上面逐项。"));
+            }
+            catch (Exception ex)
+            {
+                W("!! 用例异常: " + ex.Message + " / " + ex.GetType().Name);
+            }
+            finally
+            {
+                stopServer = true;
+                try { if (srv != null) srv.Stop(); } catch { }
+                try { if (serverThread != null) serverThread.Join(2000); } catch { }
+                try { if (wa != null) wa.Close(); } catch { }
+                try { if (mw != null) mw.Close(); } catch { }
+
+                // ⚠️⚠️ 清场（2026-10-02 踩到过，不加这行就会出事）：
+                //    窗口的 Loaded 事件是 `Navigate(txtUrl.Text, true)`，那个 true
+                //    的意思是"顺手存进网址清单"。于是自测一跑，
+                //    **用户真实的清单里就会多出一条 http://127.0.0.1:xxxxx/login**
+                //    （实测真出现过，还害得我截图时窗口跑去了一个死掉的本地地址）。
+                //    所以无论成败，都要把自测自己那条删掉。
+                try
+                {
+                    if (port > 0)
+                    {
+                        string dm;
+                        WebUrlStore.Delete("http://127.0.0.1:" + port + "/login", out dm);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>造一张指定尺寸的"假验证码"PNG（内容随便画几笔，够 canvas 抠出来就行）。</summary>
+        private static byte[] MakeTestCaptchaPng(int w, int h)
+        {
+            using (System.Drawing.Bitmap bmp = new System.Drawing.Bitmap(w, h))
+            {
+                using (System.Drawing.Graphics g = System.Drawing.Graphics.FromImage(bmp))
+                {
+                    g.Clear(System.Drawing.Color.White);
+                    g.DrawString("AB12", new System.Drawing.Font("Arial", h * 0.5F,
+                        System.Drawing.FontStyle.Bold), System.Drawing.Brushes.Red, 2F, 1F);
+                }
+                using (System.IO.MemoryStream ms = new System.IO.MemoryStream())
+                {
+                    bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                    return ms.ToArray();
+                }
+            }
         }
 
         private static void TestFirstRunTip()

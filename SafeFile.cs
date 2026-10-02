@@ -81,5 +81,40 @@ namespace CampusNetHelper
             }
             catch { return false; }
         }
+
+        /// <summary>
+        /// 文件里有没有**数据行** —— 非空、且不是以 # 开头的注释。
+        ///
+        /// ⚠️ 为什么又加了这一个（2026-10-02 修 bug）：
+        ///   webauthurls.txt / fieldprofiles.txt 这两个清单文件**永远带着两行 '#' 表头**，
+        ///   所以"用户把条目全删光"之后，文件仍然有 200 多字节。
+        ///   而 HasRealContent 只看字节数 → 会把这种**完全正常的状态**误判成"读失败"，
+        ///   于是 Save 里那道闸永久生效：用户删光之后**再也存不进任何一条**。
+        ///   （实测复现：自测的「认证网址清单」用例红的，12 通过 / 1 不通过 ——
+        ///     而且 v2.2.0 的发布版同样红，属于已经发出去的老 bug。）
+        ///
+        ///   判据本来就该是"有没有数据行"：注释不是数据，表头跟着文件走。
+        /// </summary>
+        public static bool HasDataLines(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return false;
+                foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+                {
+                    string s = line.Trim();
+                    if (s.Length == 0) continue;
+                    if (s.StartsWith("#", StringComparison.Ordinal)) continue;
+                    return true;
+                }
+                return false;
+            }
+            catch
+            {
+                // 读不出来 = 到底有没有数据**不知道**。
+                // 这时候按"有内容"处理 —— 宁可拒绝保存，也不能把用户的清单冲掉。
+                return true;
+            }
+        }
     }
 }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -205,7 +205,11 @@ namespace CampusNetHelper
                 // ⚠️ 第二道防线（2026-10-01 审计确认）：
                 //    读到 0 条、但磁盘上明明有内容 —— 这不是"用户把网址删光了"，
                 //    而是**读失败**。这时候继续写就会把原有条目全冲掉，所以直接拒绝。
-                if (all.Count == 0 && SafeFile.HasRealContent(UrlsPath))
+                //
+                // ⚠️ 判据用 HasDataLines 而不是 HasRealContent（2026-10-02 修）：
+                //    本文件永远带两行 '#' 表头，用"字节数"判会把"用户删光条目"这种
+                //    正常状态误判成读失败，导致**此后再也存不进任何一条**。
+                if (all.Count == 0 && SafeFile.HasDataLines(UrlsPath))
                 {
                     message = "现有网址清单读取失败，为防止覆盖原有内容，本次没有保存。请稍后重试。";
                     Log.Warn("保存网址被拒：清单读到 0 条但文件有内容，判定为读取失败");
