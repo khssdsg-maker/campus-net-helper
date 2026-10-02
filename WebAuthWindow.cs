@@ -1093,16 +1093,22 @@ namespace CampusNetHelper
                     return;
                 }
 
-                if (r.AcceptedCount == 0)
+                // ⚠️ 要填什么**只能**问 FillCandidate()，不能直接用 r.Text。
+                //    2026-10-03 的教训：直接用 Text 会把 "A?3?" 填进验证码框
+                //    （逐位闸门放过 2 位，Text 里就留着 '?'）。用户看到问号一脸问号。
+                //    FillCandidate 要求四位全部达标，且结果必须是 4 位字母数字。
+                string fill = CaptchaOcr.FillCandidate(r);
+                if (fill.Length == 0)
                 {
-                    SetCaptchaHint("这张认不准，没有替你填 —— 请手动填写。");
-                    Log.Info("验证码识别：置信度不足，未填入（最小 margin="
+                    SetCaptchaHint(CaptchaOcr.DescribeForUser(r));
+                    Log.Info("验证码识别：置信度不足，未填入（达标 "
+                             + r.AcceptedCount + "/4，最小 margin="
                              + r.MinMargin.ToString("0.###") + "）");
                     return;
                 }
 
                 // 把候选写进页面输入框（只写值，不触发任何提交）
-                if (!FillCaptchaBox(r.Text))
+                if (!FillCaptchaBox(fill))
                 {
                     SetCaptchaHint("识别出来了，但写进输入框失败 —— 请手动填写。");
                     return;
@@ -1111,7 +1117,7 @@ namespace CampusNetHelper
                 // 让"用户填了什么"的监听立刻刷新一次，免得提示语自相矛盾
                 PollCaptchaTyped();
                 SetCaptchaHint(CaptchaOcr.DescribeForUser(r));
-                Log.Info("验证码识别：已填入候选 " + r.Text
+                Log.Info("验证码识别：已填入候选 " + fill
                          + "（达标 " + r.AcceptedCount + "/4，最小 margin="
                          + r.MinMargin.ToString("0.###") + "）");
             }

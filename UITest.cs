@@ -1521,6 +1521,11 @@ namespace CampusNetHelper
                 + " 张（覆盖 " + a.FillImageCoverage.ToString("P1") + "）");
             W("   这些图里 4 位全对 " + a.ImagesAllFilledOk + "/" + a.ImagesAllFilled
                 + " = " + a.FillImageRate.ToString("P1"));
+            W("");
+            W("③ 不变量：填进输入框的只能是「空串」或「4 位字母数字」");
+            W("   违规次数 = " + a.FillViolations + "（必须为 0）");
+            if (a.FillViolations > 0)
+                W("!! 有内容会被填进输入框却不是 4 位字母数字 —— 用户会看到问号之类的东西");
 
             if (a.CharTotal < 40)
             {

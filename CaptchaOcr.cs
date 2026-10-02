@@ -211,12 +211,50 @@ namespace CampusNetHelper
 
         public sealed class Result
         {
-            public string Text = "????";        // 4 位，未识别为 '?'
+            /// <summary>
+            /// 4 位的最佳猜测（**永远不含 '?'**；只有某一位连观测都没取到才是 '?'）。
+            ///
+            /// ⚠️ 注意：这个字段是"猜了什么"，**不是"能填什么"**。
+            ///    要填进输入框必须走 FillCandidate()，它会再查一遍置信度闸门。
+            ///    2026-10-03 的教训：一开始直接把 Text 填进框里，于是用户看到
+            ///    输入框里出现 "A?3?" —— 因为逐位闸门放过了 2 位，Text 里就带着 '?'。
+            ///    验证码框只接受 4 位字母数字，'?' 既填不对也没意义。
+            /// </summary>
+            public string Text = "????";
+
             public SlotResult[] Slots = new SlotResult[4];
-            public int AcceptedCount;           // 达到闸门的位数
-            public double MinMargin = -1;       // 达标位里最小的 margin（整体置信度）
+
+            /// <summary>达到闸门的位数。</summary>
+            public int AcceptedCount;
+
+            /// <summary>
+            /// **四位全部**达到闸门。这才是"可以填"的条件 —— 要么 4 位都给，要么一位都不给。
+            /// 往输入框里塞 "A?3?" 这种残句对用户毫无意义，只会让人以为程序坏了。
+            /// （这也与准确率的实测口径一致：那个 72.7% 就是按"整图填"量的。）
+            /// </summary>
+            public bool AllAccepted { get { return AcceptedCount == 4; } }
+
+            /// <summary>达标位里最小的 margin（整体置信度）。</summary>
+            public double MinMargin = -1;
+
             public string Error = "";
-            public bool Ok { get { return Error.Length == 0 && AcceptedCount > 0; } }
+        }
+
+        /// <summary>
+        /// **唯一允许写进验证码输入框的东西。** 返回空串 = 什么都别填。
+        ///
+        /// 三重闸门，缺一不可：
+        ///   ① 识别本身没出错
+        ///   ② 四位全部达标（AllAccepted）—— 不做"填一半"
+        ///   ③ 结果确实由 4 位字母数字组成 —— 兜底，确保 '?' 这类字符
+        ///      在任何情况下都不可能进输入框
+        /// 之所以做成一个函数而不是散在调用处判断：这样**自测能直接断言这条不变量**。
+        /// </summary>
+        public static string FillCandidate(Result r)
+        {
+            if (r == null || r.Error.Length > 0) return "";
+            if (!r.AllAccepted) return "";
+            return CaptchaAssist.IsValidCaptchaText(r.Text) ? r.Text : "";
         }
 
         // ==================================================================
@@ -250,21 +288,25 @@ namespace CampusNetHelper
                 for (int slot = 0; slot < 4; slot++)
                     res.Slots[slot] = RecognizeSlot(cls, w, h, slot);
 
+                // Text 记的是"每位猜了什么"（诊断 + 自测用），**不是**能填的东西。
+                // 只有 Best 为 '\0'（这一位连观测都没取到）才写 '?'。
+                // 能不能填由 FillCandidate() 决定 —— 它要求四位全部达标。
                 char[] outChars = new char[4];
                 int acc = 0;
                 double minMargin = double.MaxValue;
                 for (int i = 0; i < 4; i++)
                 {
                     SlotResult s = res.Slots[i];
-                    if (s != null && s.Accepted)
-                    {
-                        outChars[i] = s.Best;
-                        acc++;
-                        if (s.Margin < minMargin) minMargin = s.Margin;
-                    }
-                    else
+                    if (s == null || s.Best == '\0')
                     {
                         outChars[i] = '?';
+                        continue;
+                    }
+                    outChars[i] = s.Best;
+                    if (s.Accepted)
+                    {
+                        acc++;
+                        if (s.Margin < minMargin) minMargin = s.Margin;
                     }
                 }
                 res.Text = new string(outChars);
@@ -572,6 +614,13 @@ namespace CampusNetHelper
             public int ImagesAllFilled;
             public int ImagesAllFilledOk;
 
+            /// <summary>
+            /// 违反"填入内容必须是 4 位字母数字"这一不变量的次数。**必须恒为 0。**
+            /// 2026-10-03 就是这里出过事：逐位闸门让 "A?3?" 被填进了验证码框。
+            /// 记这个数是为了让自测能直接断言，而不是靠人记得别写错。
+            /// </summary>
+            public int FillViolations;
+
             public double RawCharRate { get { return CharTotal == 0 ? 0 : (double)RawCharOk / CharTotal; } }
             public double FillRate { get { return CharTotal == 0 ? 0 : (double)FilledChars / CharTotal; } }
             public double FillCharRate { get { return FilledChars == 0 ? 0 : (double)FilledOk / FilledChars; } }
@@ -619,6 +668,12 @@ namespace CampusNetHelper
                 Result r = RecognizePng(png);
                 if (r.Error.Length > 0) continue;
 
+                // 不变量：真正会填进输入框的东西，只能是空串或 4 位字母数字。
+                // 这一条就是 2026-10-03 那个"问号"事故的回归防线。
+                string fill = FillCandidate(r);
+                if (fill.Length != 0 && !CaptchaAssist.IsValidCaptchaText(fill))
+                    acc.FillViolations++;
+
                 acc.Images++;
                 bool allFilled = true, allFilledOk = true;
                 for (int k = 0; k < 4; k++)
@@ -659,9 +714,9 @@ namespace CampusNetHelper
         {
             if (r == null) return "识别失败，请手动填写。";
             if (r.Error.Length > 0) return "识别不可用（" + r.Error + "），请手动填写。";
-            if (r.AcceptedCount == 0) return "认不准，没有替你填 —— 请手动填写。";
-            if (r.AcceptedCount < 4)
-                return "只认准了 " + r.AcceptedCount + " 位（? 处要你自己看），核对后再点登录。";
+            if (!r.AllAccepted)
+                return "这张认不准（4 位里有把握的只有 " + r.AcceptedCount
+                     + " 位），没有替你填 —— 请手动填写。";
             return "已填入识别候选（可能错），请核对后手动点登录。";
         }
     }
