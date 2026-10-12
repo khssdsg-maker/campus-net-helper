@@ -772,7 +772,10 @@ namespace CampusNetHelper
             Array.Sort(files, StringComparer.OrdinalIgnoreCase);
 
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("file,truth,guess,accepted,minmargin,weakest,allok");
+            // 逐位给出 top1 和 top2：鼠标质检时"改一位"只要点一下次优候选就行，
+            // 不用从 36 个字符里翻（2026-10-12 海辰反馈要鼠标操作时加的）
+            sb.AppendLine("file,truth,guess,accepted,minmargin,weakest,allok,"
+                        + "p0,p1,p2,p3,q0,q1,q2,q3");
             int rows = 0;
 
             for (int i = 0; i < files.Length; i++)
@@ -796,7 +799,20 @@ namespace CampusNetHelper
                   .Append(r.AcceptedCount).Append(',')
                   .Append(r.MinMargin.ToString("0.###", CultureInfo.InvariantCulture)).Append(',')
                   .Append(r.WeakestIndex).Append(',')
-                  .Append(allOk ? "1" : "0").AppendLine();
+                  .Append(allOk ? "1" : "0");
+
+                // top1 / top2（每位各一个字符；取不到就写空）
+                for (int k = 0; k < 4; k++)
+                {
+                    SlotResult sk = r.Slots[k];
+                    sb.Append(',').Append(sk == null || sk.Best == '\0' ? "" : sk.Best.ToString());
+                }
+                for (int k = 0; k < 4; k++)
+                {
+                    SlotResult sk = r.Slots[k];
+                    sb.Append(',').Append(sk == null || sk.Second == '\0' ? "" : sk.Second.ToString());
+                }
+                sb.AppendLine();
                 rows++;
             }
 
