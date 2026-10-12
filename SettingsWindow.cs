@@ -26,6 +26,8 @@ namespace CampusNetHelper
         private CheckBox chkCheckUpdate;
         /// <summary>验证码样本采集开关（C9）。同上，单独存。</summary>
         private CheckBox chkCaptchaSample;
+        /// <summary>网页认证「自动填验证码并提交」开关（2026-10-12）。同上，单独存。</summary>
+        private CheckBox chkAutoSubmit;
         private TextBox txtInterval;
         private CheckBox chkKeepAlive;
         private TextBox txtKeepAlive;
@@ -490,6 +492,23 @@ namespace CampusNetHelper
             rowCap.Children.Add(chkCaptchaSample);
             stack.Children.Add(rowCap);
 
+            // ---------- 网页认证：自动填验证码并提交（2026-10-12 海辰要求全自动）----------
+            // 关掉就退回"只填账号密码、验证码和登录按钮都由人来"的保守行为。
+            var rowAutoSubmit = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(0, 10, 0, 0)
+            };
+            chkAutoSubmit = MakeCheck("网页认证：自动填验证码并提交（一键登录不用再点网页里的登录）", true);
+            chkAutoSubmit.Margin = new Thickness(0, 0, 0, 0);
+            chkAutoSubmit.VerticalAlignment = VerticalAlignment.Center;
+            chkAutoSubmit.ToolTip = "打开后：填账号密码 → 自动识别验证码 → 自动点「登录」。\n"
+                + "没登上去会自动换一张验证码重试，最多 3 次（每次失败学校端都会记一次登录失败，"
+                + "所以有上限，不会一直试）。\n"
+                + "关掉则恢复保守行为：只帮你填账号密码，验证码和登录按钮都自己来。";
+            rowAutoSubmit.Children.Add(chkAutoSubmit);
+            stack.Children.Add(rowAutoSubmit);
+
             var btnSave = MainWindow.MakeButton("保存并校验设置（本页已自动保存）",
                 Theme.Accent, Theme.OnAccent, Theme.Accent, SaveToOwner);
             btnSave.HorizontalAlignment = HorizontalAlignment.Left;
@@ -620,6 +639,12 @@ namespace CampusNetHelper
             if (chkCaptchaSample != null)
                 chkCaptchaSample.Unchecked += delegate { SaveCaptchaSampleFlag(); };
 
+            // 网页认证自动提交（2026-10-12）：同上，单独存
+            if (chkAutoSubmit != null)
+                chkAutoSubmit.Checked += delegate { SaveAutoSubmitFlag(); };
+            if (chkAutoSubmit != null)
+                chkAutoSubmit.Unchecked += delegate { SaveAutoSubmitFlag(); };
+
             // 数字/文本输入框：失焦时才触发，避免边打字边存
             if (txtInterval != null)
                 txtInterval.LostFocus += delegate { RequestAutoSave(); };
@@ -723,6 +748,26 @@ namespace CampusNetHelper
         }
 
         /// <summary>
+        /// 存"网页认证自动提交"这个开关。做法和上面两个完全一致（读-合并-写）。
+        /// </summary>
+        private void SaveAutoSubmitFlag()
+        {
+            if (_loading) return;
+            try
+            {
+                System.Collections.Generic.Dictionary<string, string> disk = ConfigStore.LoadSettings();
+                ConfigStore.SetBool(disk, CaptchaAssist.AutoSubmitKey, chkAutoSubmit.IsChecked == true);
+                string msg;
+                ConfigStore.SaveSettings(disk, out msg);
+                SetSaveHint("已自动保存 ✓");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("保存自动提交开关失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 存"验证码样本采集"这个开关。做法和 SaveCheckUpdateFlag 完全一致
         /// （同样与连接行为无关，同样单独读-合并-写）。
         /// </summary>
@@ -811,6 +856,7 @@ namespace CampusNetHelper
 
                 chkCheckUpdate.IsChecked = UpdateChecker.Enabled(ConfigStore.LoadSettings());
                 chkCaptchaSample.IsChecked = CaptchaAssist.SampleCollectEnabled(ConfigStore.LoadSettings());
+                chkAutoSubmit.IsChecked = CaptchaAssist.AutoSubmitEnabled(ConfigStore.LoadSettings());
 
                 // 认证方式
                 bool portal = owner.IsPortalMode();

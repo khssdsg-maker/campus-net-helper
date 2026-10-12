@@ -61,6 +61,28 @@ namespace CampusNetHelper
         /// <summary>settings.txt 里的键名：是否采集验证码样本（默认开）。</summary>
         public const string SampleCollectKey = "CaptchaSampleCollect";
 
+        /// <summary>
+        /// settings.txt 里的键名：网页认证是否**自动填验证码并提交**（默认开）。
+        ///
+        /// 2026-10-12 海辰明确要求「我要的是全自动连接，而不是我们自己手动点击」，
+        /// 于是把原来"识别出来只填给用户看、提交永远由人点"的分工改掉：
+        /// 现在「填表并登录」会一路做完 填账号密码 → 认验证码 → 填进框 → 点登录，
+        /// 失败还会换一张重试（最多 3 次，见 WebAuthWindow.AutoAuthMaxAttempts）。
+        ///
+        /// ⚠️ 代价写在明处，别让后来人以为是漏了：
+        ///   · 每次重试失败，学校端都会记一次登录失败；3 次是刻意的上限
+        ///   · 识别本身不是 100% 准（留出集字符 76.7% / 整图全对 33.3%），
+        ///     所以"全自动"的实际体感取决于识别质量，用户也可能还是要手动补一次
+        ///   · 想要保守行为（只填不提交）的用户，把这个开关关掉即可
+        /// </summary>
+        public const string AutoSubmitKey = "PortalAutoSubmit";
+
+        /// <summary>是否自动提交（默认开）。</summary>
+        public static bool AutoSubmitEnabled(Dictionary<string, string> settings)
+        {
+            return ConfigStore.GetBool(settings, AutoSubmitKey, true);
+        }
+
         /// <summary>样本目录名（挂在 ConfigStore.AppDataDir 下面）。</summary>
         private const string SampleDirName = "captcha-samples";
 
@@ -214,8 +236,15 @@ namespace CampusNetHelper
                 "    var el = window.__cnhCaptchaInput();" +
                 "    if (!el) return 'ERR:no-input';" +
                 "    el.value = '" + safe + "';" +
-                "    el.dispatchEvent(new Event('input', { bubbles: true }));" +
-                "    el.dispatchEvent(new Event('change', { bubbles: true }));" +
+                // ⚠️⚠️ 这两行只是"通知页面"的礼节，必须**各自包 try**（2026-10-12 实测踩到）：
+                //   IE11 里**没有 `new Event()` 构造函数**（那是 Edge/现代浏览器的），
+                //   原来的写法 `el.dispatchEvent(new Event('input',{bubbles:true}))` 直接抛异常，
+                //   而异常在 `el.value = ...` 之后、`return 'OK'` 之前 —— 结果是
+                //   **值其实已经写进框里了，函数却报失败**，上层于是显示"写不进输入框"，
+                //   把用户（和我自己）往完全错误的方向引。实测真门户上一样会犯。
+                //   现在改成 IE 支持的 createEvent('HTMLEvents')，且失败也不影响返回值。
+                "    try { var e1 = document.createEvent('HTMLEvents'); e1.initEvent('input', true, true); el.dispatchEvent(e1); } catch (x1) {}" +
+                "    try { var e2 = document.createEvent('HTMLEvents'); e2.initEvent('change', true, true); el.dispatchEvent(e2); } catch (x2) {}" +
                 "    return (el.value === '" + safe + "') ? 'OK' : 'ERR:not-set';" +
                 "  } catch (e) { return 'ERR:' + (e.message || e); }" +
                 "};";

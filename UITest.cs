@@ -65,6 +65,7 @@ namespace CampusNetHelper
                 TestVersionCompare();
                 TestCaptchaAssist();
                 TestCaptchaPipeline();
+                TestAutoLoginFlow();
                 TestCaptchaOcr();
 
                 W("================ 界面自测 结束 ================");
@@ -1801,6 +1802,373 @@ namespace CampusNetHelper
                     return ms.ToArray();
                 }
             }
+        }
+
+        /// <summary>
+        /// 用例：一键登录真的会自动提交（假门户）。
+        ///
+        /// 为什么必须有这条（2026-10-12 海辰报的 bug）：
+        ///   「我点击我们一键登录时没有反应（信息已填好的情况下），需要手动点击网页里的登录。」
+        ///   老代码碰到验证码就 return，一个字都不提交 —— 读代码"逻辑是对的"，
+        ///   但用户看到的就是"点了没反应"。只有真跑一遍提交才能证伪。
+        ///
+        /// 两轮，素材都是真的：
+        ///   轮 1 用**真实验证码样本**（80×24，真值 9DST，发布版 OCR 能完整认对）：
+        ///        ① 服务端收到 POST（证明真的提交了，不是只填了框）
+        ///        ② POST 里的验证码**正好等于 9DST**（证明"识别 → 填 → 提交"整条是通的）
+        ///        ③ 第一次故意回「验证码错误!」→ 必须换一张并再提交一次
+        ///   轮 2 用 OCR **认不出**的图：断言它**一次都不提交**、并如实说"请手动填"。
+        ///        （这条是 2026-10-12 修的真缺陷：原来"认不出也提交一次看结果"，
+        ///          等于白送学校一次登录失败记录。）
+        ///
+        /// ⚠️ 两个坑：
+        ///   1. 成功判据必须换掉 —— 跑自测的机器本来就是通的，第一次提交就会被判"成功"，
+        ///      重试路径永远测不到（假通过）。所以用 OnlineProbeForTest 手动控制。
+        ///   2. 自测期间要关掉"验证码样本采集"：这条用例会走完整提交链路，
+        ///      MaybeRecordSample 可能把**假门户的假验证码**当成真样本存进
+        ///      captcha-samples\ —— 而那个目录不在 DataSnapshot 的还原范围内
+        ///      （它只处理数据目录下的文件，不含子目录）。
+        /// </summary>
+        private static void TestAutoLoginFlow()
+        {
+            W("");
+            W("---- 用例：一键登录会自动提交并重试（假门户，真实验证码素材）----");
+
+            int samplesBefore = CaptchaAssist.CountSamples();
+            try
+            {
+                SetSampleCollect(false);   // 见上面坑 2
+
+                // 轮 1：能认出来的真图
+                FakePortalResult a = RunFakePortalEpisode(RealCaptchaPng(), 2, true, "轮1/能认出");
+                if (a.Skipped != 0)
+                {
+                    W("结果：跳过 —— 本机起不了监听端口（环境问题）。");
+                    return;
+                }
+                bool submitted = a.Posts >= 1;
+                bool ccRight = a.FirstCaptcha == "9DST";
+                bool retried = a.Posts >= 2;
+
+                W("① 服务端收到 POST = " + submitted + "（期望 True）");
+                W("② POST 里的验证码 = \"" + a.FirstCaptcha + "\" → 等于真值 9DST = " + ccRight
+                    + "（期望 True —— 这一条证明「识别→填→提交」是连着的）");
+                W("③ 首次被拒后自动重试 = " + retried + "（第 2 次验证码 = \""
+                    + a.SecondCaptcha + "\"，页面累计取图 " + a.FreshImageRequests + " 次）");
+                W("   最终状态 = \"" + a.Status + "\"");
+                W("   窗口自报尝试次数 = " + a.AttemptsReported + "（服务端实际收到 " + a.Posts + " 次 POST）");
+                W("   内部状态 = " + a.State);
+                W("   第1次提交时取图 " + a.ImagesAtFirstPost + " 次／第2次提交时取图 " + a.ImagesAtSecondPost + " 次"
+                    + "（第2次 > 第1次 才说明重试用的是新图）");
+                // ⚠️ 这里验的是"重试时用的是**重新取到**的图"，不是"程序点了换一张"：
+                //    真实门户的验证码响应是 Cache-Control: no-cache，提交失败后页面重载
+                //    会自己重新取一张（并且答案跟着换），所以程序不需要、也不该再点一次
+                //    「换一张」—— 多换一次等于凭空多转一次答案。取图次数 ≥2 就说明重试
+                //    是建立在新图上的（2026-10-12 实测确认了这条链路）。
+                bool freshImage = a.FreshImageRequests >= 2;
+                bool ok1 = submitted && ccRight && retried && freshImage && a.SuccessReported;
+
+                // 轮 2：认不出的图 → 一次都不该提交
+                FakePortalResult b = RunFakePortalEpisode(MakeTestCaptchaPng(64, 20), 2, true, "轮2/认不出");
+                W("轮2（认不出的图）：提交次数 = " + b.Posts + "（期望 0 —— 认不出就别白送一次失败）");
+                W("   状态 = \"" + b.Status + "\"");
+                bool ok2 = b.Posts == 0 && b.Status.IndexOf("手动", StringComparison.Ordinal) >= 0;
+
+                // 轮 3：服务端**永远拒绝** → 验"次数上限"这条安全属性兜不兜得住。
+                //        上限的意义是"别把学校端的失败次数打爆"，所以必须实测，
+                //        不能只靠"我看着代码里有 if (_autoAuthAttempts >= 3)"。
+                FakePortalResult c = RunFakePortalEpisode(RealCaptchaPng(), 999, false, "轮3/永不接受");
+                W("轮3（服务端永远拒绝、且不点按钮＝只算一轮）：");
+                W("   程序自己提交了 " + c.AttemptsReported + " 次（上限 3 —— 防「把账号失败次数打爆」）");
+                W("   服务端收到 " + c.Posts + " 次 POST（IE 对同一个 POST 结果页偶尔会多投递一次，"
+                    + "属假门户环境噪声，不是程序重复提交）");
+                W("   状态 = \"" + c.Status + "\"");
+                W("   内部状态 = " + c.State);
+                // ⚠️ 这里断言的是**程序自己的**提交次数，不是服务端收到的 POST 数：
+                //    前者才是我们控制的属性；后者含 IE 的投递噪声，拿它当判据会时红时绿。
+                bool ok3 = c.AttemptsReported >= 1 && c.AttemptsReported <= 3
+                        && c.Status.IndexOf("成功", StringComparison.Ordinal) < 0;
+
+                int samplesAfter = CaptchaAssist.CountSamples();
+                bool noPollution = samplesAfter == samplesBefore;
+                W("样本目录没有被写脏 = " + noPollution + "（" + samplesBefore + " → " + samplesAfter + "）");
+
+                bool ok = ok1 && ok2 && ok3 && noPollution;
+                W("结果：" + (ok
+                    ? "通过 —— 提交确实带着识别出来的验证码；被拒后换图重试；认不出时一次都不提交；重试有上限。"
+                    : "不通过 —— 见上面逐项。"));
+            }
+            catch (Exception ex)
+            {
+                W("!! 用例异常: " + ex.Message + " / " + ex.GetType().Name);
+            }
+            finally
+            {
+                SetSampleCollect(true);
+            }
+        }
+
+        /// <summary>假门户一轮的观测结果。</summary>
+        private sealed class FakePortalResult
+        {
+            public int Posts;
+            public int FreshImageRequests;      // 带 ?t= 的取图请求数 = "换一张"真的发生了
+            public string FirstCaptcha = "";
+            public string SecondCaptcha = "";
+            public string Status = "";
+            public bool SuccessReported;
+            public int AttemptsReported;        // 窗口自报的自动提交次数
+            public string State = "";           // 窗口内部状态（诊断用）
+            public int ImagesAtFirstPost;
+            public int ImagesAtSecondPost;
+            public int Skipped;                 // 1 = 环境问题跳过
+        }
+
+        /// <summary>
+        /// 跑一轮"假门户"：起本地服务 → 开真实认证窗 → 点「一键登录」→
+        /// 把服务端和窗口观察到的东西全带回来。
+        /// </summary>
+        private static FakePortalResult RunFakePortalEpisode(byte[] captchaPng, int acceptFromPost, bool clickIt, string label)
+        {
+            FakePortalResult r = new FakePortalResult();
+            MainWindow mw = null;
+            WebAuthWindow wa = null;
+            System.Net.HttpListener srv = null;
+            System.Threading.Thread th = null;
+            bool stop = false;
+            bool pretendOnline = false;
+            int port = 0, posts = 0, images = 0, imagesAtFirst = 0, imagesAtSecond = 0;
+            string first = "", second = "";
+
+            try
+            {
+                System.Random rnd = new System.Random();
+                for (int i = 0; i < 12 && srv == null; i++)
+                {
+                    int p = 43000 + rnd.Next(0, 6000);
+                    try
+                    {
+                        System.Net.HttpListener l = new System.Net.HttpListener();
+                        l.Prefixes.Add("http://127.0.0.1:" + p + "/");
+                        l.Start();
+                        srv = l;
+                        port = p;
+                    }
+                    catch { }
+                }
+                if (srv == null) { r.Skipped = 1; return r; }
+
+                th = new System.Threading.Thread(delegate()
+                {
+                    while (!stop)
+                    {
+                        try
+                        {
+                            System.Net.HttpListenerContext ctx = srv.GetContext();
+                            string path = ctx.Request.Url.AbsolutePath.ToLowerInvariant();
+
+                            if (path.IndexOf("checkcode") >= 0)
+                            {
+                                images++;
+                                ctx.Response.ContentType = "image/png";
+                                ctx.Response.ContentLength64 = captchaPng.Length;
+                                ctx.Response.OutputStream.Write(captchaPng, 0, captchaPng.Length);
+                                ctx.Response.Close();
+                                continue;
+                            }
+
+                            if (string.Equals(ctx.Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string body = new System.IO.StreamReader(ctx.Request.InputStream, Encoding.UTF8).ReadToEnd();
+                                string cc = FormValue(body, "TextBoxCC");
+                                posts++;
+                                // 记下"这次提交时，页面一共取过几次图" —— 用它判断重试
+                                // 到底用的是**新取的图**还是同一个表单被重复提交（后者必然失败）
+                                if (posts == 1) { first = cc; imagesAtFirst = images; }
+                                else if (posts == 2) { second = cc; imagesAtSecond = images; }
+
+                                bool reject = posts < acceptFromPost;
+                                if (!reject) pretendOnline = true;   // 让"成功判据"变 true
+                                Serve(ctx, reject ? LoginPage("验证码错误!") : SuccessPage());
+                                continue;
+                            }
+
+                            Serve(ctx, LoginPage(""));
+                        }
+                        catch { if (stop) break; }
+                    }
+                });
+                th.IsBackground = true;
+                th.Start();
+
+                mw = new MainWindow(false);
+                mw.Left = -4000;
+                mw.Top = -4000;
+                mw.ShowInTaskbar = false;
+                mw.Show();
+                Pump();
+
+                wa = new WebAuthWindow(mw);
+                wa.Left = -4000;
+                wa.Top = -4000;
+                wa.ShowInTaskbar = false;
+                wa.LoadUrlForTest("http://127.0.0.1:" + port + "/login");
+                wa.SetAutoSubmitForTest(true);
+                wa.OnlineProbeForTest = delegate() { return pretendOnline; };
+                wa.Show();
+
+                // 等页面 + 验证码就位
+                for (int i = 0; i < 40; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(250);
+                    if (wa.CaptchaRowVisibleForTest()) break;
+                }
+
+                // ⚠️ 点不点这个按钮要分清楚（2026-10-12 被它坑过一次）：
+                //    窗口一加载就会**自动**走一遍登录（设置里"打开后自动填表"默认勾着），
+                //    而"用户点一键登录"按设计是**开新的一轮**（额度归零）。
+                //    所以想量"一次尝试最多提交几次"，就**不能**点 —— 点了等于手动给它加额度。
+                if (clickIt) wa.ClickLoginForTest();
+
+                // 等第 1 次提交（认不出的情况会一直等到超时，这没关系）
+                for (int i = 0; i < 44 && posts < 1; i++) { Pump(); System.Threading.Thread.Sleep(250); }
+
+                // 再等重试（首次被拒时会发生）
+                for (int i = 0; i < 44 && posts < 2; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(400);
+                    if (acceptFromPost > 2) break;   // 永不放行的那轮不用等第二次
+                }
+
+                // 等状态稳定（成功提示或"请手动填"）
+                string st = "";
+                for (int i = 0; i < 40; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(250);
+                    st = wa.StatusForTest();
+                    if (st.IndexOf("成功", StringComparison.Ordinal) >= 0
+                        || st.IndexOf("手动", StringComparison.Ordinal) >= 0) break;
+                }
+
+                r.Posts = posts;
+                r.FreshImageRequests = images;
+                r.AttemptsReported = wa.AutoAuthAttemptsForTest();
+                r.State = wa.AutoStateForTest();
+                r.ImagesAtFirstPost = imagesAtFirst;
+                r.ImagesAtSecondPost = imagesAtSecond;
+                r.FirstCaptcha = first;
+                r.SecondCaptcha = second;
+                r.Status = st;
+                r.SuccessReported = st.IndexOf("成功", StringComparison.Ordinal) >= 0;
+            }
+            catch (Exception ex)
+            {
+                W("   (" + label + " 异常: " + ex.Message + ")");
+            }
+            finally
+            {
+                stop = true;
+                try { if (srv != null) srv.Stop(); } catch { }
+                try { if (th != null) th.Join(2000); } catch { }
+                try { if (wa != null) wa.Close(); } catch { }
+                try { if (mw != null) mw.Close(); } catch { }
+                try
+                {
+                    if (port > 0)
+                    {
+                        string dm;
+                        WebUrlStore.Delete("http://127.0.0.1:" + port + "/login", out dm);
+                    }
+                }
+                catch { }
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// 真实验证码样本（80×24，真值 9DST）。
+        /// 选它是因为发布版 OCR 对这张能**完整认对** —— 自测要断言"提交的验证码等于真值"，
+        /// 素材必须是能认对的，否则测的就成了识别率而不是这条链路。
+        /// 来自 portal-analysis 那批真实抓取（`_tmp_captcha_lab\samples\cc-019.png`）。
+        /// </summary>
+        private static byte[] RealCaptchaPng()
+        {
+            string b64 =
+                "iVBORw0KGgoAAAANSUhEUgAAAFAAAAAYCAYAAABtGnqsAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMA" +
+                "AA7DAcdvqGQAAAOUSURBVFhH3Ze9btswEIC1d/WSpVsGZ/ADZOgsIEAewF2ypGsLRKOHpGum7h6dR8jsxXmDPoCQN/ATsHcUjzye" +
+                "jhQl2UXaDzhYP6RIfjqScmUcFRxV1bONU/FydeWOHC++uX+a6jGMQx3RqUWWoLVX4Vudw0D93gueQLYFEqnK/E+yaS7FFpIiS5mb" +
+                "TRPgUw05Rxeq0qdSsdkiT0iyHycyJV+AxvSWoJORTDel56xbWDdVH9crDBwUHY+NMZTIQ6aPlkEip8rLiWu3eF9E426ORJM6NiR6" +
+                "rz1700CPaYBd1GbbutuCIPLZHHdrtQM+lp/NjXtmioZLU2LvyklU6Zmg8ZRmHSddA3pRw9NjeSEa0XuUwlldfOlL02K9M0dXh1Mk" +
+                "IZGJUwROkYckarVmWwdZ9T0UwzVuwyU2UQbgNQ7PwM1CTPH3nXldLoPEp0N3nbGt4wF64Bi65u+lslDis1lIR3FT5SF6TXiFODAr" +
+                "SqRaCzJJYgNCUawVg8G+DWOB3XWa3h0H80YSl2vz+91ddniB8CtXjJBhLURoM4cmsFhc5ps3ukNvo/oRJFW37ho1hr130mpIDT4A" +
+                "e4iNQRy/X3qBbz+7a4QXeXjyZV53sUE5DWs4T0F9zSEFFssbAL4JugdF2QG99+sfy0AvmO5du3MlVusgcPPNddbJpag+3ZlflIVf" +
+                "F10ZBp/GMrSNLCeSC8T+nQpoj08rAjOrW7MwMNM6tF25Cwmfwm+wxEWCcSD2eGE2JPDyzqywTV4Oor3Hvrjy+MvDTW9eHvH9cueI" +
+                "F3id2HkmElqQ7JvQkUykkAJ12DroNhL74tjAuZzqEfvkRFDc1qIMCyhAffTlT+svIxDhU5mFNr0lRQJhN8aBcoEWvtMKQYSf3iRE" +
+                "LA92ifD1mHjIQPmsORQ9hcRZWGaGqd2nRCAvg5uIOmCI3nuCc38/k1FclJ/CN1BByh4JX/KStUmSF2fh34eJfySu/JDAaP1bXpr7" +
+                "h7gr8J7so4YitTvLDOvtwnDixyaFysjQu0sPDptF+GBuYd7Q/Qp6ns4/XaDPsIeLwQ9pJLcL21C+EREpD5ECCRpPloxQf9Z70MAm" +
+                "oi1/eN0DDXlBuUjII+T3IEVm+VVJCSRoXJL+F0pMvwZH3UTiv3ApeAaqsXwy4s/HWRkSSKREpiguOeahZ0dMIw1tGo+hRKT95KKD" +
+                "IT6UwL+Be0lDIousZOUVZMMcPsqLI5FxZhvzBzJ5xBtWXx27AAAAAElFTkSuQmCC";
+            return Convert.FromBase64String(b64);
+        }
+
+        /// <summary>自测用：临时改"验证码样本采集"开关（settings.txt 会被 DataSnapshot 还原）。</summary>
+        private static void SetSampleCollect(bool on)
+        {
+            try
+            {
+                Dictionary<string, string> disk = ConfigStore.LoadSettings();
+                ConfigStore.SetBool(disk, CaptchaAssist.SampleCollectKey, on);
+                string msg;
+                ConfigStore.SaveSettings(disk, out msg);
+            }
+            catch { }
+        }
+
+        private static void Serve(System.Net.HttpListenerContext ctx, string html)
+        {
+            byte[] b = Encoding.UTF8.GetBytes(html);
+            ctx.Response.ContentType = "text/html; charset=utf-8";
+            ctx.Response.ContentLength64 = b.Length;
+            ctx.Response.OutputStream.Write(b, 0, b.Length);
+            ctx.Response.Close();
+        }
+
+        /// <summary>假登录页。errText 非空就带一条 class=error 的提示（ReadPageError 认这个）。</summary>
+        private static string LoginPage(string errText)
+        {
+            return "<html><body><form method='post' action='/login'>"
+                + "<div>上网账号: <input type='text' id='MainContent_SSOACC' name='ctl00$MainContent$SSOACC'></div>"
+                + "<div>密码: <input type='password' id='MainContent_SSOPWD' name='ctl00$MainContent$SSOPWD'></div>"
+                + "<div>验证码: <input type='text' id='MainContent_TextBoxCC' name='ctl00$MainContent$TextBoxCC' maxlength='4'>"
+                + "<img id='MainContent_ImageCC' src='/CheckCode'></div>"
+                + (errText.Length > 0 ? ("<span class='error'>" + errText + "</span>") : "")
+                + "<div><input type='submit' id='MainContent_LoginBtn' name='ctl00$MainContent$LoginBtn' value='登录'></div>"
+                + "</form></body></html>";
+        }
+
+        /// <summary>假"登录成功"页 —— 关键特征：**没有验证码**（照真实门户认证成功后跳转的样子）。</summary>
+        private static string SuccessPage()
+        {
+            return "<html><body><h2>已联网</h2><div>当前在线状态：已联网</div></body></html>";
+        }
+
+        /// <summary>从 POST 表单体里取某个字段（按字段名结尾匹配，兼容 ctl00$MainContent$Xxx 这种前缀）。</summary>
+        private static string FormValue(string body, string keySuffix)
+        {
+            if (string.IsNullOrEmpty(body)) return "";
+            string[] parts = body.Split('&');
+            for (int i = 0; i < parts.Length; i++)
+            {
+                int eq = parts[i].IndexOf('=');
+                if (eq <= 0) continue;
+                string k = parts[i].Substring(0, eq);
+                if (k.EndsWith(keySuffix, StringComparison.OrdinalIgnoreCase))
+                    return Uri.UnescapeDataString(parts[i].Substring(eq + 1).Replace("+", " "));
+            }
+            return "";
         }
 
         private static void TestFirstRunTip()

@@ -106,6 +106,42 @@ namespace CampusNetHelper
         /// </summary>
         private bool _sampleTriedThisLoad = false;
 
+        // ------------------------------------------------------------------
+        // 全自动登录（2026-10-12 海辰要求：一键登录要真的连上，不要人来点）
+        //
+        // 改之前的行为（他报的 bug）：页面上只要有验证码，填表路径填完账号密码就
+        // **停手不提交**；而且 _submittedThisLoad 一旦为 true，再点也什么都不做
+        // —— 表现就是"点了一键登录没反应，还得自己去点网页里的登录"。
+        //
+        // 现在：填账号密码 → 认验证码 → 填进框 → 点页面上的「登录」→ 判结果 →
+        //       没过就换一张重试（最多 AutoAuthMaxAttempts 次）。
+        // ------------------------------------------------------------------
+
+        /// <summary>自动提交开关（settings.txt 的 PortalAutoSubmit，默认开）。关掉就退回"只填不提交"。</summary>
+        private bool _autoSubmit = true;
+
+        /// <summary>本次自动登录已经提交了几次。</summary>
+        private int _autoAuthAttempts = 0;
+
+        /// <summary>自动登录流程是否在进行中（决定"新图到手后要不要接着再试一次"）。</summary>
+        private bool _autoAuthRunning = false;
+
+        /// <summary>最近一次自动提交时填进验证码框的内容（提示语要用）。</summary>
+        private string _autoAuthLastFill = "";
+
+        /// <summary>提交后等结果的看门狗：万一这次点击没触发页面回传，不能就这么挂着。</summary>
+        private DispatcherTimer _autoAuthWatchdog;
+
+        /// <summary>
+        /// 自动登录最多提交几次。
+        ///
+        /// ⚠️ 为什么是 3 而不是"一直试到成功"：每次失败学校端都记一次登录失败，
+        ///    而学校普遍对"连续失败"有次数限制（可能直接把账号锁一段时间）。
+        ///    3 次之内大概率能过（整图识别率约 1/3~1/2，3 次约七成把握），
+        ///    剩下那三成让用户自己补 —— 比冒"账号被锁"的风险划算。
+        /// </summary>
+        private const int AutoAuthMaxAttempts = 3;
+
         /// <summary>
         /// 「可访问文档 N 个」这条日志，最后一轮是第几轮加载时写的。
         ///
@@ -180,8 +216,10 @@ namespace CampusNetHelper
             _reauthMode = reauth;
             if (reauth)
             {
-                SetStatus("检测到掉线，已自动打开认证页。账号密码已帮你填好，"
-                    + "填一下验证码再点登录即可。");
+                // 2026-10-12：文案跟着行为改 —— 现在会自动识别并提交，不再是"你填验证码再点登录"。
+                SetStatus(_autoSubmit
+                    ? "检测到掉线，已自动打开认证页 —— 正在自动登录（账号密码 + 验证码都会自动填并提交）。"
+                    : "检测到掉线，已自动打开认证页。账号密码已帮你填好，填一下验证码再点登录即可。");
                 // 连通后自己也关掉 —— 和开机自启同样的道理：
                 // 任务完成了就不该留个窗口杵在那儿。用户在打游戏时尤其明显。
                 StartAutoCloseGuard();
@@ -249,6 +287,10 @@ namespace CampusNetHelper
                 {
                     if (_captchaPoll != null) _captchaPoll.Stop();
                     if (_captchaTypedTimer != null) _captchaTypedTimer.Stop();
+                    if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
+                    // 窗口没了就别再让后台线程去动 UI（那些回调都会检查这个标记）
+                    _autoAuthRunning = false;
+                    _autoAuthWaitNext = false;
                 }
                 catch { }
 
@@ -463,9 +505,13 @@ namespace CampusNetHelper
             };
             rowAcc.Children.Add(chkAuto);
 
-            btnLogin = MainWindow.MakePrimaryButton("填表并登录", OnLoginClick);
+            btnLogin = MainWindow.MakePrimaryButton("一键登录", OnLoginClick);
             btnLogin.FontSize = 12;
             btnLogin.Margin = new Thickness(16, 0, 0, 0);
+            // 2026-10-12：这个按钮从"填表并登录"改名成"一键登录" —— 因为它现在真的会
+            // 一条龙做完（填账号密码 → 认验证码 → 填 → 点登录 → 失败换一张重试）。
+            // 名字得对得上行为，否则用户会以为还得自己点网页里的登录。
+            btnLogin.ToolTip = "自动填账号密码 + 自动识别验证码 + 自动提交（失败会换一张重试，最多 3 次）";
             rowAcc.Children.Add(btnLogin);
 
             Grid.SetRow(rowAcc, 2);
@@ -631,6 +677,12 @@ namespace CampusNetHelper
 
         private void LoadFromOwner()
         {
+            // 全自动登录的开关（默认开，2026-10-12 海辰要求）。
+            // ⚠️ 必须在这里读 —— SetReauthMode 会用 _autoSubmit 决定那句状态文案，
+            //    而 MainWindow 是在构造完之后才调 SetReauthMode 的。
+            try { _autoSubmit = CaptchaAssist.AutoSubmitEnabled(ConfigStore.LoadSettings()); }
+            catch { _autoSubmit = true; }
+
             // 升级上来时，先把旧版单独存的那个网址搬进清单 ——
             // 用户不该因为升级就发现自己填过的地址不见了。
             owner.MigrateLegacyUrl();
@@ -979,6 +1031,13 @@ namespace CampusNetHelper
                 StartCaptchaTypedWatch();
 
                 Log.Info("验证码已抠出（原图 " + w + "×" + h + "）");
+
+                // 自动登录的重试流程在等新图 —— 图到手了就接着走下一次
+                if (_autoAuthWaitNext)
+                {
+                    _autoAuthWaitNext = false;
+                    ScheduleAutoAuthNext();
+                }
                 return true;
             }
             catch (Exception ex)
@@ -1084,43 +1143,26 @@ namespace CampusNetHelper
                     return;
                 }
 
-                CaptchaOcr.Result r = CaptchaOcr.RecognizePng(_captchaPng);
+                string fill = RecognizeCaptchaCandidate();
 
-                if (r.Error.Length > 0)
-                {
-                    SetCaptchaHint("识别不可用（" + r.Error + "），请手动填写。");
-                    Log.Warn("验证码识别失败: " + r.Error);
-                    return;
-                }
-
-                // ⚠️ 要填什么**只能**问 FillCandidate()，不能直接用 r.Text。
-                //    2026-10-03 的教训：直接用 Text 会把 "A?3?" 填进验证码框
-                //    （逐位闸门放过 2 位，Text 里就留着 '?'）。用户看到问号一脸问号。
-                //    现在策略是"总是填 4 位 top1"，只有某位连字符都没切出来才整体不填。
-                string fill = CaptchaOcr.FillCandidate(r);
                 if (fill.Length == 0)
                 {
-                    int unread = CaptchaOcr.UnreadableCount(r);
-
-                    // 失败必须留证。2026-10-03 海辰说"我看得很清楚，它却说无法识别"，
-                    // 而失败的那张图当时没留下来 —— 我只能靠日志猜，方向一开始就偏了。
-                    // 这里补上：把原图存到 captcha-fails\（与带答案的样本目录分开，
-                    // 免得没答案的图被当成带标签样本污染准确率统计）。
-                    if (CaptchaAssist.SampleCollectEnabled(ConfigStore.LoadSettings()))
-                    {
-                        string ferr;
-                        CaptchaAssist.SaveFailImage(_captchaPng, unread + "unread", out ferr);
-                    }
-
-                    SetCaptchaHint(CaptchaOcr.DescribeForUser(r));
+                    SetCaptchaHint(_lastOcrResult != null
+                        ? CaptchaOcr.DescribeForUser(_lastOcrResult)
+                        : "识别不可用，请手动填写。");
 
                     // 日志要把"没切出字符"和"认出来但没把握"分开说 ——
                     // 旧版一律写"置信度不足"，害得排查的人（就是我）往错的方向找。
-                    Log.Info("验证码识别：未填入 —— "
-                             + (unread > 0 ? ("有 " + unread + " 位没切出字符")
-                                           : "结果不是 4 位字母数字")
-                             + "（识别到 \"" + r.Text + "\"，达标 " + r.AcceptedCount
-                             + "/4，最小 margin=" + r.MinMargin.ToString("0.###") + "）");
+                    if (_lastOcrResult != null)
+                    {
+                        int unread = CaptchaOcr.UnreadableCount(_lastOcrResult);
+                        Log.Info("验证码识别：未填入 —— "
+                                 + (unread > 0 ? ("有 " + unread + " 位没切出字符")
+                                               : "结果不是 4 位字母数字")
+                                 + "（识别到 \"" + _lastOcrResult.Text + "\"，达标 "
+                                 + _lastOcrResult.AcceptedCount + "/4，最小 margin="
+                                 + _lastOcrResult.MinMargin.ToString("0.###") + "）");
+                    }
                     return;
                 }
 
@@ -1133,10 +1175,10 @@ namespace CampusNetHelper
 
                 // 让"用户填了什么"的监听立刻刷新一次，免得提示语自相矛盾
                 PollCaptchaTyped();
-                SetCaptchaHint(CaptchaOcr.DescribeForUser(r));
+                SetCaptchaHint(CaptchaOcr.DescribeForUser(_lastOcrResult));
                 Log.Info("验证码识别：已填入候选 " + fill
-                         + "（达标 " + r.AcceptedCount + "/4，最小 margin="
-                         + r.MinMargin.ToString("0.###") + "）");
+                         + "（达标 " + _lastOcrResult.AcceptedCount + "/4，最小 margin="
+                         + _lastOcrResult.MinMargin.ToString("0.###") + "）");
             }
             catch (Exception ex)
             {
@@ -1145,9 +1187,448 @@ namespace CampusNetHelper
             }
         }
 
-        /// <summary>把文字写进页面的验证码输入框。只赋值，不做任何提交动作。</summary>
-        private bool FillCaptchaBox(string text)
+        /// <summary>最近一次识别的完整结果（给提示语和日志用）。</summary>
+        private CaptchaOcr.Result _lastOcrResult;
+
+        /// <summary>
+        /// 识别当前这张验证码图，返回"该填进去的 4 位"（认不出返回空串）。
+        ///
+        /// ⚠️ 抽出来是给两条路径共用的（「自动填写」按钮 + 全自动登录）。
+        ///    两处各写一份必然漂移 —— 这正是本项目反复踩过的'判据分叉'。
+        ///    失败图留证也统一在这里做：2026-10-03 海辰说"我看得很清楚，它却说无法识别"，
+        ///    而当时失败的那张图没留下来，只能靠日志猜，方向一开始就偏了。
+        /// </summary>
+        private string RecognizeCaptchaCandidate()
         {
+            _lastOcrResult = null;
+            if (_captchaPng == null || _captchaPng.Length == 0) return "";
+
+            try
+            {
+                _lastOcrResult = CaptchaOcr.RecognizePng(_captchaPng);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("验证码识别异常: " + ex.Message);
+                return "";
+            }
+
+            if (_lastOcrResult.Error.Length > 0)
+            {
+                Log.Warn("验证码识别失败: " + _lastOcrResult.Error);
+                return "";
+            }
+
+            // ⚠️ 要填什么**只能**问 FillCandidate()，不能直接用 r.Text。
+            //    2026-10-03 的教训：直接用 Text 会把 "A?3?" 填进验证码框
+            //    （逐位闸门放过 2 位，Text 里就留着 '?'）。用户看到问号一脸问号。
+            //    现在策略是"总是填 4 位 top1"，只有某位连字符都没切出来才整体不填。
+            string fill = CaptchaOcr.FillCandidate(_lastOcrResult);
+            if (fill.Length == 0)
+            {
+                // 失败必须留证：存到 captcha-fails\（与带答案的样本目录分开，
+                // 免得没答案的图被当成带标签样本污染准确率统计）。
+                if (CaptchaAssist.SampleCollectEnabled(ConfigStore.LoadSettings()))
+                {
+                    string ferr;
+                    CaptchaAssist.SaveFailImage(_captchaPng,
+                        CaptchaOcr.UnreadableCount(_lastOcrResult) + "unread", out ferr);
+                }
+                return "";
+            }
+            return fill;
+        }
+
+        // ==================================================================
+        // 全自动登录：填账号密码 → 认验证码 → 填进框 → 点登录 → 判结果 → 有界重试
+        //
+        // 为什么要有这一块（2026-10-12 海辰报的 bug）：
+        //   "我点击我们一键登录时没有反应（信息已填好的情况下），需要手动点击网页里的登录。"
+        //   —— 改之前，只要页面上有验证码，填表路径填完账号密码就 return 了，
+        //   一个字都不提交；而且 _submittedThisLoad 为 true 之后再点也什么都不做。
+        //   那是当年刻意的设计（怕连续登录失败把账号锁了），但和"全自动"直接冲突。
+        // ==================================================================
+
+        /// <summary>
+        /// 页面上有验证码时，接手这次提交（识别 → 填框 → 点「登录」→ 判结果 → 有界重试）。
+        ///
+        /// 返回 true = 已接手（调用方别再自己提交，也别再提示"请手动点登录"）。
+        /// 返回 false = 自动提交关着（维持老行为：只填不提交，让用户自己来）。
+        /// </summary>
+        private bool TryAutoSubmitWithCaptcha(WinForms.HtmlElement submit, string accountDesc)
+        {
+            if (!_autoSubmit) return false;
+
+            // 正在等"换一张"的新图 → 别在这期间又发起一次尝试（否则会变成重复提交）。
+            // 新图到手后由 TryCaptureCaptcha 的钩子接着跑。
+            if (_autoAuthWaitNext) return true;
+
+            if (_autoAuthAttempts >= AutoAuthMaxAttempts)
+            {
+                // 次数用完了就不再点按钮 —— 把最后填进去的候选留着让人接手核对
+                SetStatus("自动登录已试满 " + AutoAuthMaxAttempts + " 次还没过 —— 请核对下面的验证码"
+                    + (_autoAuthLastFill.Length > 0 ? "（我最后填的是 " + _autoAuthLastFill + "）" : "")
+                    + "，手动点页面上的「登录」。");
+                return true;
+            }
+
+            // 从这里开始就算"自动流程在跑"了 —— 认不出要换图再认、提交后要判结果，
+            // 都靠这个标记接力（TryCaptureCaptcha / ScheduleAutoAuthNext 都在看它）。
+            // ⚠️ 必须在"认验证码"之前设上：下面那条"认不出 → 换一张 → 再认一次"的路
+            //    要靠它接力，设晚了 ScheduleAutoAuthNext 会判定"不在跑"直接空转。
+            _autoAuthRunning = true;
+
+            // 手上没有这张图就先抠一张（页面可能刚加载完，图还没进过 TryCaptureCaptcha）
+            if (_captchaPng == null || _captchaPng.Length == 0)
+            {
+                TryCaptureCaptcha();
+                StartCaptchaPoll(3);
+            }
+
+            string fill = RecognizeCaptchaCandidate();
+            _autoAuthLastFill = fill;
+
+            if (fill.Length == 0)
+            {
+                // ⚠️ 认不出就**不能提交**。
+                //    提交必然被服务器打回，而每一次失败学校端都会记一笔登录失败 ——
+                //    白送一次失败记录，什么也换不到。
+                //    （2026-10-12 自测里发现的：原先写的是"认不出也提交一次看结果"，
+                //     那是照搬了老代码"先提交一次把表单激活"的思路，在全自动场景下是有害的。）
+                //    先换一张再试一次识别（有些图就是特别糊）；还认不出就老实交给用户。
+                if (!_autoAuthTriedFresh)
+                {
+                    _autoAuthTriedFresh = true;
+                    SetStatus("这张验证码认不清，正在换一张再试…");
+                    SetCaptchaHint("这张认不清，换一张再试…");
+                    _autoAuthWaitNext = true;
+                    OnCaptchaRefresh();
+                    return true;
+                }
+
+                AutoAuthGiveUp("验证码认不出来（换过一张还是不行）");
+                SetStatus("验证码我认不出来（换过一张还是不行）—— 请手动填一下，再点页面上的「登录」。");
+                return true;
+            }
+
+            if (!FillCaptchaBox(fill))
+            {
+                AutoAuthGiveUp("识别结果写不进验证码框");
+                SetStatus("验证码认出来了，但写不进输入框 —— 请手动填一下再点「登录」。");
+                return true;
+            }
+
+            if (submit == null)
+            {
+                AutoAuthGiveUp("页面上找不到「登录」按钮");
+                SetStatus("这个页面有验证码，但找不到「登录」按钮 —— 请手动点一下页面上的登录。");
+                return true;
+            }
+
+            // ⚠️ 计数交给闸门（SubmitAllowed）去做 —— 它同时管住别的提交出口
+            if (!SubmitAllowed())
+            {
+                AutoAuthGiveUp("已经试满 " + AutoAuthMaxAttempts + " 次");
+                return true;
+            }
+            _autoAuthRunning = true;
+            _submittedThisLoad = true;
+            _autoAuthEntries++;      // 诊断用：到底进了几次这条路
+
+            Log.Info("自动登录：第 " + _autoAuthAttempts + "/" + AutoAuthMaxAttempts + " 次提交"
+                     + "（验证码填 \"" + fill + "\"）");
+            SetStatus("正在自动登录（第 " + _autoAuthAttempts + "/" + AutoAuthMaxAttempts + " 次）"
+                      + "，验证码填的是 " + fill + "…");
+            if (lblFound != null && accountDesc.Length > 0) lblFound.Text = accountDesc;
+
+            _submitCalls++;
+            ClickElement(submit);
+            AfterSubmitAuto();
+            StartAutoAuthWatchdog();
+            return true;
+        }
+
+        /// <summary>认不出验证码时"已经换过一张了"的标记（每轮只换一次，避免无限换图）。</summary>
+        private bool _autoAuthTriedFresh = false;
+
+        /// <summary>
+        /// 提交后等结果的看门狗：万一这次点击没触发页面回传（点偏了 / 按钮被禁用），
+        /// 不能就这么一直挂着"正在自动登录"。
+        /// </summary>
+        private void StartAutoAuthWatchdog()
+        {
+            if (_autoAuthWatchdog == null)
+            {
+                _autoAuthWatchdog = new DispatcherTimer { Interval = TimeSpan.FromSeconds(9) };
+                _autoAuthWatchdog.Tick += delegate(object s, EventArgs e)
+                {
+                    _autoAuthWatchdog.Stop();
+                    if (!_autoAuthRunning) return;
+                    Log.Warn("自动登录：提交后 9 秒没有任何结果，按失败处理");
+                    AutoAuthNextAttemptOrGiveUp("页面没有回传结果");
+                };
+            }
+            _autoAuthWatchdog.Stop();
+            _autoAuthWatchdog.Start();
+        }
+
+        /// <summary>
+        /// 自动登录版的结果判定（对应老 AfterSubmit，但带重试决策）。
+        ///
+        /// 成功判据仍然用全局唯一那一份 NetProbe.Online(true) —— 不许在这里另立一份。
+        /// </summary>
+        private void AfterSubmitAuto()
+        {
+            int attempt = _autoAuthAttempts;
+            Thread t = new Thread(delegate()
+            {
+                try
+                {
+                    Thread.Sleep(4000);      // 认证生效要一点时间
+                    bool netOk = ProbeOnlineNow();
+
+                    string pageErr = "";
+                    try
+                    {
+                        Dispatcher.Invoke(new Action(delegate()
+                        {
+                            try
+                            {
+                                WinForms.HtmlDocument d = (browser == null) ? null : browser.Document;
+                                if (d != null) pageErr = ReadPageError(All(d));
+                            }
+                            catch { }
+                        }));
+                    }
+                    catch { }
+
+                    try
+                    {
+                        Dispatcher.Invoke(new Action(delegate()
+                        {
+                            if (!_autoAuthRunning) return;      // 已经被别处收尾（成功/停手/关窗）
+
+                            if (netOk)
+                            {
+                                // ⚠️ 只让**最后一次提交**的检查者来报"成功"（2026-10-12 自测里发现）：
+                                //    失败后页面会重载并（由重试流程）再提交一次，而上一轮的检查者
+                                //    4 秒后才醒 —— 它会抢在新一轮前面报"成功（第 1 次提交）"，
+                                //    数字对不上，日志也会误导排查的人。
+                                if (attempt != _autoAuthAttempts) return;
+
+                                _autoAuthRunning = false;
+                                if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
+                                SetStatus("自动登录成功 —— 已经连上网了（第 " + attempt + " 次提交）。");
+                                Log.Info("自动登录：第 " + attempt + " 次提交成功");
+                                NotifyOwnerOnline();
+                                if (_startupAutoClose || _reauthMode)
+                                {
+                                    try { Close(); } catch { }
+                                }
+                                return;
+                            }
+
+                            AutoAuthNextAttemptOrGiveUp(pageErr);
+                        }));
+                    }
+                    catch { }
+                }
+                catch { }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        /// <summary>
+        /// 这一次没过：验证码错就换一张接着试，别的错立刻停手。
+        ///
+        /// ⚠️ 为什么必须区分这两类：账号密码错 / 被限速 / 被拉黑 ——
+        ///    这些再试一百次也是白搭，而且每一次都在学校端累加失败次数。
+        ///    只有"验证码错"才值得重试。
+        /// </summary>
+        private void AutoAuthNextAttemptOrGiveUp(string pageErr)
+        {
+            if (!_autoAuthRunning) return;
+            if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
+
+            bool captchaWrong = pageErr.IndexOf("验证码", StringComparison.Ordinal) >= 0
+                             || pageErr.IndexOf("校验码", StringComparison.Ordinal) >= 0
+                             || pageErr.IndexOf("图形码", StringComparison.Ordinal) >= 0;
+
+            if (!captchaWrong && pageErr.Length > 0)
+            {
+                AutoAuthGiveUp("服务器说：「" + pageErr + "」");
+                return;
+            }
+
+            if (_autoAuthAttempts >= AutoAuthMaxAttempts)
+            {
+                AutoAuthGiveUp(pageErr.Length > 0 ? ("服务器说：「" + pageErr + "」")
+                                                  : ("试了 " + AutoAuthMaxAttempts + " 次都没过"));
+                return;
+            }
+
+            Log.Info("自动登录：第 " + _autoAuthAttempts + " 次没过（"
+                     + (pageErr.Length > 0 ? pageErr : "没有明确报错") + "），换一张验证码再试");
+
+            // 换图也要有上限：万一新图一直没等到（页面不响应"换一张"），
+            // 不能就这么无限换下去 —— 那样会一直挂着"正在自动登录"。
+            _autoAuthRefreshCount++;
+            if (_autoAuthRefreshCount > 3)
+            {
+                AutoAuthGiveUp("连着换了几张验证码都没等到可用的图");
+                return;
+            }
+
+            SetStatus("这次没认对，正在换一张验证码重试…");
+            SetCaptchaHint("这次没认对，换一张重试…");
+
+            // 让**页面自己**重新要一张（程序绝不自己去请求 /CheckCode —— 见 CaptchaAssist 红线 1）。
+            // 新图到手后由 TryCaptureCaptcha 里那个钩子接着跑下一次。
+            _autoAuthWaitNext = true;
+            OnCaptchaRefresh();
+            // 再武装一次看门狗：上面那次 AutoAuthNextAttemptOrGiveUp 把它停了，
+            // 万一新图永远不来，9 秒后它会再进来判一次（那时 _autoAuthRefreshCount 已经加过，
+            // 很快就到上限停手）。
+            StartAutoAuthWatchdog();
+        }
+
+        /// <summary>本次自动登录里"换一张验证码"的次数（防止无限换图挂着不动）。</summary>
+        private int _autoAuthRefreshCount = 0;
+
+        /// <summary>自测用：进了几次自动提交这条路（诊断"提交次数对不上"用）。</summary>
+        private int _autoAuthEntries = 0;
+
+        /// <summary>自测用：Navigate 被调用了几次（排查"计数器被谁重置了"用）。</summary>
+        private int _navCount = 0;
+
+        /// <summary>自测用：老路径（只填不提交那条）实际提交了几次。</summary>
+        private int _oldPathSubmits = 0;
+
+        /// <summary>已经在状态里报过"次数用完了"，别每一轮重复喊。</summary>
+        private bool _submitCapReported = false;
+
+        /// <summary>自测用：客户端**真的调了几次提交动作**（和服务端收到的 POST 数对比，
+        /// 能分清"程序提交了多次"和"浏览器把一次提交投递了多次"）。</summary>
+        private int _submitCalls = 0;
+
+        /// <summary>自测用：闸门放行了几次。</summary>
+        private int _gateAllows = 0;
+
+        /// <summary>
+        /// 提交闸门 —— 一个窗口里**所有**提交动作都必须从这里过。
+        ///
+        /// ⚠️ 为什么要有这个（2026-10-12 自测实测到的真缺陷）：
+        ///    上限原来只判在"自动登录"那条路里，可填表路径还有别的提交出口
+        ///    （老路径的 SubmitForm / SubmitFirstForm、以及启发式尾部的直接点按钮）。
+        ///    假门户一直拒绝时，实测提交了 **4~10 次** —— 上限根本没兜住。
+        ///    而每一次失败学校端都会记一次登录失败，这正是上限要防的事。
+        ///    所以闸门必须装在"提交"这个动作**本身**上，而不是某一个调用方里。
+        ///
+        /// 保守模式（_autoSubmit=false，只填不提交）不受此限，行为与历史版本一致。
+        /// </summary>
+        private bool SubmitAllowed()
+        {
+            if (!_autoSubmit) return true;
+
+            if (_autoAuthAttempts >= AutoAuthMaxAttempts)
+            {
+                if (!_submitCapReported)
+                {
+                    _submitCapReported = true;
+                    Log.Warn("提交闸门拦下：本次已经提交过 " + _autoAuthAttempts + " 次（上限 "
+                             + AutoAuthMaxAttempts + " 次），不再继续，交给人工");
+                    SetStatus("已经自动提交过 " + AutoAuthMaxAttempts + " 次都没成功 —— 不再继续试了"
+                        + "（每次失败学校都会记一次登录失败，试太多可能把账号锁住）。"
+                        + "请核对下面的验证码，手动点页面上的「登录」。");
+                }
+                return false;
+            }
+
+            _autoAuthAttempts++;
+            _gateAllows++;
+            return true;
+        }
+
+        private void AutoAuthGiveUp(string why)
+        {
+            _autoAuthRunning = false;
+            if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
+            Log.Warn("自动登录停手：" + why);
+            SetStatus("自动登录没成功 —— " + why
+                + (_autoAuthLastFill.Length > 0 ? "。我最后填的验证码是 " + _autoAuthLastFill + "，" : "。")
+                + "你核对一下再点页面上的「登录」就行。");
+        }
+
+        /// <summary>换一张之后，等新图到手了接着跑下一次（由 TryCaptureCaptcha 消费这个标记）。</summary>
+        private bool _autoAuthWaitNext = false;
+
+        /// <summary>
+        /// 自测用：替换"这次提交成功了没有"的判据。
+        ///
+        /// 为什么必须有这个缝：真机上这个判据是 NetProbe.Online(true)，
+        /// 而跑自测的机器**往往本来就是通的** —— 那样第一次提交就会被判成"成功"，
+        /// "失败 → 换一张 → 再来一次"这条重试路径**永远测不到**，自测会假通过。
+        /// 产品代码里它是 null，行为与以前完全一致。
+        /// </summary>
+        internal Func<bool> OnlineProbeForTest = null;
+
+        private bool ProbeOnlineNow()
+        {
+            if (OnlineProbeForTest != null)
+            {
+                try { return OnlineProbeForTest(); }
+                catch { return false; }
+            }
+            return NetProbe.Online(true);
+        }
+
+        // ---- 下面几个都是自测入口（产品逻辑不依赖） ----
+        internal void SetAutoSubmitForTest(bool on) { _autoSubmit = on; }
+        internal void ClickLoginForTest() { OnLoginClick(); }
+        internal string StatusForTest() { return (lblStatus == null) ? "" : lblStatus.Text; }
+        internal int AutoAuthAttemptsForTest() { return _autoAuthAttempts; }
+
+        /// <summary>自测用：把自动登录的内部状态摊开（排查"提交了几次"这类问题用）。</summary>
+        internal string AutoStateForTest()
+        {
+            return "autoSubmit=" + _autoSubmit
+                 + " attempts=" + _autoAuthAttempts
+                 + " 进入次数=" + _autoAuthEntries
+                 + " running=" + _autoAuthRunning
+                 + " waitNext=" + _autoAuthWaitNext
+                 + " triedFresh=" + _autoAuthTriedFresh
+                 + " refresh=" + _autoAuthRefreshCount
+                 + " 有图=" + (_captchaPng != null)
+                 + " nav=" + _navCount
+                 + " 老路径提交=" + _oldPathSubmits
+                 + " 闸门放行=" + _gateAllows
+                 + " 客户端提交=" + _submitCalls
+                 + " 点击登录=" + _loginClicks;
+        }
+
+        /// <summary>
+        /// 新验证码图到手 → 如果是在自动登录的重试流程里，就接着走下一次。
+        ///
+        /// ⚠️ 这里必须重新走一遍完整的填表（TryAutoFillAndSubmit），不能只提交：
+        ///    ASP.NET WebForms 回传之后**账号密码框会被清空**（服务端不保存文本框内容），
+        ///    只提交的话第二次必然是"账号密码为空"的失败。
+        /// </summary>
+        private void ScheduleAutoAuthNext()
+        {
+            DispatcherTimer once = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
+            once.Tick += delegate(object s, EventArgs e)
+            {
+                once.Stop();
+                if (!_autoAuthRunning) return;
+                if (_autoAuthAttempts >= AutoAuthMaxAttempts) { AutoAuthGiveUp("次数用完了"); return; }
+                TryAutoFillAndSubmit(true);
+            };
+            once.Start();
+        }
+
+        /// <summary>把文字写进页面的验证码输入框。只赋值，不做任何提交动作。</summary>
+        private bool FillCaptchaBox(string text)        {
             if (browser == null || browser.Document == null) return false;
             try
             {
@@ -1568,9 +2049,22 @@ namespace CampusNetHelper
             // 用户手打了一个列表里已有的地址时，下拉框不该还停在别处。
             SyncUrlComboSelection(url);
 
+            _navCount++;
             _autoDoneThisLoad = false;
             _submittedThisLoad = false;
             _sampleTriedThisLoad = false;
+
+            // ⚠️⚠️ 这里**不能**重置 _autoAuthAttempts（2026-10-12 自测实测到的真缺陷）。
+            //    提交失败后页面回传**本身就是一次导航**（Navigate 会被调用），
+            //    一重置额度就又满了 —— 上限形同虚设：假门户一直拒绝时实测提交了
+            //    4~11 次（上限写的是 3）。而每次失败学校端都会记一次登录失败，
+            //    这正是上限要防的事。
+            //    额度属于"这一次登录"，不属于"这一页"：只在用户重新点「一键登录」
+            //    或窗口重新开一轮时才归零（见 OnLoginClick 和 SetReauthMode）。
+            _autoAuthRunning = false;
+            _autoAuthWaitNext = false;
+            _autoAuthTriedFresh = false;
+            if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
             _loadToken++;
             SetStatus("正在打开认证页…");
             if (lblFound != null) lblFound.Text = "";
@@ -1659,8 +2153,18 @@ namespace CampusNetHelper
             if (TryAutoFillAndSubmit(true)) _autoDoneThisLoad = true;
         }
 
+        /// <summary>自测用：OnLoginClick 被调了几次（排查"额度被谁重置"用）。</summary>
+        private int _loginClicks = 0;
+
         private void OnLoginClick()
         {
+            _loginClicks++;
+            // 用户主动点「一键登录」= 开一轮新的自动登录，重试次数重新算。
+            // （不重置的话，上一轮用掉的次数会累积，点第二次就直接"次数用完"了。）
+            _autoAuthAttempts = 0;
+            _autoAuthRunning = false;
+            _autoAuthWaitNext = false;
+            _autoAuthTriedFresh = false;
             if (TryAutoFillAndSubmit(false)) _autoDoneThisLoad = true;
         }
 
@@ -2108,12 +2612,28 @@ namespace CampusNetHelper
             Log.Info("字段档案填表：" + string.Join("、", done.ToArray()));
             ClearFieldErrors(all);
 
-            // 页面上有验证码就"填好 + 提交一次"，让表单活起来（见 TryAutoFillAndSubmit 里的说明）
+            // 页面上有验证码：自动提交开着就一路做完（认 → 填 → 点登录 → 有界重试），
+            // 关着才退回老行为（只填不提交）。
             bool hasCc = PageHasCaptcha(all);
+            // ⚠️ 这里**不能**再写 `&& !_autoAuthRunning`（2026-10-12 自测里踩到）：
+            //    重试路径最后也是回到 TryAutoFillAndSubmit 再走一遍，而那时
+            //    _autoAuthRunning 正是 true —— 条件不成立就会掉进下面"只填不提交"的老分支，
+            //    表现就是"该重试的时候反而提交了一次空验证码"。
+            //    "要不要重试、还能试几次"由 TryAutoSubmitWithCaptcha 自己把关。
+            if (hasCc && _autoSubmit)
+            {
+                WinForms.HtmlElement sb = FindSubmit(all);
+                if (TryAutoSubmitWithCaptcha(sb,
+                        "档案命中：「" + profile.Url + "」已填 " + filled + " 项 —— "
+                        + string.Join("、", done.ToArray())))
+                    return true;
+            }
+            // 老行为（自动提交关着时）：填好 + 提交一次空表单把表单"激活"，
+            // 让用户自己填完验证码点登录就能过。
             if (hasCc && !_submittedThisLoad)
             {
                 _submittedThisLoad = true;
-                SubmitFirstForm(all);
+                if (SubmitAllowed()) { _oldPathSubmits++; _submitCalls++; SubmitFirstForm(all); }
             }
 
             if (lblFound != null)
@@ -2414,14 +2934,27 @@ namespace CampusNetHelper
                 // 反复失败可能直接把账号锁一段时间。宁可让用户自己点一下。
                 if (HasCaptcha(all))
                 {
+                    // 自动提交开着：认验证码 → 填进框 → 点「登录」，失败换一张重试（最多 3 次）。
+                    // 这就是"一键登录点了没反应"的修复点 —— 老代码在这里直接 return，
+                    // 一个字都不提交，用户只能自己去点网页里的登录。
+                    if (_autoSubmit)
+                    {
+                        if (TryAutoSubmitWithCaptcha(submit,
+                                "识别结果：账号框「" + Describe(us) + "」 密码框「" + Describe(pw) + "」"
+                                + (us2 != null ? " 附加账号框「" + Describe(us2) + "」" : "")
+                                + "；验证码 → 自动识别并提交"))
+                            return true;
+                    }
+
+                    // 自动提交关着（用户选了保守行为）：维持"只填不提交"。
                     // 光填进去不够 —— ASP.NET WebForms 的验证码是服务端生成的，
-                    // 必须把表单**提交**给服务器才能校验。所以：填好 ➜ 按一下回车触发一次提交，
+                    // 必须把表单**提交**给服务器才能校验。所以：填好 ➜ 触发一次提交，
                     // 服务器返回"验证码错误!"。这样既不绕过验证码（还是得人来填），
-                    // 又让用户填完验证码直接在页面上点「登录」就能过 —— 不会卡在"必须先提交一次"。
+                    // 又让用户填完验证码直接在页面上点「登录」就能过。
                     if (!_submittedThisLoad)
                     {
                         _submittedThisLoad = true;
-                        SubmitForm(pw);
+                        if (SubmitAllowed()) { _oldPathSubmits++; _submitCalls++; SubmitForm(pw); }
                     }
 
                     SetStatus("这个页面有图形验证码 —— 账号密码已经帮你填好，"
@@ -2441,6 +2974,12 @@ namespace CampusNetHelper
                     return true;
                 }
 
+                if (!SubmitAllowed())
+                {
+                    SetStatus("已经自动提交过 " + AutoAuthMaxAttempts + " 次都没成功 —— 不再继续试了，"
+                        + "请手动点页面上的「登录」。");
+                    return true;
+                }
                 SetStatus("已识别登录框，正在提交…");
                 if (lblFound != null)
                 {
@@ -2449,6 +2988,7 @@ namespace CampusNetHelper
                         + " 提交按钮「" + Describe(submit) + "」";
                 }
 
+                _submitCalls++;
                 ClickElement(submit);
                 AfterSubmit();
                 return true;
