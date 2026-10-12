@@ -211,6 +211,33 @@ namespace CampusNetHelper
         ///
         /// ⚠️ 这个模式下同样**绝不自动填验证码** —— 那是用户的活。
         /// </summary>
+        /// <summary>
+        /// 后台静默模式：窗口摆到**屏幕外**，用户完全看不见，但它仍然"在显示状态"——
+        /// 这一点是关键：内嵌的 IE 控件只有在真正显示着的时候才会渲染和联网，
+        /// 单纯隐藏窗口（Visibility=Hidden）会让页面加载不出来。
+        /// 本项目的自测一直就是这么跑的（-4000,-4000），所以这条路径是验证过的。
+        ///
+        /// 2026-10-12 海辰要求：「我要打游戏，测试自己在后台跑，别弹窗」。
+        /// </summary>
+        internal void SetBackgroundSilent(bool on)
+        {
+            _backgroundSilent = on;
+            if (!on) return;
+            try
+            {
+                WindowStartupLocation = WindowStartupLocation.Manual;
+                Left = -4000;
+                Top = -4000;
+                ShowInTaskbar = false;
+                ShowActivated = false;
+            }
+            catch { }
+        }
+
+        /// <summary>是不是"后台静默"跑着的（决定了收尾时要不要发托盘气泡告知）。</summary>
+        private bool _backgroundSilent = false;
+        internal bool IsBackgroundSilent() { return _backgroundSilent; }
+
         internal void SetReauthMode(bool reauth)
         {
             _reauthMode = reauth;
@@ -1285,6 +1312,17 @@ namespace CampusNetHelper
                 StartCaptchaPoll(3);
             }
 
+            // 还是没有 → 说明页面刚回传、新图还没下载完。
+            // ⚠️ 这时候**绝不能**退回用旧图（就是海辰遇到的那个"填上一次的验证码"），
+            //    也不能算成"认不出"（那会白白多换一张图）。等抠到图，由钩子接着跑。
+            if (_captchaPng == null || _captchaPng.Length == 0)
+            {
+                Log.Info("自动登录：新验证码还没下载完，先等图（不用旧图提交）");
+                SetStatus("正在等新的验证码图…");
+                _autoAuthWaitNext = true;
+                return true;
+            }
+
             string fill = RecognizeCaptchaCandidate();
             _autoAuthLastFill = fill;
 
@@ -1328,15 +1366,27 @@ namespace CampusNetHelper
             // ⚠️ 计数交给闸门（SubmitAllowed）去做 —— 它同时管住别的提交出口
             if (!SubmitAllowed())
             {
-                AutoAuthGiveUp("已经试满 " + AutoAuthMaxAttempts + " 次");
+                // ⚠️ 闸门拒绝有**三种**原因，不能一律当成"次数用完了"（2026-10-12 自测抓到）：
+                //    ① 离上次提交太近（速率闸）→ 等一会儿还能继续，**绝不能把流程判死**
+                //       （早先这里一律 AutoAuthGiveUp，结果正常重试被误判成"试满 3 次"直接放弃）
+                //    ② 10 分钟窗口用完 → 该停手
+                //    ③ 本轮次数用完 → 该停手
+                if (_autoAuthAttempts >= AutoAuthMaxAttempts || _submitWindowCount >= SubmitWindowMax)
+                {
+                    AutoAuthGiveUp("提交次数已用完");
+                    return true;
+                }
+                Log.Info("自动登录：这次尝试被速率闸拦下（离上次提交太近），稍后由定时器自然重试");
                 return true;
             }
             _autoAuthRunning = true;
             _submittedThisLoad = true;
             _autoAuthEntries++;      // 诊断用：到底进了几次这条路
 
+            // 来源标签：2026-10-12 那次"一秒 4 次提交"就是靠它才定位到驱动者的
+            //（日志里只写"第 N 次提交"看不出是谁在反复触发）。
             Log.Info("自动登录：第 " + _autoAuthAttempts + "/" + AutoAuthMaxAttempts + " 次提交"
-                     + "（验证码填 \"" + fill + "\"）");
+                     + "（验证码填 \"" + fill + "\"，来源=" + CallerTag() + "）");
             SetStatus("正在自动登录（第 " + _autoAuthAttempts + "/" + AutoAuthMaxAttempts + " 次）"
                       + "，验证码填的是 " + fill + "…");
             if (lblFound != null && accountDesc.Length > 0) lblFound.Text = accountDesc;
@@ -1515,6 +1565,34 @@ namespace CampusNetHelper
         /// <summary>自测用：闸门放行了几次。</summary>
         private int _gateAllows = 0;
 
+        /// <summary>上一次真正提交的时刻（速率闸用）。</summary>
+        private DateTime _lastSubmitAt = DateTime.MinValue;
+
+        /// <summary>滑动窗口的起点与已提交次数（**没有任何重置代码**，这是它能兜住的原因）。</summary>
+        private DateTime _submitWindowStart = DateTime.MinValue;
+        private int _submitWindowCount = 0;
+        private bool _submitWindowReported = false;
+
+        /// <summary>
+        /// 两次提交之间的最短间隔（毫秒）。
+        ///
+        /// ⚠️ 这个值不能乱调：**正常重试的节奏是 4~5 秒**（提交 → 等 4 秒判结果 → 换一张 → 再提交），
+        ///    所以间隔必须明显小于 4 秒，否则会把正常重试也挡掉。
+        ///    而那次风暴是 **300 毫秒一次**，3 秒足够把它按住。
+        ///    真正兜底的是下面那道"10 分钟最多 3 次"的窗口闸。
+        /// </summary>
+        private const int MinSubmitGapMs = 3000;
+
+        /// <summary>
+        /// 滑动窗口长度与上限：10 分钟最多 5 次。
+        ///
+        /// 为什么是 5 而不是 3：**一轮自动登录最多会用掉 3 次**（AutoAuthMaxAttempts），
+        /// 留 2 次余量给"10 分钟内又掉一次线"。而那次风暴是 60 次/天、一秒 4 次 ——
+        /// 5 这个量级既能兜住风暴，又不会把正常使用卡死。
+        /// </summary>
+        private const int SubmitWindowMinutes = 10;
+        private const int SubmitWindowMax = 5;
+
         /// <summary>
         /// 提交闸门 —— 一个窗口里**所有**提交动作都必须从这里过。
         ///
@@ -1530,6 +1608,43 @@ namespace CampusNetHelper
         private bool SubmitAllowed()
         {
             if (!_autoSubmit) return true;
+
+            // ① 速率闸：两次提交至少隔 MinSubmitGapMs。
+            //    ⚠️⚠️ 2026-10-12 血案（海辰真实日志）：一秒里提交了 4 次、一天 60 次，
+            //    而且每次都打印"第 1/3 次" —— 说明**有某条路径把 _autoAuthAttempts 反复重置**，
+            //    "3 次上限"形同虚设，学校端被记了一堆失败。
+            //    结论：**上限不能只靠一个会被重置的计数器**，必须有不依赖任何状态的闸。
+            //    这一道（时间间隔）和下一道（滑动窗口）都是这个作用。
+            double sinceMs = (DateTime.Now - _lastSubmitAt).TotalMilliseconds;
+            if (_lastSubmitAt != DateTime.MinValue && sinceMs < MinSubmitGapMs)
+            {
+                Log.Warn("提交闸门拦下：离上次提交只有 " + (int)sinceMs + " 毫秒（最短间隔 "
+                         + MinSubmitGapMs + " 毫秒），疑似提交风暴");
+                return false;
+            }
+
+            // ② 滑动窗口闸：SubmitWindowMinutes 分钟内最多 SubmitWindowMax 次。
+            //    这两道闸**没有任何地方会重置它们**（不是"注意别重置"，是根本没写重置代码）。
+            if (_submitWindowStart == DateTime.MinValue
+                || (DateTime.Now - _submitWindowStart).TotalMinutes >= SubmitWindowMinutes)
+            {
+                _submitWindowStart = DateTime.Now;
+                _submitWindowCount = 0;
+            }
+            if (_submitWindowCount >= SubmitWindowMax)
+            {
+                if (!_submitWindowReported)
+                {
+                    _submitWindowReported = true;
+                    Log.Warn("提交闸门拦下：" + SubmitWindowMinutes + " 分钟内已提交 "
+                             + _submitWindowCount + " 次，本轮不再自动提交");
+                    SetStatus("最近 " + SubmitWindowMinutes + " 分钟内已经自动提交过 "
+                        + SubmitWindowMax + " 次都没成功 —— 先停下（免得学校端把账号当成攻击）。"
+                        + "请手动核对验证码后点页面上的「登录」，或过一会儿再试。");
+                }
+                return false;
+            }
+            _submitWindowCount++;
 
             if (_autoAuthAttempts >= AutoAuthMaxAttempts)
             {
@@ -1547,6 +1662,7 @@ namespace CampusNetHelper
 
             _autoAuthAttempts++;
             _gateAllows++;
+            _lastSubmitAt = DateTime.Now;
             return true;
         }
 
@@ -1555,6 +1671,19 @@ namespace CampusNetHelper
             _autoAuthRunning = false;
             if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
             Log.Warn("自动登录停手：" + why);
+
+            // 后台静默跑的时候窗口在屏幕外，用户看不到状态条 —— 失败必须用气泡告知，
+            // 否则他会以为"网络自己好了"，其实一直没登上去。
+            if (_backgroundSilent)
+            {
+                try
+                {
+                    MainWindow mw = Owner as MainWindow;
+                    if (mw != null)
+                        mw.NotifyBackgroundAuthFailed(why, _autoAuthLastFill);
+                }
+                catch { }
+            }
             SetStatus("自动登录没成功 —— " + why
                 + (_autoAuthLastFill.Length > 0 ? "。我最后填的验证码是 " + _autoAuthLastFill + "，" : "。")
                 + "你核对一下再点页面上的「登录」就行。");
@@ -1588,6 +1717,9 @@ namespace CampusNetHelper
         internal void ClickLoginForTest() { OnLoginClick(); }
         internal string StatusForTest() { return (lblStatus == null) ? "" : lblStatus.Text; }
         internal int AutoAuthAttemptsForTest() { return _autoAuthAttempts; }
+
+        /// <summary>自测用：滑动窗口闸的计数（验证"上限兜得住"用）。</summary>
+        internal int SubmitWindowCountForTest() { return _submitWindowCount; }
 
         /// <summary>自测用：把自动登录的内部状态摊开（排查"提交了几次"这类问题用）。</summary>
         internal string AutoStateForTest()
@@ -2137,7 +2269,14 @@ namespace CampusNetHelper
             //    一旦开始抠新页面的图，上一轮的那张就被覆盖了，样本也就配不上对。
             MaybeRecordSample();
 
-            // 页面换了，上一轮的图作废，重新抠一次（扣不到就说明本页没有验证码）
+            // ⚠️⚠️ 页面换了 → 手里那张验证码图**立刻作废**（2026-10-12 海辰报的 bug：
+            //   "它帮我自动登录填的验证码是上一次刷新的，不是最新的，导致一直失败"）。
+            //   页面回传之后服务器那边的答案已经换成新图的了（no-cache，浏览器会重新下载），
+            //   拿旧图上的字去填必然对不上。所以在这里清掉 —— 后面的提交路径于是
+            //   只能重新抠一张，不可能再拿到隔页的旧图。
+            _captchaPng = null;
+
+            // 页面换了，重新抠一次（抠不到就说明本页没有验证码）
             _captchaPollKeepRow = false;
             StartCaptchaPoll(5);
 
@@ -2151,6 +2290,22 @@ namespace CampusNetHelper
 
             // 只有**真的动过手**才算处理完；没找到框就留给重试，别把机会耗掉
             if (TryAutoFillAndSubmit(true)) _autoDoneThisLoad = true;
+        }
+
+        /// <summary>
+        /// 取"谁在调我"——只用于日志。日志里光写"第 N 次提交"是查不出循环驱动者的，
+        /// 2026-10-12 那次提交风暴就是靠这个标签定位的。
+        /// </summary>
+        private static string CallerTag()
+        {
+            try
+            {
+                System.Diagnostics.StackTrace st = new System.Diagnostics.StackTrace(false);
+                if (st.FrameCount > 2 && st.GetFrame(2) != null)
+                    return st.GetFrame(2).GetMethod().Name;
+            }
+            catch { }
+            return "?";
         }
 
         /// <summary>自测用：OnLoginClick 被调了几次（排查"额度被谁重置"用）。</summary>

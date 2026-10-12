@@ -1355,10 +1355,13 @@ namespace CampusNetHelper
                 // ShowActivated=false），但真的把认证页打开并跑自动登录
                 // （填账号密码 → 认验证码 → 提交 → 失败换一张重试）。
                 // 气泡保留，作用是"告诉你发生了什么"，点它能把窗口调到前台。
-                Log.Info("网页认证自动重连（后台）：直接打开认证页并自动登录（不抢焦点）");
-                ShowBalloon("正在自动重新认证", "网络断了，正在后台自动登录…");
+                // 2026-10-12 海辰追加要求：「我要打游戏，测试自己在后台跑，**别弹窗**」。
+                // 所以这里不再发"正在重新认证"的气泡（打游戏时那是纯噪音），
+                // 窗口也摆到屏幕外（见 OpenWebAuthWindowForReauth 里的 SetBackgroundSilent）。
+                // 只有**失败**才发一次气泡——那时候他确实需要知道。
+                Log.Info("网页认证自动重连（后台）：静默自动登录（窗口在屏幕外，不发气泡）");
                 _portalReauthAttempts++;
-                AddHistory("认证失效 · 已自动打开认证页（后台）");
+                AddHistory("认证失效 · 已静默自动登录（后台）");
                 OpenWebAuthWindowForReauth();
                 return;
             }
@@ -1403,6 +1406,10 @@ namespace CampusNetHelper
                 _webAuthWindow.SetReauthMode(true);   // 通知它：这是自动重连，走自动填表
                 _webAuthWindow.Owner = this;
                 _webAuthWindow.ShowActivated = false;   // ⚠️ 不抢焦点
+                // ⚠️ 窗口摆到屏幕外：用户完全看不见，但 IE 仍然正常渲染/联网。
+                //    这条路径自测里跑了无数遍（-4000,-4000），是验证过的。
+                //    用户可能正在全屏打游戏，弹任何窗口都是打扰。
+                _webAuthWindow.SetBackgroundSilent(true);
 
                 _webAuthWindow.Closed += delegate(object s, EventArgs a)
                 {
@@ -1418,13 +1425,30 @@ namespace CampusNetHelper
                 };
 
                 _webAuthWindow.Show();
-                AddHistory("已自动打开认证页 · 请填验证码并登录");
+                AddHistory("已在后台静默自动登录（窗口在屏幕外）");
             }
             catch (Exception ex)
             {
                 _portalReauthRunning = false;
                 Log.Error("网页认证自动重连：打开认证页失败", ex);
             }
+        }
+
+        /// <summary>
+        /// 后台静默自动登录失败了 —— 窗口在屏幕外，用户看不见任何东西，
+        /// 必须用托盘气泡告诉他一声（否则他会以为网络自己好了）。
+        /// </summary>
+        internal void NotifyBackgroundAuthFailed(string why, string lastFill)
+        {
+            try
+            {
+                string tip = why;
+                if (!string.IsNullOrEmpty(lastFill))
+                    tip += "。它最后填的验证码是 " + lastFill + "，可以点开认证页核对一下。";
+                ShowBalloon("自动登录没成功，需要你看一眼", tip);
+                Log.Warn("后台自动登录失败，已发气泡告知用户：" + why);
+            }
+            catch { }
         }
 
         /// <summary>

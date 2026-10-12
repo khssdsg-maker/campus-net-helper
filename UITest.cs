@@ -1889,13 +1889,23 @@ namespace CampusNetHelper
                 bool ok3 = c.AttemptsReported >= 1 && c.AttemptsReported <= 3
                         && c.Status.IndexOf("成功", StringComparison.Ordinal) < 0;
 
+                // 轮 4：连点 10 次「一键登录」——模仿海辰那次提交风暴。
+                //        断言：不管被点多少下，客户端提交次数都不许超过 3（窗口闸）。
+                FakePortalResult sd = RunFakePortalEpisode(RealCaptchaPng(), 999, false, 10, "轮4/连点风暴");
+                // ⚠️ 判据用**服务端收到的 POST 数**，不用窗口内部那个计数器：
+                //    连点按钮按设计会把那个计数器重置（"用户又来了一次"），
+                //    拿它当判据测的就不是"风暴兜没兜住"，而是"计数器有没有被重置"。
+                W("轮4（连点 10 次按钮 = 提交风暴）：服务端收到 POST " + sd.Posts + " 次，"
+                    + "窗口闸计数 " + sd.SubmitWindow + "（都必须 ≤ 5 —— 风暴是 60 次/天，必须被按住）");
+                bool ok4 = sd.Posts <= 5 && sd.SubmitWindow <= 5;   // 风暴兜住：不许超过窗口上限
+
                 int samplesAfter = CaptchaAssist.CountSamples();
                 bool noPollution = samplesAfter == samplesBefore;
                 W("样本目录没有被写脏 = " + noPollution + "（" + samplesBefore + " → " + samplesAfter + "）");
 
-                bool ok = ok1 && ok2 && ok3 && noPollution;
+                bool ok = ok1 && ok2 && ok3 && ok4 && noPollution;
                 W("结果：" + (ok
-                    ? "通过 —— 提交确实带着识别出来的验证码；被拒后换图重试；认不出时一次都不提交；重试有上限。"
+                    ? "通过 —— 提交带着识别出来的验证码；被拒后换图重试；认不出时一次都不提交；连点也不会超过 3 次。"
                     : "不通过 —— 见上面逐项。"));
             }
             catch (Exception ex)
@@ -1921,6 +1931,7 @@ namespace CampusNetHelper
             public string State = "";           // 窗口内部状态（诊断用）
             public int ImagesAtFirstPost;
             public int ImagesAtSecondPost;
+            public int SubmitWindow;
             public int Skipped;                 // 1 = 环境问题跳过
         }
 
@@ -1929,6 +1940,11 @@ namespace CampusNetHelper
         /// 把服务端和窗口观察到的东西全带回来。
         /// </summary>
         private static FakePortalResult RunFakePortalEpisode(byte[] captchaPng, int acceptFromPost, bool clickIt, string label)
+        {
+            return RunFakePortalEpisode(captchaPng, acceptFromPost, clickIt, 0, label);
+        }
+
+        private static FakePortalResult RunFakePortalEpisode(byte[] captchaPng, int acceptFromPost, bool clickIt, int stormClicks, string label)
         {
             FakePortalResult r = new FakePortalResult();
             MainWindow mw = null;
@@ -2031,6 +2047,17 @@ namespace CampusNetHelper
                 //    所以想量"一次尝试最多提交几次"，就**不能**点 —— 点了等于手动给它加额度。
                 if (clickIt) wa.ClickLoginForTest();
 
+                // stormClicks > 0：**模拟海辰那次"提交风暴"** —— 连点按钮。
+                // 2026-10-12 他的真实日志里一秒被提交了 4 次、一天 60 次，
+                // 原因是计数上限被某条路径反复重置。这里连点就是为了证明
+                // 现在那两道"无状态的闸"（速率 + 滑动窗口）兜得住。
+                for (int i = 0; i < stormClicks; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(200);
+                    wa.ClickLoginForTest();
+                }
+
                 // 等第 1 次提交（认不出的情况会一直等到超时，这没关系）
                 for (int i = 0; i < 44 && posts < 1; i++) { Pump(); System.Threading.Thread.Sleep(250); }
 
@@ -2056,6 +2083,7 @@ namespace CampusNetHelper
                 r.Posts = posts;
                 r.FreshImageRequests = images;
                 r.AttemptsReported = wa.AutoAuthAttemptsForTest();
+                r.SubmitWindow = wa.SubmitWindowCountForTest();
                 r.State = wa.AutoStateForTest();
                 r.ImagesAtFirstPost = imagesAtFirst;
                 r.ImagesAtSecondPost = imagesAtSecond;
