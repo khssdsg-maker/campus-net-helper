@@ -6,6 +6,7 @@ using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Text;
 
 namespace CampusNetHelper
 {
@@ -748,6 +749,63 @@ namespace CampusNetHelper
         }
 
         /// <summary>
+        /// 逐张导出识别结果（诊断用，不联网、不登录、不改任何状态）。
+        ///
+        /// 为什么要有它（2026-10-12 做人工质检工具时加的）：
+        ///   MeasureDirectory 只给**汇总**数字，回答不了"到底哪几张错了、错在哪一位"。
+        ///   而提升识别率恰恰要从错例下手 —— 需要一份逐张的结果清单。
+        ///   更关键的是：这份清单必须由**发布版本身**产出，
+        ///   让质检时看到的候选和程序真正会填进去的**永远是同一个东西**；
+        ///   另写一套 Python 原型来跑，迟早会和 C# 实现漂移（项目里已经吃过判据分叉的亏）。
+        ///
+        /// 输出 CSV：文件名, 真值, 识别结果, 达标位数, 最小margin, 点名位, 是否全对
+        /// 标签同样取文件名的最后 4 位（与 MeasureDirectory、captcha-samples 同一套约定）。
+        /// 返回写出的行数。
+        /// </summary>
+        public static int DumpDirectory(string dir, string outPath)
+        {
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return -1;
+
+            string[] files;
+            try { files = Directory.GetFiles(dir, "*.png"); }
+            catch { return -1; }
+            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("file,truth,guess,accepted,minmargin,weakest,allok");
+            int rows = 0;
+
+            for (int i = 0; i < files.Length; i++)
+            {
+                string stem = Path.GetFileNameWithoutExtension(files[i]);
+                string label = (stem.Length >= 4) ? stem.Substring(stem.Length - 4).ToUpperInvariant() : "";
+
+                byte[] png;
+                try { png = File.ReadAllBytes(files[i]); }
+                catch { continue; }
+
+                Result r = RecognizePng(png);
+                if (r.Error.Length > 0) continue;
+
+                string fill = FillCandidate(r);
+                bool allOk = (fill.Length == 4) && (label.Length == 4) && (fill == label);
+
+                sb.Append(Path.GetFileName(files[i])).Append(',')
+                  .Append(label).Append(',')
+                  .Append(fill).Append(',')
+                  .Append(r.AcceptedCount).Append(',')
+                  .Append(r.MinMargin.ToString("0.###", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(r.WeakestIndex).Append(',')
+                  .Append(allOk ? "1" : "0").AppendLine();
+                rows++;
+            }
+
+            try { File.WriteAllText(outPath, sb.ToString(), new UTF8Encoding(false)); }
+            catch { return -1; }
+            return rows;
+        }
+
+        /// <summary>
         /// 扫一个目录，对每个"文件名里带 4 位标签"的 PNG 跑识别并比对。
         /// 标签取文件名（去掉扩展名）的**最后 4 个字符**，正好同时适配
         /// cc-000-SK84.png 和 yyyyMMdd-HHmmss-fff-SK84.png 两种命名。
@@ -759,8 +817,7 @@ namespace CampusNetHelper
         /// 另外无条件断言"绝不放非字母数字进输入框"（FillViolations 必须为 0）。
         /// </summary>
         public static Accuracy MeasureDirectory(string dir, out string error)
-        {
-            error = "";
+        {            error = "";
             Accuracy acc = new Accuracy();
             if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
             {

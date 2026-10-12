@@ -55,6 +55,43 @@ namespace CampusNetHelper
                 }
             }
 
+            // 识别结果逐张导出（诊断用）：--ocr-dump <图片目录> [输出csv]
+            //   · 不联网、不登录、不改任何用户数据，只读图片 + 写一个 csv
+            //   · 放在单实例保护之前，程序正跑着也能用
+            //   · 给"人工质检验证码识别"那套流程提供候选 —— 且候选来自发布版本身
+            if (args != null)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (!args[i].Equals("--ocr-dump", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (i + 1 >= args.Length)
+                    {
+                        Log.Warn("--ocr-dump 缺少目录参数");
+                        return;
+                    }
+                    string dir = args[i + 1];
+                    string outCsv = (i + 2 < args.Length)
+                        ? args[i + 2]
+                        : Path.Combine(Path.GetTempPath(), "campusnet-ocr-dump.csv");
+
+                    Log.SelfTestQuiet = true;
+                    int n = CaptchaOcr.DumpDirectory(dir, outCsv);
+
+                    // ⚠️ 不能用 Console.WriteLine 报结果：这是个 winexe，没有控制台，
+                    //    输出会凭空消失（调用方只会看到"程序跑了但什么都没说"）。
+                    //    所以把结论写进 csv 旁边的同名 .summary.txt，由调用方去读。
+                    try
+                    {
+                        File.WriteAllText(outCsv + ".summary.txt",
+                            "rows=" + n + Environment.NewLine + "dir=" + dir + Environment.NewLine,
+                            new UTF8Encoding(false));
+                    }
+                    catch { }
+                    return;
+                }
+            }
+
             // 单实例保护：多实例并存会导致托盘图标重复、日志交错。
             if (!AcquireSingleInstance())
             {
