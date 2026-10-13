@@ -96,6 +96,18 @@ namespace CampusNetHelper
         /// </summary>
         private string _captchaSrc = "";
 
+        /// <summary>
+        /// 当前这张验证码的**完整身份** = 图的 src + 图像内容的指纹。
+        ///
+        /// ⚠️ 2026-10-13 第二次修（海辰："填入验证码好了一些，但**有概率**会填入刷新前的"）。
+        ///    上一版只用 src 当身份，有个漏洞：**回传后页面重载，img 的 src 常常一模一样
+        ///    （门户的 &lt;img src="/CheckCode"&gt; 不带时间戳），可服务器返回的却是新图**。
+        ///    于是"src 没变"被我错判成"还是那张图"，继续拿旧像素去认、去填 ——
+        ///    填进去的就是上一张的答案。这就是那个"有概率"。
+        ///    加上内容指纹之后，"src 相同但图变了"也能认出来。
+        /// </summary>
+        private string _captchaKey = "";
+
         /// <summary>用户当前填在验证码框里的内容（每秒读一次）。</summary>
         private string _captchaTyped = "";
 
@@ -1009,37 +1021,67 @@ namespace CampusNetHelper
         // 所以这里所有取图动作都只针对"页面已经加载好的那张图"。
         // ==================================================================
 
-        /// <summary>问页面"现在这张验证码图是哪个 URL"（**只读**，不改 src、不发请求）。</summary>
-        private string CurrentCaptchaSrc()
+        /// <summary>
+        /// 图上"现在这张验证码"的完整身份（src + 内容指纹）。**只读**：不改 src、不发请求、不动状态。
+        ///
+        /// 为什么必须带内容：门户回传后 img 的 src 常常跟上一张**完全一样**，
+        /// 但服务器已经换了图。只比 src 会把新图误判成"还是那张"，
+        /// 于是继续用旧像素去认、去填 —— 填进去的就是上一张的答案。
+        /// </summary>
+        private string ProbeCaptchaKey()
         {
             try
             {
                 WinForms.HtmlDocument doc = browser == null ? null : browser.Document;
                 if (doc == null) return "";
-                doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildSrcJs() });
-                object ret = doc.InvokeScript("__cnhCaptchaSrc");
+                doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildExtractJs() });
+                object ret = doc.InvokeScript("__cnhCaptchaCap");
                 string raw = ret == null ? "" : ret.ToString();
-                string s;
-                return CaptchaAssist.TryParseSrc(raw, out s) ? s : "";
+
+                int w, h;
+                string b64, err, src;
+                if (!CaptchaAssist.TryParseShot(raw, out w, out h, out b64, out err, out src)) return "";
+                return MakeCaptchaKey(src, b64);
             }
             catch { return ""; }
         }
 
+        /// <summary>拼"图的身份"：src + 内容指纹。</summary>
+        private static string MakeCaptchaKey(string src, string b64)
+        {
+            return (src ?? "") + "#" + ContentHash(b64 ?? "");
+        }
+
         /// <summary>
-        /// 手里这张验证码，是不是已经被页面换掉了。
+        /// 内容指纹（FNV-1a 64 位）。不用 MD5/SHA 是为了不引入 System.Security.Cryptography ——
+        /// 这里只要"变了能看出来"，不需要抗碰撞。
+        /// </summary>
+        private static string ContentHash(string s)
+        {
+            ulong h = 14695981039346656037UL;
+            for (int i = 0; i < s.Length; i++)
+            {
+                h ^= s[i];
+                h *= 1099511628211UL;
+            }
+            return h.ToString("x16");
+        }
+
+        /// <summary>
+        /// 手里这张验证码，是不是已经被页面换掉了（**按内容判**）。
         ///
         /// 判据故意取得"宁可放过、不可错杀"：
-        ///   · 手上没有 src（`_captchaSrc` 为空）→ **不算变**（无从比较，别把流程卡死）
-        ///   · 当前读不到 src（脚本异常 / 页面上暂时没图）→ **不算变**（同上）
+        ///   · 手上没有身份 → **不算变**（无从比较，别把流程卡死）
+        ///   · 当前读不到（脚本异常 / 页面上暂时没图）→ **不算变**（同上）
         ///   · 两边都有值且不同 → 才算变了
-        /// ⚠️ 这里千万别把"读不到"当成"变了" —— 那会把正常流程永久卡在"等新图"上。
+        /// ⚠️ 千万别把"读不到"当成"变了" —— 那会把正常流程永久卡在"等新图"上。
         /// </summary>
         private bool CaptchaIdentityChanged()
         {
-            if (_captchaSrc.Length == 0) return false;
-            string now = CurrentCaptchaSrc();
+            if (_captchaKey.Length == 0) return false;
+            string now = ProbeCaptchaKey();
             if (now.Length == 0) return false;
-            return !string.Equals(now, _captchaSrc, StringComparison.Ordinal);
+            return !string.Equals(now, _captchaKey, StringComparison.Ordinal);
         }
 
         /// <summary>等图片下载完再抠图（每 0.7 秒试一次，最多 rounds 次）。</summary>
@@ -1110,14 +1152,19 @@ namespace CampusNetHelper
             //      ① 日志里一串"验证码已抠出"，看起来就像"验证码在疯狂刷新"（海辰的原话）；
             //      ② 更糟的是每次都会把 `_autoAuthWaitNext` 清掉并接力重试，
             //         等于让重试流程拿**还没换的旧图**接着跑 → 填的是上一张的答案。
-            //    现在按 src 认身份：src 没变 = 还是那张，直接返回。
-            if (src.Length > 0 && src == _captchaSrc && _captchaPng != null) return true;
+            //    ⚠️ 判"是不是同一张"必须用 **src + 内容指纹**，不能只用 src：
+            //       门户回传后 img 的 src 常常跟上一张一模一样，但服务器换了图。
+            //       只比 src 会把新图误判成"还是那张"，于是继续用旧像素去认
+            //       —— 这就是海辰说的"**有概率**会填入刷新前的验证码"。
+            string key = MakeCaptchaKey(src, b64);
+            if (key == _captchaKey && _captchaPng != null) return true;
 
             try
             {
                 byte[] png = Convert.FromBase64String(b64);
                 _captchaPng = png;
                 _captchaSrc = src;
+                _captchaKey = key;
                 _captchaTyped = "";
 
                 imgCaptcha.Source = BitmapFrame.Create(
@@ -1207,6 +1254,7 @@ namespace CampusNetHelper
                 // 图换了 → 之前抠的那张作废（它对应的答案已经不是这个 session 的了）
                 _captchaPng = null;
                 _captchaSrc = "";
+                _captchaKey = "";
                 _captchaTyped = "";
                 SetCaptchaHint("已向服务器要了一张新的，正在重新取图…");
 
@@ -1448,6 +1496,19 @@ namespace CampusNetHelper
 
             if (submit == null)
             {
+                // ⚠️ 挑不出按钮时**必须把候选全打出来**（2026-10-13 加）。
+                //    否则下一次又是"看不见"：只知道没找到，不知道页面上到底有什么。
+                //    只在挑不出时打，正常情况不刷屏。
+                //    ⚠️ 这个方法里没有现成的元素列表（参数只有 submit 和说明文字），
+                //       得自己从当前文档捞一份 —— 第一次写漏了，编译直接报 CS0103。
+                string candDesc = "(读不到文档)";
+                try
+                {
+                    WinForms.HtmlDocument d = (browser == null) ? null : browser.Document;
+                    if (d != null) candDesc = DescribeButtonCands(All(d));
+                }
+                catch { }
+                Log.Warn("自动登录：挑不出「登录」按钮，页面上的候选 = " + candDesc);
                 AutoAuthGiveUp("页面上找不到「登录」按钮");
                 SetStatus("这个页面有验证码，但找不到「登录」按钮 —— 请手动点一下页面上的登录。");
                 return true;
@@ -1496,8 +1557,12 @@ namespace CampusNetHelper
 
             // 来源标签：2026-10-12 那次"一秒 4 次提交"就是靠它才定位到驱动者的
             //（日志里只写"第 N 次提交"看不出是谁在反复触发）。
+            // ⚠️ 2026-10-13 追加"按钮="：一定要记下**点的是哪个元素** ——
+            //    "点错按钮（点了换一张）"这个 bug 之所以能藏这么久，就是因为日志里
+            //    只有"第 N 次提交"，看不出点的是谁。以后一眼可辨。
             Log.Info("自动登录：第 " + _autoAuthAttempts + "/" + AutoAuthMaxAttempts + " 次提交"
-                     + "（验证码填 \"" + fill + "\"，来源=" + CallerTag() + "）");
+                     + "（验证码填 \"" + fill + "\"，来源=" + CallerTag()
+                     + "，按钮=" + Describe(submit) + "）");
             SetStatus("正在自动登录（第 " + _autoAuthAttempts + "/" + AutoAuthMaxAttempts + " 次）"
                       + "，验证码填的是 " + fill + "…");
             if (lblFound != null && accountDesc.Length > 0) lblFound.Text = accountDesc;
@@ -1932,6 +1997,24 @@ namespace CampusNetHelper
         internal string CaptchaSrcForTest() { return _captchaSrc; }
 
         /// <summary>
+        /// 自测用：验证"图的身份"能不能区分**同一个 src、不同内容**的两张图。
+        ///
+        /// ⚠️ 这正是海辰说的"**有概率**会填入刷新前的验证码"的根子：
+        ///    门户回传后 img 的 src 常常一模一样，服务器却换了图。
+        ///    只比 src 会把新图误判成旧图，于是拿旧像素去认、去填。
+        ///    所以这里必须断言：**同 src + 内容不同 → 身份必须不同**；
+        ///    同 src + 内容相同 → 身份必须相同（否则轮询会把同一张图当新图，重复触发）。
+        /// </summary>
+        internal static bool KeyDistinguishesContentForTest()
+        {
+            string a = MakeCaptchaKey("http://x/CheckCode", "AAAABBBB");
+            string b = MakeCaptchaKey("http://x/CheckCode", "AAAABBBC");   // 同 src，内容差 1 个字符
+            string c = MakeCaptchaKey("http://x/CheckCode", "AAAABBBB");   // 完全一样
+            string d = MakeCaptchaKey("http://x/CheckCode?t=2", "AAAABBBB"); // 内容一样，src 不同
+            return a != b && a == c && a != d;
+        }
+
+        /// <summary>
         /// 自测用：验证"验证码图的身份"这条判据（2026-10-13 新增）。
         /// 返回 "拦得住/不误伤" 才算健康。
         ///
@@ -1943,12 +2026,12 @@ namespace CampusNetHelper
         /// </summary>
         internal string CaptchaIdentityProbeForTest()
         {
-            if (_captchaSrc.Length == 0) return "没抓到图身份";
+            if (_captchaKey.Length == 0) return "没抓到图身份";
 
-            string keep = _captchaSrc;
-            _captchaSrc = keep + "__poisoned__";
+            string keep = _captchaKey;
+            _captchaKey = keep + "__poisoned__";
             bool caught = CaptchaIdentityChanged();
-            _captchaSrc = keep;
+            _captchaKey = keep;
             bool noFalseAlarm = !CaptchaIdentityChanged();
 
             return (caught ? "拦得住" : "拦不住") + "/" + (noFalseAlarm ? "不误伤" : "误伤");
@@ -2191,6 +2274,7 @@ namespace CampusNetHelper
         {
             _captchaPng = null;
             _captchaSrc = "";
+            _captchaKey = "";
             _captchaTyped = "";
             if (_captchaTypedTimer != null) _captchaTypedTimer.Stop();
             if (rowCaptcha != null) rowCaptcha.Visibility = Visibility.Collapsed;
@@ -2608,6 +2692,7 @@ namespace CampusNetHelper
             //   只能重新抠一张，不可能再拿到隔页的旧图。
             _captchaPng = null;
             _captchaSrc = "";
+            _captchaKey = "";
 
             // 页面换了，重新抠一次（抠不到就说明本页没有验证码）
             _captchaPollKeepRow = false;
@@ -3920,56 +4005,177 @@ namespace CampusNetHelper
             return null;
         }
 
-        private static WinForms.HtmlElement FindSubmit(List<WinForms.HtmlElement> all)
+        /// <summary>按钮上"明确不是登录"的词 —— 命中直接排除，绝不许点。</summary>
+        private static readonly string[] NotSubmitWords = new string[] {
+            "换一张", "换一换", "刷新", "看不清", "重置", "清空", "取消", "返回", "上一",
+            "注册", "忘记", "找回", "发送", "获取", "重发", "关闭", "退出",
+            "reset", "refresh", "cancel", "back", "register", "reload", "clear", "close"
+        };
+
+        /// <summary>按钮上"明确是登录"的词。</summary>
+        private static readonly string[] SubmitWords = new string[] {
+            "登录", "登陆", "认证", "上线", "连接", "确定", "提交", "进入",
+            "login", "logon", "signin", "sign in", "connect", "submit"
+        };
+
+        /// <summary>取按钮的"字面"：input 看 value，其它看 InnerText。</summary>
+        private static string ButtonLabel(WinForms.HtmlElement el)
         {
-            // form 元素留着兜底用（最后找不到按钮时直接提交表单）
-            WinForms.HtmlElement form = null;
-            foreach (WinForms.HtmlElement el in all)
+            string tag = TagOf(el);
+            if (tag == "input")
             {
-                if (TagOf(el) == "form")
-                {
-                    form = el;
-                    break;
-                }
+                string v = AttrOf(el, "value");
+                if (v.Length > 0) return v.Trim();
+            }
+            try { return (el.InnerText ?? "").Trim(); }
+            catch { return ""; }
+        }
+
+        private static bool ContainsAny(string s, string[] words)
+        {
+            string low = s.ToLowerInvariant();
+            foreach (string w in words)
+            {
+                if (low.IndexOf(w, StringComparison.Ordinal) >= 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 一个按钮候选的**抽象描述**。
+        ///
+        /// ⚠️ 把决策从 HtmlElement 里抽出来，是为了让自测能**直接断言**这个决策 ——
+        ///    否则"挑错按钮"这种事只能靠真机碰运气复现（这个 bug 已经藏了两轮了）。
+        /// </summary>
+        internal struct ButtonCand
+        {
+            public int Index;      // 原始下标（返回给调用方）
+            public string Tag;     // input / button / a / …
+            public string Type;    // submit / button / reset / …
+            public string Label;   // 按钮上的字（input 取 value，其它取文字）
+            public bool Disabled;
+        }
+
+        /// <summary>
+        /// 从候选里挑「登录按钮」的**纯决策**（不碰 DOM，可被自测直接调用）。
+        /// 返回下标；**-1 = 分不清，宁可不点**。
+        ///
+        /// 顺序：① 先认字 ② 兜底只认"表单里唯一的 submit/button"。
+        /// ⚠️ 绝不"遇到第一个 submit 就点" —— 门户是 ASP.NET WebForms，
+        ///    「换一张」也是 type=submit，那样点下去就是刷新验证码的 PostBack。
+        /// </summary>
+        internal static int PickSubmitIndex(List<ButtonCand> cands)
+        {
+            // ① 先认字：只认明确的登录语义，命中"换一张/刷新/重置…"的直接排除
+            foreach (ButtonCand c in cands)
+            {
+                if (c.Tag != "input" && c.Tag != "button" && c.Tag != "a") continue;
+                if (c.Disabled) continue;
+                string lb = (c.Label ?? "").Trim();
+                if (lb.Length == 0 || lb.Length > 12) continue;
+                if (ContainsAny(lb, NotSubmitWords)) continue;
+                if (!ContainsAny(lb, SubmitWords)) continue;
+                return c.Index;
             }
 
-            string[] words = new string[] { "登录", "登陆", "认证", "连接", "上线", "确定", "提交", "login", "logon", "connect", "submit", "signin" };
+            // ② 兜底：表单里**唯一**的 submit/button 才敢点
+            int only = -1;
+            int cnt = 0;
+            foreach (ButtonCand c in cands)
+            {
+                if (c.Tag != "input" && c.Tag != "button") continue;
+                string t = (c.Type ?? "").ToLowerInvariant();
+                if (t != "submit" && t != "button") continue;
+                if (c.Disabled) continue;
+                if (ContainsAny(c.Label ?? "", NotSubmitWords)) continue;
+                cnt++;
+                only = c.Index;
+            }
+            return cnt == 1 ? only : -1;
+        }
 
+        /// <summary>
+        /// 找页面上的「登录」按钮。
+        ///
+        /// ⚠️⚠️ 2026-10-13 重写 —— 这是海辰报的
+        ///    「点了一键登录，信息都填对了，但一点登录**整个页面刷新、信息全被清空**」
+        ///    的根因。
+        ///
+        /// 老实现第二行就是：
+        ///     `if (type == "submit" || type == "button") return el;`
+        /// 它按**文档顺序**返回遇到的第一个 submit/button，**完全不看这个按钮是干什么的**。
+        /// 而这个门户是 ASP.NET WebForms —— **页面上每个服务器按钮都是 type=submit**，
+        /// 「换一张」也是。于是一旦「换一张」在文档里排在前面，
+        /// 程序点下去点的是"刷新验证码的 PostBack"：
+        ///   · 页面整个回传重载 → 账号密码框被清空（WebForms 不保存文本框的值）；
+        ///   · 用户看到的就是"点一下，页面刷了、信息全没了"；
+        ///   · 而他**手动**点真正的「登录」是好的 —— 因为他点对了按钮。
+        ///
+        /// 决策本身在 PickSubmitIndex（纯函数，有自测钉住）。
+        /// </summary>
+        private static WinForms.HtmlElement FindSubmit(List<WinForms.HtmlElement> all)
+        {
+            List<ButtonCand> cands = new List<ButtonCand>();
+            List<WinForms.HtmlElement> picked = new List<WinForms.HtmlElement>();
+
+            for (int i = 0; i < all.Count; i++)
+            {
+                WinForms.HtmlElement el = all[i];
+                string tag = TagOf(el);
+                if (tag != "input" && tag != "button" && tag != "a") continue;
+
+                ButtonCand c = new ButtonCand();
+                c.Index = picked.Count;
+                c.Tag = tag;
+                c.Type = AttrOf(el, "type");
+                c.Label = ButtonLabel(el);
+                c.Disabled = IsDisabled(el);
+
+                cands.Add(c);
+                picked.Add(el);
+            }
+
+            int idx = PickSubmitIndex(cands);
+            return (idx >= 0 && idx < picked.Count) ? picked[idx] : null;
+        }
+
+        /// <summary>
+        /// 把页面上所有"像按钮"的元素列一遍（诊断用，**只在挑不出登录按钮时**调用）。
+        ///
+        /// 目的：让"挑不出按钮"这件事下次能一眼定位 —— 直接看到页面上有什么、
+        /// 每个按钮写的什么字、是什么 type。没有它，日志里只有一句"找不到"，
+        /// 等于白瞎一轮。
+        /// </summary>
+        private static string DescribeButtonCands(List<WinForms.HtmlElement> all)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            int n = 0;
             foreach (WinForms.HtmlElement el in all)
             {
                 string tag = TagOf(el);
-                if (tag != "input" && tag != "button" && tag != "a" && tag != "div" && tag != "span") continue;
-                if (IsDisabled(el)) continue;
+                if (tag != "input" && tag != "button" && tag != "a") continue;
 
-                string type = AttrOf(el, "type").ToLowerInvariant();
-                if (type == "submit" || type == "button") return el;
-
-                string text = "";
-                try { text = (el.InnerText ?? "").Trim(); }
-                catch { }
-                if (text.Length == 0 || text.Length > 12) continue;   // 太长的多半是段落不是按钮
-
-                string low = text.ToLowerInvariant();
-                foreach (string w in words)
+                string type = AttrOf(el, "type");
+                // input 里只关心按钮类的（text/password/hidden 都不是按钮）
+                if (tag == "input")
                 {
-                    if (low.IndexOf(w, StringComparison.Ordinal) >= 0) return el;
+                    string t = type.ToLowerInvariant();
+                    if (t != "submit" && t != "button" && t != "reset" && t != "image") continue;
                 }
-            }
 
-            // ② 实在找不到，就交还表单自己提交
-            if (form != null)
-            {
-                try
-                {
-                    WinForms.HtmlElementCollection subs = form.GetElementsByTagName("input");
-                    foreach (WinForms.HtmlElement el in subs)
-                    {
-                        if ("submit".Equals(AttrOf(el, "type"), StringComparison.OrdinalIgnoreCase)) return el;
-                    }
-                }
-                catch { }
+                if (n > 0) sb.Append(" ｜ ");
+                sb.Append(tag);
+                if (type.Length > 0) sb.Append("[type=").Append(type).Append("]");
+                string id = AttrOf(el, "id");
+                if (id.Length > 0) sb.Append("#").Append(id);
+                string lbl = ButtonLabel(el);
+                sb.Append(" 文字=「").Append(lbl.Length > 20 ? lbl.Substring(0, 20) : lbl).Append("」");
+                if (IsDisabled(el)) sb.Append("(已禁用)");
+
+                n++;
+                if (n >= 15) { sb.Append(" ｜ …"); break; }
             }
-            return null;
+            return (n == 0) ? "(一个按钮都没有)" : sb.ToString();
         }
 
         private static string Describe(WinForms.HtmlElement el)

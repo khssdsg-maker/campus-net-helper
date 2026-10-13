@@ -67,6 +67,7 @@ namespace CampusNetHelper
                 TestCaptchaPipeline();
                 TestAutoLoginFlow();
                 TestAutoAuthTimeoutRetries();
+                TestSubmitButtonPicking();
                 TestCaptchaOcr();
 
                 W("================ 界面自测 结束 ================");
@@ -1969,6 +1970,12 @@ namespace CampusNetHelper
                 bool identityOk = a.CaptchaSrcTracked.Length > 0
                                && a.IdentityProbe == "拦得住/不误伤";
 
+                // ⑤ 身份必须"认内容"，不能只认 src（治「**有概率**填刷新前的」）
+                bool keyOk = WebAuthWindow.KeyDistinguishesContentForTest();
+                W("⑤ 同 src、内容不同 → 身份不同 = " + keyOk
+                    + "（期望 True —— 门户回传后 src 常常一模一样、图却换了；"
+                    + "只比 src 就会拿旧图去认去填，这就是海辰说的「有概率」）");
+
                 int samplesAfter = CaptchaAssist.CountSamples();
                 bool noPollution = samplesAfter == samplesBefore;
 
@@ -1986,6 +1993,86 @@ namespace CampusNetHelper
             {
                 SetSampleCollect(true);
             }
+        }
+
+        /// <summary>
+        /// 2026-10-13 新增：挑「登录」按钮的决策。
+        ///
+        /// 为什么要单独一条：海辰报的「点了一键登录 → 信息都对 → 一点登录整页刷新、信息全清空」
+        /// 根因就是**点错了按钮** —— 门户是 ASP.NET WebForms，「换一张」也是 type=submit，
+        /// 而老代码"遇到第一个 submit 就点"，于是点下去是"刷新验证码"的 PostBack。
+        /// 这条用例把这个决策钉死（纯函数、不需要浏览器、跑得飞快）。
+        /// </summary>
+        private static void TestSubmitButtonPicking()
+        {
+            W("");
+            W("---- 用例：挑「登录」按钮不会挑错（2026-10-13）----");
+
+            bool ok = true;
+            int pick;
+
+            // ① 「换一张」排在「登录」前面 —— 老代码会点「换一张」（灾难），必须点「登录」
+            List<WebAuthWindow.ButtonCand> a = new List<WebAuthWindow.ButtonCand>();
+            a.Add(Cand(0, "input", "submit", "换一张", false));
+            a.Add(Cand(1, "input", "submit", "登录", false));
+            a.Add(Cand(2, "a", "", "注册", false));
+            pick = WebAuthWindow.PickSubmitIndex(a);
+            W("① [换一张, 登录, 注册] → 挑第 " + pick + " 个（期望 1 = 登录）");
+            ok = ok && pick == 1;
+
+            // ② 页面上**没有**登录按钮，只有换一张/重置 —— 必须一个都不点
+            List<WebAuthWindow.ButtonCand> b = new List<WebAuthWindow.ButtonCand>();
+            b.Add(Cand(0, "input", "submit", "换一张", false));
+            b.Add(Cand(1, "input", "submit", "重置", false));
+            pick = WebAuthWindow.PickSubmitIndex(b);
+            W("② [换一张, 重置] → 挑第 " + pick + " 个（期望 -1 = 一个都不点）");
+            ok = ok && pick == -1;
+
+            // ③ 按钮没文字：唯一的 submit 才敢兜底点
+            List<WebAuthWindow.ButtonCand> c = new List<WebAuthWindow.ButtonCand>();
+            c.Add(Cand(0, "input", "submit", "", false));
+            pick = WebAuthWindow.PickSubmitIndex(c);
+            W("③ 唯一无字 submit → 挑第 " + pick + " 个（期望 0 = 兜底敢点）");
+            ok = ok && pick == 0;
+
+            // ④ 两个无字 submit：分不清 → 一个都不点
+            List<WebAuthWindow.ButtonCand> d = new List<WebAuthWindow.ButtonCand>();
+            d.Add(Cand(0, "input", "submit", "", false));
+            d.Add(Cand(1, "input", "submit", "", false));
+            pick = WebAuthWindow.PickSubmitIndex(d);
+            W("④ 两个无字 submit → 挑第 " + pick + " 个（期望 -1 = 分不清就不点）");
+            ok = ok && pick == -1;
+
+            // ⑤ 英文按钮
+            List<WebAuthWindow.ButtonCand> e = new List<WebAuthWindow.ButtonCand>();
+            e.Add(Cand(0, "input", "submit", "Refresh", false));
+            e.Add(Cand(1, "button", "button", "Login", false));
+            pick = WebAuthWindow.PickSubmitIndex(e);
+            W("⑤ [Refresh, Login] → 挑第 " + pick + " 个（期望 1 = Login）");
+            ok = ok && pick == 1;
+
+            // ⑥ 登录按钮被禁用 + 只剩刷新 —— 一个都不点
+            List<WebAuthWindow.ButtonCand> f = new List<WebAuthWindow.ButtonCand>();
+            f.Add(Cand(0, "input", "submit", "登陆", true));      // 被禁用
+            f.Add(Cand(1, "input", "submit", "刷新验证码", false));
+            pick = WebAuthWindow.PickSubmitIndex(f);
+            W("⑥ 登录按钮被禁用 + 只有刷新 → 挑第 " + pick + " 个（期望 -1）");
+            ok = ok && pick == -1;
+
+            W("结果：" + (ok
+                ? "通过 —— 「换一张」这类绝不会被当成登录按钮；分不清时宁可不点（不瞎点、不点错）。"
+                : "不通过 —— 见上面逐项。"));
+        }
+
+        private static WebAuthWindow.ButtonCand Cand(int idx, string tag, string type, string label, bool disabled)
+        {
+            WebAuthWindow.ButtonCand c = new WebAuthWindow.ButtonCand();
+            c.Index = idx;
+            c.Tag = tag;
+            c.Type = type;
+            c.Label = label;
+            c.Disabled = disabled;
+            return c;
         }
 
         /// <summary>假门户一轮的观测结果。</summary>
