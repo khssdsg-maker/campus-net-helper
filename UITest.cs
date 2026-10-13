@@ -1933,7 +1933,7 @@ namespace CampusNetHelper
         private static void TestAutoAuthTimeoutRetries()
         {
             W("");
-            W("---- 用例：页面没回传结果时应重试（看门狗 / 速率闸，2026-10-13）----");
+            W("---- 用例：页面没回传结果时会重试 + 验证码图有身份（2026-10-13）----");
 
             int samplesBefore = CaptchaAssist.CountSamples();
             try
@@ -1960,13 +1960,22 @@ namespace CampusNetHelper
                     + " 次延迟重试（期望 ≥1 —— 以前这里是一句空话，压根没有那个定时器）");
                 bool gateOk = a.GateRetryScheduledCount >= 1;
 
+                // ④ 验证码"图身份"（2026-10-13 核心修复，治「填的是刷新前的」）
+                W("④ 抓到验证码图的身份 = " + (a.CaptchaSrcTracked.Length > 0 ? "是" : "否")
+                    + "（src = 「" + a.CaptchaSrcTracked.Substring(0, Math.Min(60, a.CaptchaSrcTracked.Length))
+                    + "」，期望：是）");
+                W("   身份判据 = 「" + a.IdentityProbe + "」（期望「拦得住/不误伤」—— "
+                    + "拦得住=换了图不提交旧答案；不误伤=没换图绝不会卡住流程）");
+                bool identityOk = a.CaptchaSrcTracked.Length > 0
+                               && a.IdentityProbe == "拦得住/不误伤";
+
                 int samplesAfter = CaptchaAssist.CountSamples();
                 bool noPollution = samplesAfter == samplesBefore;
 
-                bool ok = a.WatchdogRetries && noGiveUp && gateOk && noPollution;
+                bool ok = a.WatchdogRetries && noGiveUp && gateOk && identityOk && noPollution;
                 W("结果：" + (ok
                     ? "通过 —— 页面没回传结果时会换一张接着重试（不再提交一次就停手）；"
-                      + "速率闸拦下后也真的会再来一次。"
+                      + "速率闸拦下后也真的会再来一次；验证码图有身份、认完之后被换掉就不会拿旧答案去提交。"
                     : "不通过 —— 见上面逐项。"));
             }
             catch (Exception ex)
@@ -1998,6 +2007,9 @@ namespace CampusNetHelper
             public bool WatchdogRetries;        // 看门狗超时后是否继续重试（false = 停手，就是那个 bug）
             public int GateRetryScheduledCount; // 速率闸拦下后累计安排过几次延迟重试
             public string WatchdogStatus = "";  // 探针那一刻的状态文案
+            // ↓↓ 2026-10-13 新增：验证码"图身份"回归探针
+            public string CaptchaSrcTracked = "";  // 首次提交时手里那张图的 src（空 = 根本没抓身份）
+            public string IdentityProbe = "";      // "拦得住/不误伤" 才算健康
         }
 
         /// <summary>
@@ -2144,6 +2156,19 @@ namespace CampusNetHelper
                     // ① 模拟"页面一直没回传结果"（真机上的常态）→ 应该继续重试
                     r.WatchdogRetries = wa.SimulateWatchdogTimeoutForTest();
                     r.WatchdogStatus = wa.StatusForTest();
+
+                    // ③ 验证码"图身份"（2026-10-13 核心修复）：必须真的抓到了 src，
+                    //    而且"换了图能拦住、没换图不误伤"。
+                    // ⚠️ 必须先等身份就位再取样：刚提交完页面会导航一次，
+                    //    那一刻 `_captchaSrc` 正是被清空的状态 —— 直接取会测到空气
+                    //    （第一次写就踩了这个坑：src 报空，看着像修复没生效）。
+                    for (int i = 0; i < 40 && wa.CaptchaSrcForTest().Length == 0; i++)
+                    {
+                        Pump();
+                        System.Threading.Thread.Sleep(150);
+                    }
+                    r.CaptchaSrcTracked = wa.CaptchaSrcForTest();
+                    r.IdentityProbe = wa.CaptchaIdentityProbeForTest();
 
                     // ② 探针会让流程走"换图 → 重新填表 → 再提交"，
                     //    而这条路的节奏（1.4~2.4 秒）比 3 秒的速率闸更快 ——

@@ -167,10 +167,46 @@ namespace CampusNetHelper
                 "    var u = c.toDataURL('image/png');" +
                 "    if (!u || u.indexOf('data:image') !== 0) return 'ERR:no-dataurl';" +
                 "    var r = im.getBoundingClientRect();" +
+                "    var s0 = im.src || '';" +
                 "    return 'OK|' + w + 'x' + h + '|' + Math.round(r.left) + ',' + Math.round(r.top)" +
-                "         + ',' + Math.round(r.width) + ',' + Math.round(r.height) + '|' + u;" +
+                "         + ',' + Math.round(r.width) + ',' + Math.round(r.height) + '|' + s0 + '|' + u;" +
                 "  } catch (e) { return 'ERR:' + (e.message || e); }" +
                 "};";
+        }
+
+        /// <summary>
+        /// 只问一句"现在页面上这张验证码图是哪个 URL"（**只读**：不取像素、不改 src、不发请求）。
+        ///
+        /// ⚠️ 2026-10-13 新增。为什么需要它（海辰报的 bug）：
+        ///    「一键登录填的验证码是刷新前的」——
+        ///    程序"认出一张图"到"真正点登录"之间可能隔几百毫秒到几秒，
+        ///    而这段时间里页面完全可能已经把图换掉了（回传重载 / 点了换一张）。
+        ///    以前程序**无法察觉**，于是把上一张图的答案提交上去，必然失败、
+        ///    而且日志里看不出来。有了这个"图的身份"，提交前对一次就行 ——
+        ///    不一致就放弃这次提交，等新图。
+        /// </summary>
+        public static string BuildSrcJs()
+        {
+            return JsFinder +
+                "window.__cnhCaptchaSrc = function () {" +
+                "  try {" +
+                "    var im = window.__cnhCaptchaImg();" +
+                "    if (!im) return 'ERR:no-img';" +
+                "    return 'OK|' + (im.src || '');" +
+                "  } catch (e) { return 'ERR:' + (e.message || e); }" +
+                "};";
+        }
+
+        /// <summary>解析 BuildSrcJs 的返回。格式：OK|src</summary>
+        public static bool TryParseSrc(string raw, out string src)
+        {
+            src = "";
+            if (string.IsNullOrEmpty(raw)) return false;
+            if (raw.StartsWith("ERR", StringComparison.Ordinal)) return false;
+            int bar = raw.IndexOf('|');
+            if (bar < 0 || raw.Substring(0, bar) != "OK") return false;
+            src = raw.Substring(bar + 1);
+            return src.Length > 0;
         }
 
         /// <summary>
@@ -273,22 +309,42 @@ namespace CampusNetHelper
         // ==================================================================
 
         /// <summary>
-        /// 解析取图脚本的返回。格式：OK|宽x高|左,上,宽,高|data:image/png;base64,xxxx
+        /// 解析取图脚本的返回。格式（**新，5 段**）：
+        ///     OK|宽x高|左,上,宽,高|图的src|data:image/png;base64,xxxx
+        /// 兼容旧的 4 段格式（没有 src 那一段）。
         /// 失败时 error 里是原因（ERR:no-img / ERR:not-ready / …）。
         /// </summary>
         public static bool TryParseShot(string raw, out int width, out int height,
                                        out string base64, out string error)
         {
+            string ignore;
+            return TryParseShot(raw, out width, out height, out base64, out error, out ignore);
+        }
+
+        /// <summary>
+        /// 同上，但多返回一个 <paramref name="src"/> —— "这张图是哪个 URL"。
+        ///
+        /// ⚠️ 2026-10-13 加 src 的原因（海辰报的"填的验证码是刷新前的"）：
+        ///    以前取图**不带图的身份**，程序无法判断"我认的这张"和"提交时页面上的那张"
+        ///    是不是同一张。页面回传/换图只要发生在识别与提交之间，提交上去的就是
+        ///    隔了一张图的旧答案 —— 必然失败，且日志里看不出来。
+        ///    有了 src 才谈得上绑定（见 WebAuthWindow._captchaSrc）。
+        /// </summary>
+        public static bool TryParseShot(string raw, out int width, out int height,
+                                       out string base64, out string error, out string src)
+        {
             width = 0;
             height = 0;
             base64 = "";
             error = "";
+            src = "";
 
             if (string.IsNullOrEmpty(raw)) { error = "空返回"; return false; }
             if (raw.StartsWith("ERR", StringComparison.Ordinal)) { error = raw; return false; }
 
-            string[] p = raw.Split('|');
-            if (p.Length != 4 || p[0] != "OK") { error = "返回格式不对"; return false; }
+            // 限 5 段：src 里万一带上 '|' 也不会把图片数据切碎
+            string[] p = raw.Split(new char[] { '|' }, 5);
+            if ((p.Length != 4 && p.Length != 5) || p[0] != "OK") { error = "返回格式不对"; return false; }
 
             string[] wh = p[1].Split('x');
             if (wh.Length != 2
@@ -300,10 +356,15 @@ namespace CampusNetHelper
                 return false;
             }
 
-            if (!p[3].StartsWith("data:image", StringComparison.Ordinal)) { error = "不是图片数据"; return false; }
-            int comma = p[3].IndexOf(',');
+            // 图片数据在最后一段（5 段格式里 src 插在前面）
+            string dataUrl = p[p.Length - 1];
+            if (dataUrl.StartsWith("data:image", StringComparison.Ordinal) && p.Length == 5)
+                src = p[3];
+
+            if (!dataUrl.StartsWith("data:image", StringComparison.Ordinal)) { error = "不是图片数据"; return false; }
+            int comma = dataUrl.IndexOf(',');
             if (comma < 0) { error = "图片数据格式不对"; return false; }
-            base64 = p[3].Substring(comma + 1);
+            base64 = dataUrl.Substring(comma + 1);
             if (base64.Length == 0) { error = "图片数据为空"; return false; }
             return true;
         }

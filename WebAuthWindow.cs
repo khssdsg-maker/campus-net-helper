@@ -84,6 +84,18 @@ namespace CampusNetHelper
         /// <summary>当前这张验证码的原始 PNG 字节。采集样本要用它（必须和用户填的那 4 位是同一张）。</summary>
         private byte[] _captchaPng;
 
+        /// <summary>
+        /// 当前这张验证码图在页面上的 **src**（就是它的"身份"）。
+        ///
+        /// ⚠️ 2026-10-13 新增。海辰报的 bug：「一键登录填的验证码是刷新前的」。
+        ///    取图以前只带回像素、不带身份，所以程序无法回答一个关键问题：
+        ///    **我现在手里这张，还是页面上正在显示的那张吗？**
+        ///    从"认出一张图"到"真的点提交"之间，页面随时可能换图
+        ///    （回传重载 / 用户点换一张），只要换了，提交上去的必然是旧答案。
+        ///    有了这个 src，提交前对一次就能拦住（见 CaptchaIdentityChanged）。
+        /// </summary>
+        private string _captchaSrc = "";
+
         /// <summary>用户当前填在验证码框里的内容（每秒读一次）。</summary>
         private string _captchaTyped = "";
 
@@ -125,6 +137,12 @@ namespace CampusNetHelper
 
         /// <summary>自动登录流程是否在进行中（决定"新图到手后要不要接着再试一次"）。</summary>
         private bool _autoAuthRunning = false;
+
+        /// <summary>
+        /// 本轮是不是已经"停手"过了（只喊一次，避免多个驱动者各喊一遍）。
+        /// 开新一轮（用户点「一键登录」/ 重新认证）时才归零。
+        /// </summary>
+        private bool _autoAuthGaveUp = false;
 
         /// <summary>最近一次自动提交时填进验证码框的内容（提示语要用）。</summary>
         private string _autoAuthLastFill = "";
@@ -991,6 +1009,39 @@ namespace CampusNetHelper
         // 所以这里所有取图动作都只针对"页面已经加载好的那张图"。
         // ==================================================================
 
+        /// <summary>问页面"现在这张验证码图是哪个 URL"（**只读**，不改 src、不发请求）。</summary>
+        private string CurrentCaptchaSrc()
+        {
+            try
+            {
+                WinForms.HtmlDocument doc = browser == null ? null : browser.Document;
+                if (doc == null) return "";
+                doc.InvokeScript("eval", new object[] { CaptchaAssist.BuildSrcJs() });
+                object ret = doc.InvokeScript("__cnhCaptchaSrc");
+                string raw = ret == null ? "" : ret.ToString();
+                string s;
+                return CaptchaAssist.TryParseSrc(raw, out s) ? s : "";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 手里这张验证码，是不是已经被页面换掉了。
+        ///
+        /// 判据故意取得"宁可放过、不可错杀"：
+        ///   · 手上没有 src（`_captchaSrc` 为空）→ **不算变**（无从比较，别把流程卡死）
+        ///   · 当前读不到 src（脚本异常 / 页面上暂时没图）→ **不算变**（同上）
+        ///   · 两边都有值且不同 → 才算变了
+        /// ⚠️ 这里千万别把"读不到"当成"变了" —— 那会把正常流程永久卡在"等新图"上。
+        /// </summary>
+        private bool CaptchaIdentityChanged()
+        {
+            if (_captchaSrc.Length == 0) return false;
+            string now = CurrentCaptchaSrc();
+            if (now.Length == 0) return false;
+            return !string.Equals(now, _captchaSrc, StringComparison.Ordinal);
+        }
+
         /// <summary>等图片下载完再抠图（每 0.7 秒试一次，最多 rounds 次）。</summary>
         private void StartCaptchaPoll(int rounds)
         {
@@ -1043,8 +1094,8 @@ namespace CampusNetHelper
             }
 
             int w, h;
-            string b64, err;
-            if (!CaptchaAssist.TryParseShot(raw, out w, out h, out b64, out err))
+            string b64, err, src;
+            if (!CaptchaAssist.TryParseShot(raw, out w, out h, out b64, out err, out src))
             {
                 // 「页面上本来就没有验证码」「图还没加载完」都是正常情况，不记日志
                 bool normal = err.IndexOf("no-img", StringComparison.Ordinal) >= 0
@@ -1053,10 +1104,20 @@ namespace CampusNetHelper
                 return false;
             }
 
+            // ⚠️⚠️「同一张图」不等于「新图」（2026-10-13 修）：
+            //    轮询每 0.7 秒来一次，同一张图会被反复抠出来。
+            //    以前这里每一次都当成"新验证码到手" —— 于是：
+            //      ① 日志里一串"验证码已抠出"，看起来就像"验证码在疯狂刷新"（海辰的原话）；
+            //      ② 更糟的是每次都会把 `_autoAuthWaitNext` 清掉并接力重试，
+            //         等于让重试流程拿**还没换的旧图**接着跑 → 填的是上一张的答案。
+            //    现在按 src 认身份：src 没变 = 还是那张，直接返回。
+            if (src.Length > 0 && src == _captchaSrc && _captchaPng != null) return true;
+
             try
             {
                 byte[] png = Convert.FromBase64String(b64);
                 _captchaPng = png;
+                _captchaSrc = src;
                 _captchaTyped = "";
 
                 imgCaptcha.Source = BitmapFrame.Create(
@@ -1145,6 +1206,7 @@ namespace CampusNetHelper
 
                 // 图换了 → 之前抠的那张作废（它对应的答案已经不是这个 session 的了）
                 _captchaPng = null;
+                _captchaSrc = "";
                 _captchaTyped = "";
                 SetCaptchaHint("已向服务器要了一张新的，正在重新取图…");
 
@@ -1309,6 +1371,11 @@ namespace CampusNetHelper
                 return true;
             }
 
+            // 本轮已经停手了 → 别再让别的驱动者（补填定时器 / 自动重连 / 页面回传）
+            // 反复走进来。⚠️ 2026-10-13 海辰日志里同一句"自动登录停手：提交次数已用完"
+            // 被喊了 6 遍，就是这些驱动者各自进来触发一次 AutoAuthGiveUp 造成的。
+            if (_autoAuthGaveUp) return true;
+
             if (_autoAuthAttempts >= AutoAuthMaxAttempts)
             {
                 // 次数用完了就不再点按钮 —— 把最后填进去的候选留着让人接手核对
@@ -1383,6 +1450,21 @@ namespace CampusNetHelper
             {
                 AutoAuthGiveUp("页面上找不到「登录」按钮");
                 SetStatus("这个页面有验证码，但找不到「登录」按钮 —— 请手动点一下页面上的登录。");
+                return true;
+            }
+
+            // ⚠️⚠️ 提交前最后一道：**确认手里这张还是页面上那张**（2026-10-13 新增）。
+            //    这是海辰报的「填的验证码是刷新前的」的直接防线 ——
+            //    从"认完这张图"到"点下去"之间可能过了几百毫秒到几秒，
+            //    期间页面完全可能已经换了图（回传重载 / 用户点了换一张）。
+            //    只要 src 变了，这次提交必然是把上一张的答案交上去，
+            //    白让学校端记一次失败。所以：**不用旧图提交**，改为等新图。
+            if (CaptchaIdentityChanged())
+            {
+                Log.Warn("自动登录：认完之后验证码图已经被换掉了 —— 放弃这次提交，改用新图重新认"
+                         + "（否则填进去的就是上一张的答案）");
+                SetStatus("验证码刚换过，正在用新的那张重新认…");
+                _autoAuthWaitNext = true;
                 return true;
             }
 
@@ -1467,9 +1549,30 @@ namespace CampusNetHelper
                 {
                     _autoAuthWatchdog.Stop();
                     if (!_autoAuthRunning) return;
+
+                    // ⚠️ 正在等新图却没等到 → 这才是**唯一该主动点「换一张」**的场合。
+                    //    （提交失败那种情况，页面回传时自己就会带一张新图；
+                    //      程序再点一次等于把答案凭空多转一轮 —— 就是海辰看到的
+                    //      "点击后页面验证码会重复刷新"。）
+                    if (_autoAuthWaitNext)
+                    {
+                        _autoAuthRefreshCount++;
+                        if (_autoAuthRefreshCount > 3)
+                        {
+                            AutoAuthGiveUp("连着等了几次都没等到可用的验证码图");
+                            return;
+                        }
+                        Log.Warn("自动登录：等了 " + AutoAuthWatchdogSeconds
+                                 + " 秒没等到新验证码图，主动让页面换一张（第 "
+                                 + _autoAuthRefreshCount + " 次）");
+                        OnCaptchaRefresh();
+                        StartAutoAuthWatchdog();
+                        return;
+                    }
+
                     Log.Warn("自动登录：提交后 " + AutoAuthWatchdogSeconds
-                             + " 秒没有任何结果（这次点击可能没生效），换一张重试");
-                    AutoAuthNextAttemptOrGiveUp(AutoAuthNoResultWhy);
+                             + " 秒没有任何结果（这次点击可能没生效），按失败处理");
+                    AutoAuthNextAttemptOrGiveUp(AutoAuthNoResultWhy, true);
                 };
             }
             _autoAuthWatchdog.Stop();
@@ -1532,7 +1635,9 @@ namespace CampusNetHelper
                                 return;
                             }
 
-                            AutoAuthNextAttemptOrGiveUp(pageErr);
+                            // submitted = true：这条路本来就是"提交之后判结果"，
+                            // 所以不该再主动点「换一张」（见 AutoAuthNextAttemptOrGiveUp 注释）。
+                            AutoAuthNextAttemptOrGiveUp(pageErr, true);
                         }));
                     }
                     catch { }
@@ -1549,8 +1654,18 @@ namespace CampusNetHelper
         /// ⚠️ 为什么必须区分这两类：账号密码错 / 被限速 / 被拉黑 ——
         ///    这些再试一百次也是白搭，而且每一次都在学校端累加失败次数。
         ///    只有"验证码错"才值得重试。
+        ///
+        /// <param name="submitted">
+        /// 这一次是不是**真的提交过**（点击落到页面上）。
+        /// ⚠️ 2026-10-13 新增这个参数，专门治海辰报的「页面验证码会重复刷新」：
+        ///    提交过 → 页面回传时服务端已经换了答案、页面会自己重新下载新图
+        ///             （实测每次提交后 0.7 秒内就有新图），程序**不必也不能**再点「换一张」，
+        ///              多点一次等于凭空多转一轮答案，用户看到的就是验证码在疯狂刷新，
+        ///              而且会让"认的那张"和"页面上的那张"错位（填上旧答案）。
+        ///    没提交过（认不出 / 按钮点不动）→ 页面不会自己换图，这时**才**需要主动换一张。
+        /// </param>
         /// </summary>
-        private void AutoAuthNextAttemptOrGiveUp(string pageErr)
+        private void AutoAuthNextAttemptOrGiveUp(string pageErr, bool submitted)
         {
             if (!_autoAuthRunning) return;
             if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
@@ -1597,16 +1712,30 @@ namespace CampusNetHelper
                 return;
             }
 
-            SetStatus("这次没认对，正在换一张验证码重试…");
-            SetCaptchaHint("这次没认对，换一张重试…");
+            SetStatus("这次没认对，正在准备重试…");
+            SetCaptchaHint("这次没认对，马上重试…");
 
-            // 让**页面自己**重新要一张（程序绝不自己去请求 /CheckCode —— 见 CaptchaAssist 红线 1）。
-            // 新图到手后由 TryCaptureCaptcha 里那个钩子接着跑下一次。
+            // ⚠️⚠️ 2026-10-13 关键修正（海辰报的「页面验证码会重复刷新」+「填的是刷新前的」）：
+            //    **提交过的时候绝不主动点「换一张」**。
+            //    页面回传本身就是一次导航，服务端答案已换、页面会自己重新下载新图 ——
+            //    实测每次提交后 0.7 秒内日志就有"验证码已抠出"。
+            //    程序再点一次「换一张」= 又转一轮答案，于是：
+            //      · 用户看到验证码图连着闪（重复刷新）；
+            //      · 程序上一刻认的那张已经作废，填上去的就是"刷新前的"答案，必然失败。
+            //    所以这里只**等**页面自己带来的那张新图（_autoAuthWaitNext 的钩子接力）；
+            //    真等不到（看门狗到点）再主动换 —— 那条兜底写在 StartAutoAuthWatchdog 里。
             _autoAuthWaitNext = true;
-            OnCaptchaRefresh();
-            // 再武装一次看门狗：上面那次 AutoAuthNextAttemptOrGiveUp 把它停了，
-            // 万一新图永远不来，9 秒后它会再进来判一次（那时 _autoAuthRefreshCount 已经加过，
-            // 很快就到上限停手）。
+            if (submitted)
+            {
+                Log.Info("自动登录：等页面回传时自己带来的那张新验证码（程序不主动换图）");
+            }
+            else
+            {
+                Log.Info("自动登录：这次压根没提交成功，主动让页面换一张验证码");
+                OnCaptchaRefresh();
+            }
+            // 再武装一次看门狗：上面把它停了。新图不来时它会兜底
+            //（_autoAuthRefreshCount 已经加过，很快就到上限停手）。
             StartAutoAuthWatchdog();
         }
 
@@ -1735,8 +1864,19 @@ namespace CampusNetHelper
 
         private void AutoAuthGiveUp(string why)
         {
+            // ⚠️ 只喊一次（2026-10-13 修）。海辰日志里同一句
+            //    "自动登录停手：提交次数已用完" 在 20 秒内被喊了 6 遍 ——
+            //    因为补填定时器 / 自动重连 / 页面回传都在各自驱动一遍填表+提交，
+            //    每一遍都走到这里。重复喊既刷屏，又让人以为流程在反复重启。
+            //    ⚠️ 注意：状态（_autoAuthRunning=false）**每次都做**，只把
+            //    "喊话"这一步限制成一次 —— 否则状态会不一致（见下面的坑）。
+            bool firstGiveUp = !_autoAuthGaveUp;
+            _autoAuthGaveUp = true;
+
             _autoAuthRunning = false;
             if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
+
+            if (!firstGiveUp) return;
             Log.Warn("自动登录停手：" + why);
 
             // 后台静默跑的时候窗口在屏幕外，用户看不到状态条 —— 失败必须用气泡告知，
@@ -1788,6 +1928,32 @@ namespace CampusNetHelper
         /// <summary>自测用：自动登录流程是不是还在跑（true = 没停手）。</summary>
         internal bool AutoAuthRunningForTest() { return _autoAuthRunning; }
 
+        /// <summary>自测用：当前手里那张验证码图的身份（src）。空 = 没抓到身份。</summary>
+        internal string CaptchaSrcForTest() { return _captchaSrc; }
+
+        /// <summary>
+        /// 自测用：验证"验证码图的身份"这条判据（2026-10-13 新增）。
+        /// 返回 "拦得住/不误伤" 才算健康。
+        ///
+        /// 它同时验两件相反的事，缺一不可：
+        ///   ① 图真的换了（src 变了）→ **必须拦住**（否则就是把旧答案提交上去）
+        ///   ② 图没换（src 一样）→ **绝不能拦**（否则流程会被永久卡在"等新图"上）
+        /// ⚠️ 只验 ① 是最容易骗过自己的写法 —— 一个 `return true` 的假实现也能过。
+        ///    改完立刻还原，不影响后续流程。
+        /// </summary>
+        internal string CaptchaIdentityProbeForTest()
+        {
+            if (_captchaSrc.Length == 0) return "没抓到图身份";
+
+            string keep = _captchaSrc;
+            _captchaSrc = keep + "__poisoned__";
+            bool caught = CaptchaIdentityChanged();
+            _captchaSrc = keep;
+            bool noFalseAlarm = !CaptchaIdentityChanged();
+
+            return (caught ? "拦得住" : "拦不住") + "/" + (noFalseAlarm ? "不误伤" : "误伤");
+        }
+
         /// <summary>
         /// 自测用：**直接**模拟"看门狗超时"（页面一直没回传结果）。
         /// 返回 true = 程序选择继续重试；false = 它停手了。
@@ -1801,7 +1967,9 @@ namespace CampusNetHelper
         /// </summary>
         internal bool SimulateWatchdogTimeoutForTest()
         {
-            AutoAuthNextAttemptOrGiveUp(AutoAuthNoResultWhy);
+            // submitted = false：自测里我们希望它走"主动换一张"那条路，
+            // 这样探针能覆盖得更全（页面不响应时也有兜底）。
+            AutoAuthNextAttemptOrGiveUp(AutoAuthNoResultWhy, false);
             return _autoAuthRunning;
         }
 
@@ -2022,6 +2190,7 @@ namespace CampusNetHelper
         private void HideCaptchaRow()
         {
             _captchaPng = null;
+            _captchaSrc = "";
             _captchaTyped = "";
             if (_captchaTypedTimer != null) _captchaTypedTimer.Stop();
             if (rowCaptcha != null) rowCaptcha.Visibility = Visibility.Collapsed;
@@ -2350,6 +2519,15 @@ namespace CampusNetHelper
             _autoAuthRunning = false;
             _autoAuthWaitNext = false;
             _autoAuthTriedFresh = false;
+            // ⚠️ 换页也把"已经停手"的标记清掉：自动重连会重新打开认证页，
+            //    如果标记一直留着，重连那一轮会被静默挡住（看起来像"重连了但没反应"）。
+            //    重复喊话的风险由 AutoAuthGiveUp 的一次性守卫 + 两道闸门共同兜住。
+            _autoAuthGaveUp = false;
+            // ⚠️ 2026-10-13：`_autoAuthRefreshCount` 以前**只加不清**（原代码里没有任何
+            //    重置点）。一旦某次会话里累计换图超过 3 次，之后每一轮都会一进门就判
+            //    "连着换了几张都没等到可用的图" 直接停手 —— 也就是越用越不灵。
+            //    换页算新的一轮尝试，归零。防风暴靠的是两道闸门，不靠这个计数。
+            _autoAuthRefreshCount = 0;
             if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
             _loadToken++;
             SetStatus("正在打开认证页…");
@@ -2429,6 +2607,7 @@ namespace CampusNetHelper
             //   拿旧图上的字去填必然对不上。所以在这里清掉 —— 后面的提交路径于是
             //   只能重新抠一张，不可能再拿到隔页的旧图。
             _captchaPng = null;
+            _captchaSrc = "";
 
             // 页面换了，重新抠一次（抠不到就说明本页没有验证码）
             _captchaPollKeepRow = false;
@@ -2474,6 +2653,8 @@ namespace CampusNetHelper
             _autoAuthRunning = false;
             _autoAuthWaitNext = false;
             _autoAuthTriedFresh = false;
+            _autoAuthGaveUp = false;      // 新一轮 → "已经停手"的标记也要归零
+            _autoAuthRefreshCount = 0;
             if (TryAutoFillAndSubmit(false)) _autoDoneThisLoad = true;
         }
 
