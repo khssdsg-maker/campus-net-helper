@@ -68,6 +68,7 @@ namespace CampusNetHelper
                 TestAutoLoginFlow();
                 TestAutoAuthTimeoutRetries();
                 TestSubmitButtonPicking();
+                TestAutostartStateLogic();
                 TestCaptchaOcr();
 
                 W("================ 界面自测 结束 ================");
@@ -2114,6 +2115,36 @@ namespace CampusNetHelper
             c.Disabled = false;
             c.Href = href;
             return c;
+        }
+
+        /// <summary>
+        /// 2026-10-13 新增：开机自启"算不算生效"的判据。
+        ///
+        /// 海辰报的 bug：点完「以管理员身份安装自启」之后，下次打开设置，
+        /// 「开机自动启动（登录后静默运行）」那个勾**变回未勾选**。
+        /// 根因：装计划任务时会主动删掉「启动」文件夹的副本（防登录时起两个实例），
+        /// 而判据只看副本 → 必然显示未勾选。**自启其实是好的**，界面却说他没开。
+        /// </summary>
+        private static void TestAutostartStateLogic()
+        {
+            W("");
+            W("---- 用例：开机自启的状态判据（2026-10-13）----");
+
+            bool a = MainWindow.AutostartActive(true, false);    // 只有「启动」副本
+            bool b = MainWindow.AutostartActive(false, true);    // 只有计划任务 ← 海辰那种情形
+            bool c = MainWindow.AutostartActive(true, true);     // 两条都有
+            bool d = MainWindow.AutostartActive(false, false);   // 都没有
+
+            W("① 只有「启动」副本 → 算生效 = " + a + "（期望 True）");
+            W("② 只有计划任务 → 算生效 = " + b
+                + "（期望 True —— 就是海辰那种情形；修之前这里是 False，所以勾会自己变回去）");
+            W("③ 两条都有 → 算生效 = " + c + "（期望 True）");
+            W("④ 都没有 → 算生效 = " + d + "（期望 False —— 不能把没装也算成装了）");
+
+            bool ok = a && b && c && !d;
+            W("结果：" + (ok
+                ? "通过 —— 「启动」副本 / 计划任务两条腿任一条在就算生效，不会再看错地方。"
+                : "不通过 —— 见上面逐项。"));
         }
 
         /// <summary>假门户一轮的观测结果。</summary>

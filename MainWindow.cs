@@ -116,7 +116,45 @@ namespace CampusNetHelper
 
         internal const string FontUi = "Microsoft YaHei UI, Microsoft YaHei, Segoe UI";
         internal const string FontMono = "Consolas, Microsoft YaHei UI";
-        internal const string VersionText = "2.4.5";
+        internal const string VersionText = "2.4.6";
+
+        /// <summary>
+        /// 这一份 exe 是不是「测试版」。缓存三态：-1 未判、0 正式版、1 测试版。
+        /// </summary>
+        private static int _testBuildState = -1;
+
+        /// <summary>
+        /// 判断当前跑的是不是测试版 —— 2026-10-13 海辰要求：
+        /// **测试版要和正式版一眼分得开**（他两个都在跑，分不清就会把测试版的问题
+        /// 当成正式版的毛病）。
+        ///
+        /// 判据用**文件名**（含「测试版」三个字），不用编译期常量。理由：
+        ///   同一份源码编译出来的产物，拷成「校园网助手-测试版.exe」就是测试版、
+        ///   拷成「校园网助手.exe」就是正式版 —— 不需要维护两套构建配置，
+        ///   也就**不会出现"忘了改常量导致标错"**这种事故。
+        ///   正好也贴合本项目的发布方式（release_sync.py 就是这么拷的）。
+        /// </summary>
+        internal static bool IsTestBuild()
+        {
+            if (_testBuildState < 0)
+            {
+                _testBuildState = 0;
+                try
+                {
+                    string p = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
+                    if (!string.IsNullOrEmpty(p) && p.IndexOf("测试版", StringComparison.Ordinal) >= 0)
+                        _testBuildState = 1;
+                }
+                catch { }
+            }
+            return _testBuildState == 1;
+        }
+
+        /// <summary>标题里显示的名字：测试版会带后缀。</summary>
+        internal static string AppDisplayName()
+        {
+            return IsTestBuild() ? "校园网助手（测试版）" : "校园网助手";
+        }
 
         // ==================================================================
         // 本校专属默认值
@@ -450,7 +488,7 @@ namespace CampusNetHelper
 
         private void BuildUi()
         {
-            Title = "校园网助手";
+            Title = AppDisplayName();
             Width = 920;
             Height = 810;
             MinWidth = 860;
@@ -700,6 +738,7 @@ namespace CampusNetHelper
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             var title = new StackPanel();
+            var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
             var t = new TextBlock
             {
                 Text = "校园网助手",
@@ -708,7 +747,36 @@ namespace CampusNetHelper
                 Foreground = new SolidColorBrush(Theme.TextPrimary)
             };
             _primaryTexts.Add(t);
-            title.Children.Add(t);
+            titleRow.Children.Add(t);
+
+            // 2026-10-13 海辰要求：测试版要和正式版一眼分得开。
+            // 用一个醒目的角标，而不是只在标题栏加几个字 —— 他两个版本都在跑，
+            // 窗口长得一模一样的话，很容易把测试版的问题当成正式版的毛病。
+            if (IsTestBuild())
+            {
+                var badge = new Border
+                {
+                    Background = new SolidColorBrush(
+                        System.Windows.Media.Color.FromRgb(0xEF, 0x9F, 0x27)),
+                    CornerRadius = new CornerRadius(4),
+                    Padding = new Thickness(6, 1, 6, 2),
+                    Margin = new Thickness(8, 1, 0, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    ToolTip = "这是测试版（文件名里带「测试版」）。"
+                        + "正式版是「校园网助手.exe」，两者互不影响。"
+                };
+                var bt = new TextBlock
+                {
+                    Text = "测试版",
+                    FontSize = 11,
+                    Foreground = new SolidColorBrush(
+                        System.Windows.Media.Color.FromRgb(0x41, 0x24, 0x02))
+                };
+                badge.Child = bt;
+                titleRow.Children.Add(badge);
+            }
+
+            title.Children.Add(titleRow);
 
             var st = new TextBlock
             {

@@ -419,7 +419,38 @@ namespace CampusNetHelper
         /// </summary>
         internal bool SilentEnabled()
         {
-            return AutostartHelper.StartupCopyExists();
+            // ⚠️⚠️ 2026-10-13 修（海辰报的「装完开机自启，下次打开那个勾又变回没勾」）：
+            //
+            //   开机自启有**两条腿**，而且它们**互斥**：
+            //     ① 「启动」文件夹里的副本（普通权限）
+            //     ② 计划任务（管理员权限）—— 装它的时候会**主动删掉副本**，否则登录时会起两个实例
+            //
+            //   原实现只看 ①：`return AutostartHelper.StartupCopyExists();`
+            //   于是**只要装了计划任务，这个勾就必然显示成未勾选** ——
+            //   自启明明是好的，界面却告诉用户"没开"。用户看到的就是
+            //   "我明明装了，下次打开勾没了"。
+            //
+            //   现在两条腿任一条在，就算"开机自启生效"。
+            //   ⚠️ 副作用已核过：`Silent` 这个配置只被 App.xaml.cs 的
+            //      IsSilentSetting() 读，而它**只在"从启动文件夹启动"时才生效** ——
+            //      那种情况下副本本来就存在。所以这里改成 true 不会让手动双击
+            //      启动变成静默启动（那才是真正的回归）。
+            return AutostartActive(AutostartHelper.StartupCopyExists(),
+                                   AutostartHelper.IsTaskInstalled());
+        }
+
+        /// <summary>
+        /// "开机自启算不算生效"的**纯判据**（抽出来就是为了能被自测直接断言）。
+        ///
+        /// 两条腿：①「启动」文件夹副本 ② 计划任务（管理员权限）。**任一在即生效**。
+        ///
+        /// ⚠️ 2026-10-13 修的真 bug：以前只看 ①，而**装计划任务时会主动删掉副本**
+        ///    （防登录时起两个实例），于是"装了计划任务 → 副本没了 → 勾选框显示未勾选"。
+        ///    用户看到的就是"我明明装了，下次打开勾又没了"。
+        /// </summary>
+        internal static bool AutostartActive(bool startupCopyExists, bool taskInstalled)
+        {
+            return startupCopyExists || taskInstalled;
         }
 
         internal int ReconnectInterval()
@@ -3319,7 +3350,7 @@ namespace CampusNetHelper
             {
                 // 刚启动时还没连上，直接挂灰色那张；连上后由 UpdateTrayIcon 换掉
                 Icon = _trayIcIdle != null ? _trayIcIdle : LoadAppIcon(),
-                Text = "校园网助手",
+                Text = AppDisplayName(),
                 ContextMenuStrip = trayMenu,
                 Visible = true
             };
@@ -3400,7 +3431,10 @@ namespace CampusNetHelper
             if (trayMiStatus != null) trayMiStatus.Text = "状态：" + (text ?? "");
             if (trayIcon != null)
             {
-                string t = "校园网助手 - " + (text ?? "");
+                // 2026-10-13：测试版在托盘提示里也要认得出（AppDisplayName 会带「（测试版）」）。
+                // ⚠️ 末尾的 60 字截断保留 —— Windows 的托盘提示有长度上限，
+                //    加了后缀之后更容易顶到上限，靠它兜住。
+                string t = AppDisplayName() + " - " + (text ?? "");
                 if (t.Length > 60) t = t.Substring(0, 60);
                 trayIcon.Text = t;
             }
