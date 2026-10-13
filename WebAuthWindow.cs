@@ -1494,6 +1494,35 @@ namespace CampusNetHelper
                 return true;
             }
 
+            // ⚠️⚠️ 信心门控（2026-10-13，直接回应海辰「提交次数有限」）：
+            //    认出了 4 位 **不等于** 值得提交。margin 低意味着"第一选择只比第二选择
+            //    高一点点"，这种提交基本必错 —— 而每一次失败学校端都会记一笔登录失败，
+            //    还占掉 3 次额度里的一次。
+            //    实测（300 张人工标注）：margin<0.05 → 整图只有 69.0% 对；
+            //    margin>=0.05 → 96.8% 对。所以低信心时**不提交，改换一张**（换图免费）。
+            if (_lastOcrResult != null && _lastOcrResult.MinMargin < AutoAuthSubmitMinMargin)
+            {
+                _autoAuthRefreshCount++;
+                if (_autoAuthRefreshCount > AutoAuthMaxRefresh)
+                {
+                    AutoAuthGiveUp("换了 " + AutoAuthMaxRefresh
+                                   + " 张验证码都没碰到有把握的（最小 margin 一直低于 "
+                                   + AutoAuthSubmitMinMargin.ToString("0.###") + "）");
+                    SetStatus("换了 " + AutoAuthMaxRefresh + " 张验证码都没认出有把握的 —— "
+                        + "请手动填一下验证码，再点页面上的「登录」。");
+                    return true;
+                }
+                Log.Info("自动登录：这次识别信心不足（最小 margin="
+                         + _lastOcrResult.MinMargin.ToString("0.###") + " < "
+                         + AutoAuthSubmitMinMargin.ToString("0.###")
+                         + "）—— 不提交，换一张再试（提交失败学校端要记一次，换图免费）");
+                SetStatus("这张验证码没把握，换一张再试…");
+                SetCaptchaHint("没把握，换一张重试…");
+                _autoAuthWaitNext = true;
+                OnCaptchaRefresh();
+                return true;
+            }
+
             if (submit == null)
             {
                 // ⚠️ 挑不出按钮时**必须把候选全打出来**（2026-10-13 加）。
@@ -1569,7 +1598,11 @@ namespace CampusNetHelper
 
             _submitCalls++;
             ClickElement(submit);
-            AfterSubmitAuto();
+            // ⚠️ 提交前先记下"当时通不通"（2026-10-13 假阳性修复用）：
+            //    成功判定不能只看"提交后通不通" —— 提交前就通着的话，
+            //    这条证据是空的（海辰 12:24:17 就这么误报过一次成功）。
+            //    OnlineStale() 不阻塞 UI（缓存 5 秒，过期就返回上次已知值并后台预热）。
+            AfterSubmitAuto(NetProbe.OnlineStale());
             StartAutoAuthWatchdog();
             return true;
         }
@@ -1599,6 +1632,35 @@ namespace CampusNetHelper
         private const int AutoAuthWatchdogSeconds = 12;
 
         /// <summary>
+        /// 整张图的「最小 margin」要到多少才值得提交。
+        ///
+        /// ⚠️ 2026-10-13 用海辰 10-12 人工判的 **300 张真样本**标定出来的
+        ///    （数据与脚本：`campus-net-helper-验证码质检\90/91/92_*.py`）：
+        ///      margin &lt; 0.05 的图，整图 4 位全对只有 **69.0%**；
+        ///      margin &gt;= 0.05 的图，整图全对 **96.8%**（62 张样本）。
+        ///
+        ///    为什么要卡这一道：**换一张图是免费的，而提交失败学校端会记一次登录失败**，
+        ///    还用掉 3 次额度里的一次。海辰原话「提交次数有限」—— 这道门就是为此设的。
+        ///
+        ///    成本模型（二项分布，每轮 B=3 次提交 / R 次换图）：
+        ///      现状 T=0.03, R=3  → 一轮成功率 72.1%、学校端失败 0.180 次/轮、
+        ///                          "一轮一次都提交不了" 20.9%
+        ///      本组 T=0.05, R=10 → 一轮成功率 89.3%、学校端失败 0.061 次/轮、
+        ///                          "一轮一次都提交不了" 9.9%
+        ///    （更激进可看 T=0.05/R=15：成功率 96.5%、失败 0.079 次/轮，代价是更慢）
+        /// </summary>
+        private const double AutoAuthSubmitMinMargin = 0.05;
+
+        /// <summary>
+        /// 一轮里「换一张验证码」的上限。3 → 10（2026-10-13，与上面的门槛配套）。
+        ///
+        /// 为什么必须一起涨：门槛提到 0.05 之后，一张图"能提交"的概率从 40.7% 掉到 20.7%。
+        /// 换图上限还停在 3 的话，**大多数轮次会"换了 3 张都没碰到有把握的"就停手** ——
+        /// 那反而是倒退。换图不产生登录失败，所以这个上限可以放宽。
+        /// </summary>
+        private const int AutoAuthMaxRefresh = 10;
+
+        /// <summary>
         /// 提交后等结果的看门狗：万一这次点击没触发页面回传（点偏了 / 按钮被禁用），
         /// 不能就这么一直挂着"正在自动登录"。
         /// </summary>
@@ -1622,7 +1684,7 @@ namespace CampusNetHelper
                     if (_autoAuthWaitNext)
                     {
                         _autoAuthRefreshCount++;
-                        if (_autoAuthRefreshCount > 3)
+                        if (_autoAuthRefreshCount > AutoAuthMaxRefresh)
                         {
                             AutoAuthGiveUp("连着等了几次都没等到可用的验证码图");
                             return;
@@ -1647,9 +1709,18 @@ namespace CampusNetHelper
         /// <summary>
         /// 自动登录版的结果判定（对应老 AfterSubmit，但带重试决策）。
         ///
-        /// 成功判据仍然用全局唯一那一份 NetProbe.Online(true) —— 不许在这里另立一份。
+        /// ⚠️ 2026-10-13 修「提交成功」的假阳性：
+        ///    原来只看 `netOk`（网络通不通）。可**提交之前网络就是通的**情况下，
+        ///    "现在通着"证明不了这次登录成功 —— 海辰日志 12:24:17 就是这么误报了一次
+        ///    「第 1 次提交成功」（当时网络全程是通的，验证码其实很可能是错的）。
+        ///    更糟的形态是：13:26:04 提交、5.6 秒后又判定掉线 —— 一次错提交被算成成功，
+        ///    重试就白白少了一次。
+        ///    现在要求**两种证据之一**：
+        ///      ① 提交前不通、提交后通了（真正的跃变）
+        ///      ② 页面已经没有验证码了（离开了登录页 —— 项目里 MaybeRecordSample
+        ///         早就把这一条当作"真的登进去了"的旁证）
         /// </summary>
-        private void AfterSubmitAuto()
+        private void AfterSubmitAuto(bool wasOnlineBefore)
         {
             int attempt = _autoAuthAttempts;
             Thread t = new Thread(delegate()
@@ -1680,7 +1751,14 @@ namespace CampusNetHelper
                         {
                             if (!_autoAuthRunning) return;      // 已经被别处收尾（成功/停手/关窗）
 
-                            if (netOk)
+                            // ⚠️ 假阳性防线（2026-10-13，详见方法注释）：
+                            //    "网络通着"单独不足以证明这次登录成功 —— 提交前就可能已经通着。
+                            //    要求"从不通到通"的跃变，或者"页面已经没有验证码了"（离开登录页）。
+                            bool leftLogin = false;
+                            try { leftLogin = LeftLoginPage(); }
+                            catch { }
+
+                            if (netOk && (!wasOnlineBefore || leftLogin))
                             {
                                 // ⚠️ 只让**最后一次提交**的检查者来报"成功"（2026-10-12 自测里发现）：
                                 //    失败后页面会重载并（由重试流程）再提交一次，而上一轮的检查者
@@ -1691,13 +1769,24 @@ namespace CampusNetHelper
                                 _autoAuthRunning = false;
                                 if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
                                 SetStatus("自动登录成功 —— 已经连上网了（第 " + attempt + " 次提交）。");
-                                Log.Info("自动登录：第 " + attempt + " 次提交成功");
+                                Log.Info("自动登录：第 " + attempt + " 次提交成功"
+                                         + "（跃变=" + (!wasOnlineBefore)
+                                         + "，已离开登录页=" + leftLogin + "）");
                                 NotifyOwnerOnline();
                                 if (_startupAutoClose || _reauthMode)
                                 {
                                     try { Close(); } catch { }
                                 }
                                 return;
+                            }
+
+                            // 网络通着但拿不出"这次登录生效"的证据 —— 不能算成功，
+                            // 也不能直接当失败（可能是生效慢）。交给下面那条正常判定路径，
+                            // 让它看页面报错再决定重试还是停手。
+                            if (netOk)
+                            {
+                                Log.Info("自动登录：网络是通的，但提交前就已经通着、"
+                                         + "页面也还在登录页 —— 不算这次成功，继续按页面结果判定");
                             }
 
                             // submitted = true：这条路本来就是"提交之后判结果"，
@@ -1729,6 +1818,30 @@ namespace CampusNetHelper
         ///              而且会让"认的那张"和"页面上的那张"错位（填上旧答案）。
         ///    没提交过（认不出 / 按钮点不动）→ 页面不会自己换图，这时**才**需要主动换一张。
         /// </param>
+        /// </summary>
+        /// <summary>
+        /// 页面是不是已经**离开登录页**了。
+        ///
+        /// 判据：页面上已经没有验证码那一套。这是"真的登进去了"最直接的旁证 ——
+        /// 项目里的 MaybeRecordSample 早就把这一条当成成功证据用了
+        /// （"跳转后的页面上已经没有验证码了"）。失败回传时页面会重载并重新显示验证码。
+        ///
+        /// ⚠️ 2026-10-13 新增，用来补「提交成功」判据的假阳性：网络通着不等于这次登录成功。
+        /// </summary>
+        private bool LeftLoginPage()
+        {
+            try
+            {
+                if (browser == null) return false;
+                WinForms.HtmlDocument d = browser.Document;
+                if (d == null) return false;
+                return !PageHasCaptchaNow();
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 这一次没过：验证码错就换一张接着试，别的错立刻停手。
         /// </summary>
         private void AutoAuthNextAttemptOrGiveUp(string pageErr, bool submitted)
         {
@@ -1771,7 +1884,7 @@ namespace CampusNetHelper
             // 换图也要有上限：万一新图一直没等到（页面不响应"换一张"），
             // 不能就这么无限换下去 —— 那样会一直挂着"正在自动登录"。
             _autoAuthRefreshCount++;
-            if (_autoAuthRefreshCount > 3)
+            if (_autoAuthRefreshCount > AutoAuthMaxRefresh)
             {
                 AutoAuthGiveUp("连着换了几张验证码都没等到可用的图");
                 return;

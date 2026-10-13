@@ -1902,13 +1902,31 @@ namespace CampusNetHelper
                     + "窗口闸计数 " + sd.SubmitWindow + "（都必须 ≤ 5 —— 风暴是 60 次/天，必须被按住）");
                 bool ok4 = sd.Posts <= 5 && sd.SubmitWindow <= 5;   // 风暴兜住：不许超过窗口上限
 
+                // 轮 5：**识别信心不足** → 一次都不许提交（2026-10-13 新增的信心门控）。
+                //        用的是海辰 300 张标注样本里真的一张（cc-0158，margin=0.030）。
+                //        这一张其实认对了，但 margin 太低 —— 拿它提交就是拿学校端的
+                //        失败记录去赌，所以必须"换一张"而不是提交。
+                FakePortalResult e = RunFakePortalEpisode(LowConfidenceCaptchaPng(), 999, true, 0, "轮5/信心不足");
+                W("轮5（margin=0.030 的真样本，认出来了但没把握）：服务端收到 POST " + e.Posts
+                    + " 次（期望 0 —— 没把握就不提交，换图是免费的）");
+                W("   状态 = \"" + e.Status + "\"");
+                W("   内部状态 = " + e.State);
+                // ⚠️ 判据里的「把握」是这条路径独有的词：信心门控的三句文案
+                //    （"没把握，换一张再试" / "都没碰到有把握的"）都含它，
+                //    而其它停手原因（找不到按钮、认不出来、次数用完）都不含。
+                //    第一次写这里时我找的是"没把握"，而最终文案是"都没认出**有把握**的" ——
+                //    子串对不上，用例红了。**判据要用这条路径真正会输出的词。**
+                bool ok5 = e.Posts == 0
+                        && e.Status.IndexOf("把握", StringComparison.Ordinal) >= 0;
+
                 int samplesAfter = CaptchaAssist.CountSamples();
                 bool noPollution = samplesAfter == samplesBefore;
                 W("样本目录没有被写脏 = " + noPollution + "（" + samplesBefore + " → " + samplesAfter + "）");
 
-                bool ok = ok1 && ok2 && ok3 && ok4 && noPollution;
+                bool ok = ok1 && ok2 && ok3 && ok4 && ok5 && noPollution;
                 W("结果：" + (ok
-                    ? "通过 —— 提交带着识别出来的验证码；被拒后换图重试；认不出时一次都不提交；连点也不会超过 3 次。"
+                    ? "通过 —— 提交带着识别出来的验证码；被拒后换图重试；认不出时一次都不提交；"
+                      + "连点也不会超过 3 次；**信心不足时也不提交**（换成免费换图）。"
                     : "不通过 —— 见上面逐项。"));
             }
             catch (Exception ex)
@@ -2418,6 +2436,26 @@ namespace CampusNetHelper
                 "h7gr8J7so4YitTvLDOvtwnDixyaFysjQu0sPDptF+GBuYd7Q/Qp6ns4/XaDPsIeLwQ9pJLcL21C+EREpD5ECCRpPloxQf9Z70MAm" +
                 "oi1/eN0DDXlBuUjII+T3IEVm+VVJCSRoXJL+F0pMvwZH3UTiv3ApeAaqsXwy4s/HWRkSSKREpiguOeahZ0dMIw1tGo+hRKT95KKD" +
                 "IT6UwL+Be0lDIousZOUVZMMcPsqLI5FxZhvzBzJ5xBtWXx27AAAAAElFTkSuQmCC";
+            return Convert.FromBase64String(b64);
+        }
+
+        /// <summary>
+        /// 一张**能认出来、但信心很低**的真实验证码（margin = 0.030）。
+        ///
+        /// 来源：海辰 10-12 人工判的 300 张样本里的 cc-0158.png
+        /// （`campus-net-helper-验证码质检\samples\`）。
+        /// 标定数据见 margin_calib_20261013.csv：这张 accepted=4、minmargin=0.030，
+        /// 程序猜 "63YS"、人工判定 "63YS" —— **其实是对的**，但 margin 低于 0.05。
+        ///
+        /// ⚠️ 用它做夹具，正好把"信心门控"这条新行为钉住：
+        ///    认出来了 ≠ 该提交。margin 0.030 意味着第一选择只比第二选择高 3%，
+        ///    这种提交基本必错，而每次失败学校端都要记一笔 —— 所以应当**换一张**而不是提交。
+        ///    （哪怕这一张恰好蒙对了，也不该拿学校端的失败记录去赌。）
+        /// </summary>
+        private static byte[] LowConfidenceCaptchaPng()
+        {
+            string b64 =
+                "iVBORw0KGgoAAAANSUhEUgAAAFAAAAAYCAYAAABtGnqsAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAANUSURBVFhH1Zc7ctswEEDRp3XjRp0zQxU+B2dcp1HvGXdpVLqIal+BpXQE1WqkG+gAGt2AJ0B2yV1gsQRI8KOM82Y2pih8nxafGLsAh/WanpYH2+b4jgwKNH+Mi0cjZU2SZpYfozFf9BRnVI9SphTaO9FDvAstqreNHBaQN2UMrtcp/WuhUiqjJXEsyVx3c8aU1XVu41guR+p3YY44ZvLsuHMZUSA9coQm6z+IOf3JjB8lcFBWJlpoTOrQ5j2VueNHeb0CDWbMzGAaMXiIcFxO9E0XL/PJfhaFm+hxf6cSmru9bny5w+5M7xXnnS8jo9hBC8PgdDjaf0K6bzqc7BYqNnLKyt7obR9N2TdoWsrj+KS2ovFFISQWL/b9R7fs6/OLl7F66nyPcd8JwYm4KO9QLYghDDaS5FbZEloxZgsaxwCljxU9AzU8O4nb9p0aXWfJyszZ7G1NrxGsenSCE5kk6xcr+9bMg+Jplf5OxRDJEsZ8UOaVtspJO0mtK8DnI8qDiCxjLY8HLzPIL+Vw6WIG6Xm2YsIyDJbFeH3eRL936EYTJEsZ8xMi/DUwtuNSseVaRuXxkuXn9q8c0tleXKZt7BUc1ns/8di+h+8RWQ7lY7NB05kM1Ul8fWomglFS+t2q0r3LlghLt3ZLt436t9i7EhEQLOVNcul26wr5FE2m4TgWJN4a7H1dWeIwGZuGl1CinDn3I5GTbkKJaN+pzyqwycMa6sXqYsD76N45knDkzGnbTgrCu7rZqiSBPaexcuG5w+HBAq+3th1VOHYfbAmzifdDXb+fbkY2kRKcCI2aAX0kgRi8hHMF9kKZeHsfM/EWt6fBXsjZN534DzKFxEz8HuiXqxfopSbgQ0ONq0Rx+F7cSYZEYH+IF1g0h8ls7vtmP4UO0pfwDJrRde5ggD806Boz5k4o9zy5XIXUWJ8xOEvcUqPTuBfoy2WYukM6SGBTZq7AFMb8ImkU2UsXFLNAF3SBzsSJo5BLOCkQ+yGC/4V0LtvhEo7eAzPxPUbIzRIJDghxWTcCN2ERTJZAwI85cWjomJp9NLfFBc4Rx8hnZkhg6gR39SIxJ/OYxQQuJU5+XoyR48qC2lxEIIrLmrjYoyQPE/cPWESgZPDHVhL/V3Et1v4FgNyeIOH1N8cAAAAASUVORK5CYII=";
             return Convert.FromBase64String(b64);
         }
 
