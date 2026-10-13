@@ -4054,23 +4054,92 @@ namespace CampusNetHelper
             public string Type;    // submit / button / reset / …
             public string Label;   // 按钮上的字（input 取 value，其它取文字）
             public bool Disabled;
+            public string Href;    // 只对 <a> 有意义：区分"导航链接"和"回传链接"
+        }
+
+        /// <summary>
+        /// 这个 href 是不是"会导航走"的链接。
+        ///
+        /// ⚠️⚠️ 2026-10-13 这是真正那个 bug 的分界线（见 PickSubmitIndex 注释）：
+        ///    · 空 / `./` / `login` / `#` / `http://…`  → **导航链接**，点它 = 整页重载，
+        ///      已经填好的账号密码全被清空；
+        ///    · `javascript:__doPostBack(...)`        → **页面内回传**（WebForms 的
+        ///      LinkButton 就是这样渲染的），点它是提交表单，不是导航。
+        /// </summary>
+        private static bool IsNavigationHref(string href)
+        {
+            string h = (href ?? "").Trim();
+            if (h.Length == 0) return true;      // ⚠️ <a href=""> 也会导航到当前地址
+            return !h.StartsWith("javascript:", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
         /// 从候选里挑「登录按钮」的**纯决策**（不碰 DOM，可被自测直接调用）。
         /// 返回下标；**-1 = 分不清，宁可不点**。
         ///
-        /// 顺序：① 先认字 ② 兜底只认"表单里唯一的 submit/button"。
-        /// ⚠️ 绝不"遇到第一个 submit 就点" —— 门户是 ASP.NET WebForms，
-        ///    「换一张」也是 type=submit，那样点下去就是刷新验证码的 PostBack。
+        /// ⚠️⚠️ 2026-10-13 第二次重写 —— 上一版（"先认按钮文字"）**认错了人**。
+        ///    真机页面（`http://10.6.6.6/login` 抓下来的真实 HTML）长这样：
+        ///        &lt;a href="login" class="nav-link"&gt;连网登录&lt;/a&gt;      ← 导航栏链接
+        ///        &lt;input type="submit" value="登录" id="MainContent_LoginBtn"&gt; ← 真按钮
+        ///    导航栏排在文档**前面**，文字又含「登录」两个字，于是"按文字找"第一个撞上的
+        ///    就是那个**导航链接**。点 `<a href="login">` 是**跳转**、不是提交表单 ——
+        ///    结果就是海辰看到的"点一下，整个页面刷新、信息全没了"。
+        ///    （上一版我以为凶是「换一张」，错了；是**导航链接**。日志里的 `按钮=a` 是铁证。）
+        ///
+        /// 现在的判定顺序（**可靠性从高到低，绝不拿导航链接当提交**）：
+        ///   ① `input`/`button` + `type=submit` —— 真·提交按钮，唯一可靠的一类；
+        ///      先挑文字明确的，退一步"只有一个候选"也认。
+        ///   ② `input`/`button` + `type=button` —— 有些门户把登录做成普通按钮 + onclick。
+        ///   ③ `<a>`：**只有 href 是 `javascript:`**（LinkButton 回传）才可能是一次提交；
+        ///      `href="login"` / `"./"` / `"#"` 这类**一律不点**。
+        ///   ④ 都不满足 → -1（交给用户手动点）。
         /// </summary>
         internal static int PickSubmitIndex(List<ButtonCand> cands)
         {
-            // ① 先认字：只认明确的登录语义，命中"换一张/刷新/重置…"的直接排除
+            // ① 真·提交按钮
+            int onlySubmit = -1;
+            int submitCnt = 0;
             foreach (ButtonCand c in cands)
             {
-                if (c.Tag != "input" && c.Tag != "button" && c.Tag != "a") continue;
+                if (c.Tag != "input" && c.Tag != "button") continue;
                 if (c.Disabled) continue;
+                if ((c.Type ?? "").ToLowerInvariant() != "submit") continue;
+
+                string lb = (c.Label ?? "").Trim();
+                if (ContainsAny(lb, NotSubmitWords)) continue;   // 「换一张」这类直接剔除
+
+                submitCnt++;
+                onlySubmit = c.Index;
+                if (lb.Length > 0 && lb.Length <= 12 && ContainsAny(lb, SubmitWords)) return c.Index;
+            }
+            if (submitCnt == 1) return onlySubmit;
+
+            // ② type=button（普通按钮 + onclick 提交的写法）
+            int onlyBtn = -1;
+            int btnCnt = 0;
+            foreach (ButtonCand c in cands)
+            {
+                if (c.Tag != "input" && c.Tag != "button") continue;
+                if (c.Disabled) continue;
+                if ((c.Type ?? "").ToLowerInvariant() != "button") continue;
+
+                string lb = (c.Label ?? "").Trim();
+                if (lb.Length == 0 || lb.Length > 12) continue;
+                if (ContainsAny(lb, NotSubmitWords)) continue;
+                if (!ContainsAny(lb, SubmitWords)) continue;
+
+                btnCnt++;
+                onlyBtn = c.Index;
+            }
+            if (btnCnt == 1) return onlyBtn;
+
+            // ③ <a>：只认"回传链接"（javascript:），导航链接一律不点
+            foreach (ButtonCand c in cands)
+            {
+                if (c.Tag != "a") continue;
+                if (c.Disabled) continue;
+                if (IsNavigationHref(c.Href)) continue;          // ← 这条拦住的是那个导航链接
+
                 string lb = (c.Label ?? "").Trim();
                 if (lb.Length == 0 || lb.Length > 12) continue;
                 if (ContainsAny(lb, NotSubmitWords)) continue;
@@ -4078,20 +4147,8 @@ namespace CampusNetHelper
                 return c.Index;
             }
 
-            // ② 兜底：表单里**唯一**的 submit/button 才敢点
-            int only = -1;
-            int cnt = 0;
-            foreach (ButtonCand c in cands)
-            {
-                if (c.Tag != "input" && c.Tag != "button") continue;
-                string t = (c.Type ?? "").ToLowerInvariant();
-                if (t != "submit" && t != "button") continue;
-                if (c.Disabled) continue;
-                if (ContainsAny(c.Label ?? "", NotSubmitWords)) continue;
-                cnt++;
-                only = c.Index;
-            }
-            return cnt == 1 ? only : -1;
+            // ④ 分不清就别动
+            return -1;
         }
 
         /// <summary>
@@ -4130,6 +4187,7 @@ namespace CampusNetHelper
                 c.Type = AttrOf(el, "type");
                 c.Label = ButtonLabel(el);
                 c.Disabled = IsDisabled(el);
+                c.Href = (tag == "a") ? AttrOf(el, "href") : "";
 
                 cands.Add(c);
                 picked.Add(el);
@@ -4187,6 +4245,16 @@ namespace CampusNetHelper
             if (type.Length > 0) s = s + "[type=" + type + "]";
             if (id.Length > 0) s = s + "#" + id;
             else if (name.Length > 0) s = s + "[name=" + name + "]";
+
+            // ⚠️ 2026-10-13 加 href：日志里光写 `按钮=a` **分不出是"导航链接"还是
+            //    "回传链接"** —— 而这两者天差地别（前者一点整页重载、信息清空）。
+            //    真凶就是这么从日志里溜过去的，必须让它在日志里现形。
+            if (s.StartsWith("a", StringComparison.Ordinal))
+            {
+                string href = AttrOf(el, "href");
+                if (href.Length > 40) href = href.Substring(0, 40) + "…";
+                s = s + "(href=" + href + ")";
+            }
             return s;
         }
 

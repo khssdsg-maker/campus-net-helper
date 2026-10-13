@@ -2059,8 +2059,36 @@ namespace CampusNetHelper
             W("⑥ 登录按钮被禁用 + 只有刷新 → 挑第 " + pick + " 个（期望 -1）");
             ok = ok && pick == -1;
 
+            // ⑦ ★ 真机页面夹具（2026-10-13 从 http://10.6.6.6/login 直接抓下来的真实 HTML）★
+            //    这是海辰那个 bug 的**原始证据**：导航栏排在文档前面，其中
+            //    <a href="login" class="nav-link">连网登录</a> 的文字里也含「登录」，
+            //    于是"按文字找按钮"第一个撞上的就是它 —— 点的是**导航**，整页重载、信息清空。
+            //    真按钮是 <input type="submit" value="登录" id="MainContent_LoginBtn">。
+            List<WebAuthWindow.ButtonCand> g = new List<WebAuthWindow.ButtonCand>();
+            g.Add(CandH(0, "a", "", "桂林信息科技学院 多运营商接入管理平台统一认证系统", "./"));
+            g.Add(CandH(1, "a", "", "主页", "./"));
+            g.Add(CandH(2, "a", "", "连网登录", "login"));        // ← 真凶
+            g.Add(CandH(3, "a", "", "断开网络", "logoff"));
+            g.Add(CandH(4, "a", "", "信息验证", "checking"));
+            g.Add(Cand(5, "input", "submit", "登录", false));      // ← 真按钮
+            pick = WebAuthWindow.PickSubmitIndex(g);
+            W("⑦ 真机页面（导航栏 5 个链接 + 真提交按钮）→ 挑第 " + pick
+                + " 个（期望 5 = MainContent_LoginBtn；挑成 2 就是点了导航「连网登录」）");
+            ok = ok && pick == 5;
+
+            // ⑧ 反方向：WebForms 的 LinkButton 是 <a href="javascript:__doPostBack(...)">
+            //    —— 那是**回传**不是导航，必须仍然认得出来（别把好的也一起禁掉）
+            List<WebAuthWindow.ButtonCand> h2 = new List<WebAuthWindow.ButtonCand>();
+            h2.Add(Cand(0, "input", "submit", "重置", false));
+            h2.Add(CandH(1, "a", "", "登录", "javascript:__doPostBack('ctl00$btnLogin','')"));
+            pick = WebAuthWindow.PickSubmitIndex(h2);
+            W("⑧ [重置, <a href=javascript:__doPostBack…>登录] → 挑第 " + pick
+                + " 个（期望 1 = 回传链接要认，不能连它一起禁掉）");
+            ok = ok && pick == 1;
+
             W("结果：" + (ok
-                ? "通过 —— 「换一张」这类绝不会被当成登录按钮；分不清时宁可不点（不瞎点、不点错）。"
+                ? "通过 —— 只挑真·提交按钮；导航链接（href=login/./#）绝不点；"
+                  + "WebForms 的回传链接（href=javascript:）仍然认。"
                 : "不通过 —— 见上面逐项。"));
         }
 
@@ -2072,6 +2100,19 @@ namespace CampusNetHelper
             c.Type = type;
             c.Label = label;
             c.Disabled = disabled;
+            c.Href = "";
+            return c;
+        }
+
+        private static WebAuthWindow.ButtonCand CandH(int idx, string tag, string type, string label, string href)
+        {
+            WebAuthWindow.ButtonCand c = new WebAuthWindow.ButtonCand();
+            c.Index = idx;
+            c.Tag = tag;
+            c.Type = type;
+            c.Label = label;
+            c.Disabled = false;
+            c.Href = href;
             return c;
         }
 
