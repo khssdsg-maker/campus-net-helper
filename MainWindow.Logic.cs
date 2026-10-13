@@ -651,6 +651,27 @@ namespace CampusNetHelper
             return "auto";
         }
 
+        /// <summary>
+        /// 开机自动连接（网页认证）—— settings.txt 的 PortalAutoConnect，**默认开**。
+        ///
+        /// 2026-10-13 海辰要求：开机后程序自己把网页认证登录跑完（不用他动手），
+        /// 并且**给一个开关**让他能关掉。
+        ///
+        /// 行为：
+        ///   · 开（默认）= 开机自启时自动打开认证页并跑完一键登录（认验证码 → 填 → 提交）。
+        ///     这与之前 PortalStartupBehavior=auto 时的"弹出认证窗口"是一致的，
+        ///     只是现在窗口里那套自动登录会真的跑到底。
+        ///   · 关 = 开机只静默起进程守在网络后面，**不弹窗、不登录**，
+        ///     等用户自己想连的时候点「立即连接」。
+        ///
+        /// ⚠️ 只对网页认证模式有效；拨号模式一个字都不改。
+        /// ⚠️ 夜间免打扰时段内依然不弹（那道判断在 App.xaml.cs，优先于本开关）。
+        /// </summary>
+        internal bool PortalAutoConnectOnStartup()
+        {
+            return ConfigStore.GetBool(_settings, "PortalAutoConnect", true);
+        }
+
         internal string WebAuthUrl()
         {
             // 三级兜底，顺序不能乱：

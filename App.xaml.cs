@@ -180,7 +180,14 @@ namespace CampusNetHelper
             // 拨号模式则维持原来的静默行为，一个字都不改。
             if (silent && mainWindow.IsPortalMode())
             {
-                if (mainWindow.InNightQuiet())
+                if (!mainWindow.PortalAutoConnectOnStartup())
+                {
+                    // 2026-10-13 新增开关：用户明确关掉「开机自动连接」就尊重它 ——
+                    // 连窗口都不开。他需要时点主页「立即连接」即可
+                    //（那条路走 OpenWebAuthWindowOnStartup，不受本开关影响）。
+                    Log.Info("网页认证模式：已关闭「开机自动连接」—— 只静默启动，不弹认证窗口");
+                }
+                else if (mainWindow.InNightQuiet())
                 {
                     // 夜间免打扰时段内不弹窗，避免半夜重启电脑被弹窗打扰。
                     // 次日的常规起点（tick）会跳过拨号逻辑，用户需要时自己点托盘即可。
@@ -188,7 +195,7 @@ namespace CampusNetHelper
                 }
                 else
                 {
-                    Log.Info("网页认证模式：开机自启弹出网页认证窗口"
+                    Log.Info("网页认证模式：开机自动连接已开启，自动打开认证窗口并完成登录"
                         + "（行为=" + mainWindow.PortalStartupBehavior() + "）");
                     mainWindow.OpenWebAuthWindowOnStartup();
                 }

@@ -28,6 +28,10 @@ namespace CampusNetHelper
         private CheckBox chkCaptchaSample;
         /// <summary>网页认证「自动填验证码并提交」开关（2026-10-12）。同上，单独存。</summary>
         private CheckBox chkAutoSubmit;
+        /// <summary>「开机自动连接」开关（2026-10-13 海辰要求）。同上，单独存。</summary>
+        private CheckBox chkPortalAutoConnect;
+        /// <summary>「登录完成后」那两个单选项的容器 —— 只在开机自动连接开着时可点。</summary>
+        private StackPanel panelPortalCloseOpts;
         private TextBox txtInterval;
         private CheckBox chkKeepAlive;
         private TextBox txtKeepAlive;
@@ -138,14 +142,28 @@ namespace CampusNetHelper
             };
             rbPortal.Checked += delegate(object s, RoutedEventArgs e) { OnAuthModeChanged(); };
             authPanel.Children.Add(rbPortal);
-            authPanel.Children.Add(HintLine("登录网页里要填图形验证码，程序没法替你自动认，"
-                + "所以开机后会把认证窗口直接弹出来，账号密码帮你填好，你填一下验证码就行。"));
+            authPanel.Children.Add(HintLine("登录网页里要填图形验证码。程序会自己认、自己填、自己点「登录」，"
+                + "认不准时自动换一张重试（最多 3 次）；都没过才需要你接手核对一下。"));
 
             // 网页认证模式下的开机行为（只在选了网页认证时显示）
             panelPortalOpts = new StackPanel { Margin = new Thickness(20, 12, 0, 0) };
-            panelPortalOpts.Children.Add(new TextBlock
+
+            // 2026-10-13 海辰要求：开机它自己把网页登录跑完，并且**给一个开关**。
+            chkPortalAutoConnect = MakeCheck("开机自动连接（开机后自动打开认证页并完成登录）", true);
+            chkPortalAutoConnect.Margin = new Thickness(0, 0, 0, 0);
+            chkPortalAutoConnect.VerticalAlignment = VerticalAlignment.Center;
+            chkPortalAutoConnect.ToolTip = "打开后：每次开机自动打开认证页，自动填账号密码、"
+                + "自动认验证码、自动点「登录」（最多重试 3 次），登上去了窗口自己关掉。\n"
+                + "关掉后：开机只在后台静默启动，不弹窗也不登录 —— "
+                + "需要上网时点主页的「立即连接」就行。\n"
+                + "（夜间免打扰时段内始终不弹。）";
+            panelPortalOpts.Children.Add(chkPortalAutoConnect);
+
+            // 「登录完成后」的两个选项 —— 放进子容器，好在"开机自动连接"关掉时整块置灰
+            panelPortalCloseOpts = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
+            panelPortalCloseOpts.Children.Add(new TextBlock
             {
-                Text = "开机弹出认证窗口后：",
+                Text = "登录完成后：",
                 FontSize = 11,
                 Foreground = new SolidColorBrush(Theme.TextMuted),
                 Margin = new Thickness(0, 0, 0, 6)
@@ -153,12 +171,12 @@ namespace CampusNetHelper
 
             rbPortalAuto = new RadioButton
             {
-                Content = "登录完成后自动关闭窗口",
+                Content = "自动关闭窗口",
                 GroupName = "PortalStartup",
                 Foreground = new SolidColorBrush(Theme.TextPrimary),
                 FontSize = 12
             };
-            panelPortalOpts.Children.Add(rbPortalAuto);
+            panelPortalCloseOpts.Children.Add(rbPortalAuto);
 
             rbPortalKeep = new RadioButton
             {
@@ -168,7 +186,8 @@ namespace CampusNetHelper
                 FontSize = 12,
                 Margin = new Thickness(0, 6, 0, 0)
             };
-            panelPortalOpts.Children.Add(rbPortalKeep);
+            panelPortalCloseOpts.Children.Add(rbPortalKeep);
+            panelPortalOpts.Children.Add(panelPortalCloseOpts);
             authPanel.Children.Add(panelPortalOpts);
 
             lblAuthHint = HintLine("");
@@ -553,10 +572,20 @@ namespace CampusNetHelper
                 panelPortalOpts.Visibility = portal ? Visibility.Visible : Visibility.Collapsed;
             }
 
+            // 「登录完成后」两个选项只在"开机自动连接"开着时才可点 ——
+            // 关掉自动连接就压根不弹窗，那两个选项也就没意义了。
+            if (panelPortalCloseOpts != null)
+            {
+                bool autoConnect = chkPortalAutoConnect != null && chkPortalAutoConnect.IsChecked == true;
+                panelPortalCloseOpts.IsEnabled = portal && autoConnect;
+                panelPortalCloseOpts.Opacity = (portal && autoConnect) ? 1.0 : 0.45;
+            }
+
             if (lblAuthHint != null)
             {
                 lblAuthHint.Text = portal
-                    ? "选它之后：开机自启不再静默拨号，而是直接弹出网页认证窗口（夜间免打扰时段内不弹）。"
+                    ? "选它之后：开机自启不再静默拨号，而是打开网页认证页并自动登录"
+                      + "（想关掉就取消上面的「开机自动连接」；夜间免打扰时段内不弹）。"
                     : "选它之后：开机自启在后台静默拨号，保持原来的行为，不会弹窗打扰。";
             }
         }
@@ -644,6 +673,12 @@ namespace CampusNetHelper
                 chkAutoSubmit.Checked += delegate { SaveAutoSubmitFlag(); };
             if (chkAutoSubmit != null)
                 chkAutoSubmit.Unchecked += delegate { SaveAutoSubmitFlag(); };
+
+            // 开机自动连接（2026-10-13）：单独存；顺手刷一下下面两个选项的可用状态
+            if (chkPortalAutoConnect != null)
+                chkPortalAutoConnect.Checked += delegate { SavePortalAutoConnectFlag(); OnAuthModeChanged(); };
+            if (chkPortalAutoConnect != null)
+                chkPortalAutoConnect.Unchecked += delegate { SavePortalAutoConnectFlag(); OnAuthModeChanged(); };
 
             // 数字/文本输入框：失焦时才触发，避免边打字边存
             if (txtInterval != null)
@@ -768,6 +803,29 @@ namespace CampusNetHelper
         }
 
         /// <summary>
+        /// 存「开机自动连接」这个开关（2026-10-13 海辰要求）。
+        /// 做法和 SaveAutoSubmitFlag 完全一致（读-合并-写）。
+        /// </summary>
+        private void SavePortalAutoConnectFlag()
+        {
+            if (_loading) return;
+            try
+            {
+                System.Collections.Generic.Dictionary<string, string> disk = ConfigStore.LoadSettings();
+                ConfigStore.SetBool(disk, "PortalAutoConnect", chkPortalAutoConnect.IsChecked == true);
+                string msg;
+                ConfigStore.SaveSettings(disk, out msg);
+                SetSaveHint(chkPortalAutoConnect.IsChecked == true
+                    ? "已自动保存 ✓ 开机后会自动完成网页登录"
+                    : "已自动保存 ✓ 开机后不再自动登录（需要时点「立即连接」）");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("保存开机自动连接开关失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 存"验证码样本采集"这个开关。做法和 SaveCheckUpdateFlag 完全一致
         /// （同样与连接行为无关，同样单独读-合并-写）。
         /// </summary>
@@ -857,6 +915,9 @@ namespace CampusNetHelper
                 chkCheckUpdate.IsChecked = UpdateChecker.Enabled(ConfigStore.LoadSettings());
                 chkCaptchaSample.IsChecked = CaptchaAssist.SampleCollectEnabled(ConfigStore.LoadSettings());
                 chkAutoSubmit.IsChecked = CaptchaAssist.AutoSubmitEnabled(ConfigStore.LoadSettings());
+                // 2026-10-13：开机自动连接（默认开）
+                chkPortalAutoConnect.IsChecked =
+                    ConfigStore.GetBool(ConfigStore.LoadSettings(), "PortalAutoConnect", true);
 
                 // 认证方式
                 bool portal = owner.IsPortalMode();

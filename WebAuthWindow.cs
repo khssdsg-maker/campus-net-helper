@@ -170,6 +170,18 @@ namespace CampusNetHelper
         /// </summary>
         private int _noPwdLoggedToken = -1;
 
+        /// <summary>
+        /// 「自动提交开着但这一页没认出验证码框」记到第几轮了。
+        ///
+        /// ⚠️ 2026-10-13 新增。存在的理由：海辰日志里 10:47:25 那次"填完表之后
+        ///    一个字都没有"，既没有提交日志、也没有任何报错 —— 排查时完全看不出
+        ///    程序在哪个分支上停了。这条日志就是用来把那个分支照亮的：
+        ///    如果 `_autoSubmit` 开着却打出这一行，说明**验证码框没被认出来**，
+        ///    流程掉进了"只填不提交"的老路径（那正是他说的"只填信息不点登录"）。
+        ///    和上面两条一样按轮节流，不会刷屏。
+        /// </summary>
+        private int _noCcLoggedToken = -1;
+
         /// <summary>本轮页面里是否已经"填好并提交过"一次（用来避免反复提交）。导航新页面时复位。</summary>
         private bool _submittedThisLoad = false;
         private DispatcherTimer _retryTimer;
@@ -1288,11 +1300,20 @@ namespace CampusNetHelper
 
             // 正在等"换一张"的新图 → 别在这期间又发起一次尝试（否则会变成重复提交）。
             // 新图到手后由 TryCaptureCaptcha 的钩子接着跑。
-            if (_autoAuthWaitNext) return true;
+            // ⚠️ 这条**不是**死路（新图到手会接力），但必须留一行日志 ——
+            //    2026-10-13 排查海辰那份日志时，10:47:25 那次"填完表之后什么都没发生"
+            //    就是因为在这里静默 return，日志里一个字都没有，看不出死在哪。
+            if (_autoAuthWaitNext)
+            {
+                Log.Info("自动登录：正在等新的验证码图，本次填表先不发起提交");
+                return true;
+            }
 
             if (_autoAuthAttempts >= AutoAuthMaxAttempts)
             {
                 // 次数用完了就不再点按钮 —— 把最后填进去的候选留着让人接手核对
+                Log.Warn("自动登录：本轮已提交 " + _autoAuthAttempts + " 次（上限 "
+                         + AutoAuthMaxAttempts + " 次），不再提交，交给人工");
                 SetStatus("自动登录已试满 " + AutoAuthMaxAttempts + " 次还没过 —— 请核对下面的验证码"
                     + (_autoAuthLastFill.Length > 0 ? "（我最后填的是 " + _autoAuthLastFill + "）" : "")
                     + "，手动点页面上的「登录」。");
@@ -1337,6 +1358,8 @@ namespace CampusNetHelper
                 if (!_autoAuthTriedFresh)
                 {
                     _autoAuthTriedFresh = true;
+                    // 必须留日志：这一支以前是静默的，排查时看不出"认不出→换图"发生过。
+                    Log.Info("自动登录：这张验证码认不出来，换一张重试一次");
                     SetStatus("这张验证码认不清，正在换一张再试…");
                     SetCaptchaHint("这张认不清，换一张再试…");
                     _autoAuthWaitNext = true;
@@ -1376,7 +1399,13 @@ namespace CampusNetHelper
                     AutoAuthGiveUp("提交次数已用完");
                     return true;
                 }
-                Log.Info("自动登录：这次尝试被速率闸拦下（离上次提交太近），稍后由定时器自然重试");
+
+                // ⚠️⚠️ 2026-10-13 修：这里以前只写了一句"稍后由定时器自然重试"就 return ——
+                //    而**根本没有那个定时器**。海辰日志现场：10:47:47.241 被速率闸拦下，
+                //    之后一路静默到看门狗超时、直接停手，整个流程就断在这儿，
+                //    表现正是他说的"点了像没反应 / 不顺畅"。
+                //    现在真的安排一次延迟重试，等过完速率闸再走一遍完整流程。
+                ScheduleAutoAuthRetryAfterGate();
                 return true;
             }
             _autoAuthRunning = true;
@@ -1402,6 +1431,27 @@ namespace CampusNetHelper
         private bool _autoAuthTriedFresh = false;
 
         /// <summary>
+        /// 看门狗超时用的**合成原因**。
+        ///
+        /// ⚠️ 它**不是服务器报错**，必须当"可重试"处理 —— 2026-10-13 用海辰的真实日志定位到：
+        ///    这句合成原因以前被 AutoAuthNextAttemptOrGiveUp 当成"服务器明确报错"，
+        ///    于是页面回传只要慢一点就直接"提交一次就停手"，**一键登录永远走不到第 2 次**。
+        ///    日志现场（10:47:53.888）：`自动登录停手：服务器说：「页面没有回传结果」`。
+        /// </summary>
+        internal const string AutoAuthNoResultWhy = "页面没有回传结果";
+
+        /// <summary>
+        /// 看门狗等多久算"这次点击没生效"。
+        ///
+        /// ⚠️ 12 秒而不是 9 秒（2026-10-13 实测）：结果判定那条路是
+        ///    `Thread.Sleep(4000)` + `ProbeOnlineNow()`，而探测本身最长要 5 秒，
+        ///    合计约 9 秒 —— 和 9 秒的看门狗**正好打平**。
+        ///    海辰日志里看门狗（10:47:53.887）比判定线程早 2 毫秒触发，
+        ///    "还没判就先判死"，白丢了一整轮重试。留 3 秒余量。
+        /// </summary>
+        private const int AutoAuthWatchdogSeconds = 12;
+
+        /// <summary>
         /// 提交后等结果的看门狗：万一这次点击没触发页面回传（点偏了 / 按钮被禁用），
         /// 不能就这么一直挂着"正在自动登录"。
         /// </summary>
@@ -1409,13 +1459,17 @@ namespace CampusNetHelper
         {
             if (_autoAuthWatchdog == null)
             {
-                _autoAuthWatchdog = new DispatcherTimer { Interval = TimeSpan.FromSeconds(9) };
+                _autoAuthWatchdog = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromSeconds(AutoAuthWatchdogSeconds)
+                };
                 _autoAuthWatchdog.Tick += delegate(object s, EventArgs e)
                 {
                     _autoAuthWatchdog.Stop();
                     if (!_autoAuthRunning) return;
-                    Log.Warn("自动登录：提交后 9 秒没有任何结果，按失败处理");
-                    AutoAuthNextAttemptOrGiveUp("页面没有回传结果");
+                    Log.Warn("自动登录：提交后 " + AutoAuthWatchdogSeconds
+                             + " 秒没有任何结果（这次点击可能没生效），换一张重试");
+                    AutoAuthNextAttemptOrGiveUp(AutoAuthNoResultWhy);
                 };
             }
             _autoAuthWatchdog.Stop();
@@ -1500,6 +1554,19 @@ namespace CampusNetHelper
         {
             if (!_autoAuthRunning) return;
             if (_autoAuthWatchdog != null) _autoAuthWatchdog.Stop();
+
+            // ⚠️⚠️ 2026-10-13 修（海辰真实日志定位到的核心 bug）：
+            //    看门狗超时给的是**本地合成的**"页面没有回传结果" —— 它的意思是
+            //    "我们没看到结果"，而**不是**服务器给了什么错误。
+            //    以前它落到下面那句 `pageErr.Length > 0` 分支，被判成"服务器明确报错"，
+            //    直接 AutoAuthGiveUp —— 于是**每次页面回传慢一点就只提交一次就停手**，
+            //    3 次重试永远用不上，海辰看到的就是"点了登录没反应 / 不顺畅"。
+            //    现场的 10:47:53.888 日志：`自动登录停手：服务器说：「页面没有回传结果」`。
+            //    归零之后它会走"没有明确报错 → 换一张再试"这条正确路径。
+            if (string.Equals(pageErr, AutoAuthNoResultWhy, StringComparison.Ordinal))
+            {
+                pageErr = "";
+            }
 
             bool captchaWrong = pageErr.IndexOf("验证码", StringComparison.Ordinal) >= 0
                              || pageErr.IndexOf("校验码", StringComparison.Ordinal) >= 0
@@ -1718,6 +1785,45 @@ namespace CampusNetHelper
         internal string StatusForTest() { return (lblStatus == null) ? "" : lblStatus.Text; }
         internal int AutoAuthAttemptsForTest() { return _autoAuthAttempts; }
 
+        /// <summary>自测用：自动登录流程是不是还在跑（true = 没停手）。</summary>
+        internal bool AutoAuthRunningForTest() { return _autoAuthRunning; }
+
+        /// <summary>
+        /// 自测用：**直接**模拟"看门狗超时"（页面一直没回传结果）。
+        /// 返回 true = 程序选择继续重试；false = 它停手了。
+        ///
+        /// ⚠️ 这个入口是为 2026-10-13 那个真 bug 专门加的。为什么要单独一条用例、
+        ///    而不是靠假门户跑出来：
+        ///    原来的「一键登录会自动提交并重试」用例里假门户是**毫秒级响应**的，
+        ///    12 秒的看门狗永远轮不到触发 —— 所以那个 bug 在自测里**一直是绿的**，
+        ///    却在海辰的真机上（页面回传要好几秒）每次都踩。
+        ///    教训：验证环境比真实环境"快"得多时，超时类的路径等于没被测过。
+        /// </summary>
+        internal bool SimulateWatchdogTimeoutForTest()
+        {
+            AutoAuthNextAttemptOrGiveUp(AutoAuthNoResultWhy);
+            return _autoAuthRunning;
+        }
+
+        /// <summary>
+        /// 自测用：被速率闸拦下之后，程序**一共安排过几次**延迟重试（只增不减）。
+        ///
+        /// ⚠️ 对应 2026-10-13 修的另一个 bug：以前这里只打了一句
+        ///    "稍后由定时器自然重试"就 return，而根本没有那个定时器 ——
+        ///    海辰日志里 10:47:47 被拦下之后一路静默到停手，整个流程就断在那儿。
+        ///
+        /// ⚠️ 用"累计次数"而不是 `_autoAuthRetryTimer.IsEnabled`：
+        ///    定时器一旦触发就 Stop 了，拿 IsEnabled 当判据会时真时假
+        ///    （正是"判据必须不可能骗过你"那条）。
+        /// </summary>
+        internal int GateRetryScheduledCountForTest()
+        {
+            return _gateRetryScheduledCount;
+        }
+
+        /// <summary>速率闸拦下后累计安排过多少次延迟重试（诊断/自测用，只增不减）。</summary>
+        private int _gateRetryScheduledCount = 0;
+
         /// <summary>自测用：滑动窗口闸的计数（验证"上限兜得住"用）。</summary>
         internal int SubmitWindowCountForTest() { return _submitWindowCount; }
 
@@ -1758,6 +1864,54 @@ namespace CampusNetHelper
             };
             once.Start();
         }
+
+        /// <summary>
+        /// 被**速率闸**拦下后的延迟重试。
+        ///
+        /// 为什么要单独一个：重试的节奏是"页面回传 → 重新填表 → 再提交"，
+        /// 实测只有约 1.4~2.4 秒（海辰日志 10:47:47.241 = 2356ms、10:48:02.651 = 1438ms），
+        /// 比 3 秒的速率闸**本身还快** —— 于是正常重试被自己的闸门拦下。
+        /// 拦下之后必须**真的等一会儿再来**，而不是嘴上说"稍后由定时器自然重试"。
+        /// （⚠️ 2026-10-13 之前那句话是空话，压根没有这个定时器。）
+        /// </summary>
+        private void ScheduleAutoAuthRetryAfterGate()
+        {
+            double sinceMs = _lastSubmitAt == DateTime.MinValue
+                ? MinSubmitGapMs
+                : (DateTime.Now - _lastSubmitAt).TotalMilliseconds;
+
+            double wait = MinSubmitGapMs - sinceMs + 300;
+            if (wait < 300) wait = 300;
+            if (wait > MinSubmitGapMs + 800) wait = MinSubmitGapMs + 800;   // 兜底，别等太久
+
+            Log.Info("自动登录：这次尝试被速率闸拦下（离上次提交太近），"
+                     + (int)wait + " 毫秒后自动重试");
+            SetStatus("正在自动登录 —— 等验证码换好，马上重试…");
+            _gateRetryScheduledCount++;
+
+            // ⚠️ 只保留**一个**定时器实例：重复进来就重启它，绝不叠加
+            //    （叠加就等于把"防风暴"变成"造风暴"）。
+            if (_autoAuthRetryTimer == null)
+            {
+                _autoAuthRetryTimer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(wait)
+                };
+                _autoAuthRetryTimer.Tick += delegate(object s, EventArgs e)
+                {
+                    _autoAuthRetryTimer.Stop();
+                    if (!_autoAuthRunning) return;
+                    if (_autoAuthAttempts >= AutoAuthMaxAttempts) return;
+                    TryAutoFillAndSubmit(true);
+                };
+            }
+            _autoAuthRetryTimer.Stop();
+            _autoAuthRetryTimer.Interval = TimeSpan.FromMilliseconds(wait);
+            _autoAuthRetryTimer.Start();
+        }
+
+        /// <summary>速率闸拦下后的延迟重试定时器（全局只有一个实例，不会叠起来）。</summary>
+        private DispatcherTimer _autoAuthRetryTimer;
 
         /// <summary>把文字写进页面的验证码输入框。只赋值，不做任何提交动作。</summary>
         private bool FillCaptchaBox(string text)        {
@@ -2770,6 +2924,17 @@ namespace CampusNetHelper
             // 页面上有验证码：自动提交开着就一路做完（认 → 填 → 点登录 → 有界重试），
             // 关着才退回老行为（只填不提交）。
             bool hasCc = PageHasCaptcha(all);
+
+            // ⚠️ 2026-10-13 新增的诊断（按轮节流）：自动提交开着、账号密码也填上了，
+            //    却没认出验证码框 —— 这时流程会掉到下面"只填不提交"的老路径，
+            //    表现就是用户说的"一键登录只填信息、不点网页里的登录"。
+            //    以前这个分支**一个字都不打**，日志里看起来像凭空消失。
+            if (_autoSubmit && !hasCc && _noCcLoggedToken != _loadToken)
+            {
+                _noCcLoggedToken = _loadToken;
+                Log.Warn("自动提交：这一页没认出验证码框（hasCc=false）—— 会退回「只填不提交」，"
+                         + "请把这一行连同前后几行日志发给开发者");
+            }
             // ⚠️ 这里**不能**再写 `&& !_autoAuthRunning`（2026-10-12 自测里踩到）：
             //    重试路径最后也是回到 TryAutoFillAndSubmit 再走一遍，而那时
             //    _autoAuthRunning 正是 true —— 条件不成立就会掉进下面"只填不提交"的老分支，

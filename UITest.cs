@@ -66,6 +66,7 @@ namespace CampusNetHelper
                 TestCaptchaAssist();
                 TestCaptchaPipeline();
                 TestAutoLoginFlow();
+                TestAutoAuthTimeoutRetries();
                 TestCaptchaOcr();
 
                 W("================ 界面自测 结束 ================");
@@ -1918,6 +1919,66 @@ namespace CampusNetHelper
             }
         }
 
+        /// <summary>
+        /// 2026-10-13 新增：专门抓「一键登录只提交一次就停手」那个真 bug。
+        ///
+        /// 为什么要单独一条：原来的「一键登录会自动提交并重试」用例里，假门户是
+        /// **毫秒级响应**的，12 秒的看门狗永远轮不到触发 —— 那个 bug 在自测里一直是绿的，
+        /// 却在真机上每次必踩（海辰 10:47:53 的真实日志：
+        /// `自动登录停手：服务器说：「页面没有回传结果」`）。
+        /// 所以这条**直接打那条路径**，不靠时序运气。
+        ///
+        /// 教训（值得记）：**验证环境比真实环境快得多时，超时类的路径等于没被测过。**
+        /// </summary>
+        private static void TestAutoAuthTimeoutRetries()
+        {
+            W("");
+            W("---- 用例：页面没回传结果时应重试（看门狗 / 速率闸，2026-10-13）----");
+
+            int samplesBefore = CaptchaAssist.CountSamples();
+            try
+            {
+                SetSampleCollect(false);
+
+                // acceptFromPost = 999：服务端永远拒绝 —— 把「多轮提交」这条链跑热
+                FakePortalResult a = RunFakePortalEpisode(
+                    RealCaptchaPng(), 999, true, 0, "看门狗探针", true);
+                if (a.Skipped != 0)
+                {
+                    W("结果：跳过 —— 本机起不了监听端口（环境问题）。");
+                    return;
+                }
+
+                W("① 看门狗超时后仍继续重试 = " + a.WatchdogRetries
+                    + "（期望 True —— 假就说明「提交一次就停手」那个 bug 回来了）");
+                W("   探针那一刻的状态 = 「" + a.WatchdogStatus + "」");
+                bool noGiveUp = a.WatchdogStatus.IndexOf("没成功", StringComparison.Ordinal) < 0
+                             && a.WatchdogStatus.IndexOf("停手", StringComparison.Ordinal) < 0;
+                W("② 状态里没有出现「没成功 / 停手」= " + noGiveUp + "（期望 True）");
+
+                W("③ 速率闸拦下后累计安排了 " + a.GateRetryScheduledCount
+                    + " 次延迟重试（期望 ≥1 —— 以前这里是一句空话，压根没有那个定时器）");
+                bool gateOk = a.GateRetryScheduledCount >= 1;
+
+                int samplesAfter = CaptchaAssist.CountSamples();
+                bool noPollution = samplesAfter == samplesBefore;
+
+                bool ok = a.WatchdogRetries && noGiveUp && gateOk && noPollution;
+                W("结果：" + (ok
+                    ? "通过 —— 页面没回传结果时会换一张接着重试（不再提交一次就停手）；"
+                      + "速率闸拦下后也真的会再来一次。"
+                    : "不通过 —— 见上面逐项。"));
+            }
+            catch (Exception ex)
+            {
+                W("!! 用例异常: " + ex.Message + " / " + ex.GetType().Name);
+            }
+            finally
+            {
+                SetSampleCollect(true);
+            }
+        }
+
         /// <summary>假门户一轮的观测结果。</summary>
         private sealed class FakePortalResult
         {
@@ -1933,6 +1994,10 @@ namespace CampusNetHelper
             public int ImagesAtSecondPost;
             public int SubmitWindow;
             public int Skipped;                 // 1 = 环境问题跳过
+            // ↓↓ 2026-10-13 新增：看门狗 / 速率闸两条回归探针（见 TestAutoAuthTimeoutRetries）
+            public bool WatchdogRetries;        // 看门狗超时后是否继续重试（false = 停手，就是那个 bug）
+            public int GateRetryScheduledCount; // 速率闸拦下后累计安排过几次延迟重试
+            public string WatchdogStatus = "";  // 探针那一刻的状态文案
         }
 
         /// <summary>
@@ -1945,6 +2010,11 @@ namespace CampusNetHelper
         }
 
         private static FakePortalResult RunFakePortalEpisode(byte[] captchaPng, int acceptFromPost, bool clickIt, int stormClicks, string label)
+        {
+            return RunFakePortalEpisode(captchaPng, acceptFromPost, clickIt, stormClicks, label, false);
+        }
+
+        private static FakePortalResult RunFakePortalEpisode(byte[] captchaPng, int acceptFromPost, bool clickIt, int stormClicks, string label, bool watchdogProbe)
         {
             FakePortalResult r = new FakePortalResult();
             MainWindow mw = null;
@@ -2060,6 +2130,31 @@ namespace CampusNetHelper
 
                 // 等第 1 次提交（认不出的情况会一直等到超时，这没关系）
                 for (int i = 0; i < 44 && posts < 1; i++) { Pump(); System.Threading.Thread.Sleep(250); }
+
+                // ============ 看门狗／速率闸探针（2026-10-13 新增）============
+                if (watchdogProbe)
+                {
+                    // 确认自动登录已经进入"提交完、在等结果"的状态
+                    for (int i = 0; i < 30; i++)
+                    {
+                        Pump();
+                        System.Threading.Thread.Sleep(100);
+                        if (wa.AutoAuthRunningForTest()) break;
+                    }
+                    // ① 模拟"页面一直没回传结果"（真机上的常态）→ 应该继续重试
+                    r.WatchdogRetries = wa.SimulateWatchdogTimeoutForTest();
+                    r.WatchdogStatus = wa.StatusForTest();
+
+                    // ② 探针会让流程走"换图 → 重新填表 → 再提交"，
+                    //    而这条路的节奏（1.4~2.4 秒）比 3 秒的速率闸更快 ——
+                    //    必然会被闸门拦下；这里等它**安排上**延迟重试。
+                    for (int i = 0; i < 80 && wa.GateRetryScheduledCountForTest() == 0; i++)
+                    {
+                        Pump();
+                        System.Threading.Thread.Sleep(200);
+                    }
+                    r.GateRetryScheduledCount = wa.GateRetryScheduledCountForTest();
+                }
 
                 // 再等重试（首次被拒时会发生）
                 for (int i = 0; i < 44 && posts < 2; i++)
