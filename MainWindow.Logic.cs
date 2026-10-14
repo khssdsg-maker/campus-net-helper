@@ -830,7 +830,14 @@ namespace CampusNetHelper
             }
 
             _webAuthWindow = new WebAuthWindow(this);
-            _webAuthWindow.Owner = this;
+            try
+            {
+                if (this.IsLoaded && this.IsVisible)
+                {
+                    _webAuthWindow.Owner = this;
+                }
+            }
+            catch { }
             _webAuthWindow.Closed += delegate(object s, EventArgs a)
             {
                 _webAuthWindow = null;
@@ -1456,7 +1463,14 @@ namespace CampusNetHelper
 
                 _webAuthWindow = new WebAuthWindow(this);
                 _webAuthWindow.SetReauthMode(true);   // 通知它：这是自动重连，走自动填表
-                _webAuthWindow.Owner = this;
+                try
+                {
+                    if (this.IsLoaded && this.IsVisible)
+                    {
+                        _webAuthWindow.Owner = this;
+                    }
+                }
+                catch { }
                 _webAuthWindow.ShowActivated = false;   // ⚠️ 不抢焦点
                 // ⚠️ 窗口摆到屏幕外：用户完全看不见，但 IE 仍然正常渲染/联网。
                 //    这条路径自测里跑了无数遍（-4000,-4000），是验证过的。

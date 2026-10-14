@@ -116,7 +116,7 @@ namespace CampusNetHelper
 
         internal const string FontUi = "Microsoft YaHei UI, Microsoft YaHei, Segoe UI";
         internal const string FontMono = "Consolas, Microsoft YaHei UI";
-        internal const string VersionText = "2.4.7";
+        internal const string VersionText = "2.4.8";
 
         /// <summary>
         /// 这一份 exe 是不是「测试版」。缓存三态：-1 未判、0 正式版、1 测试版。

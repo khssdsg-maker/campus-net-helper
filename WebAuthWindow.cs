@@ -159,6 +159,9 @@ namespace CampusNetHelper
         /// <summary>最近一次自动提交时填进验证码框的内容（提示语要用）。</summary>
         private string _autoAuthLastFill = "";
 
+        /// <summary>上一次提交时的验证码身份（src+指纹），用来判"新验证码是不是已经在提交后回传到了"。</summary>
+        private string _lastSubmittedCaptchaKey = "";
+
         /// <summary>提交后等结果的看门狗：万一这次点击没触发页面回传，不能就这么挂着。</summary>
         private DispatcherTimer _autoAuthWatchdog;
 
@@ -1597,6 +1600,7 @@ namespace CampusNetHelper
             if (lblFound != null && accountDesc.Length > 0) lblFound.Text = accountDesc;
 
             _submitCalls++;
+            _lastSubmittedCaptchaKey = _captchaKey ?? "";
             ClickElement(submit);
             // ⚠️ 提交前先记下"当时通不通"（2026-10-13 假阳性修复用）：
             //    成功判定不能只看"提交后通不通" —— 提交前就通着的话，
@@ -1727,23 +1731,65 @@ namespace CampusNetHelper
             {
                 try
                 {
-                    Thread.Sleep(4000);      // 认证生效要一点时间
-                    bool netOk = ProbeOnlineNow();
-
+                    bool netOk = false;
                     string pageErr = "";
-                    try
+                    bool leftLogin = false;
+
+                    // 渐进式探测（最多约 4.2 秒，每轮 300ms）：
+                    // 若网络已连通，或服务端回传完成（明确报错 / 新验证码到达），
+                    // 立即跳出循环进入结算，不再傻等 4 秒。
+                    for (int step = 0; step < 14; step++)
                     {
-                        Dispatcher.Invoke(new Action(delegate()
+                        Thread.Sleep(300);
+                        if (!_autoAuthRunning) return;
+
+                        netOk = ProbeOnlineNow();
+
+                        try
                         {
+                            Dispatcher.Invoke(new Action(delegate()
+                            {
+                                try
+                                {
+                                    WinForms.HtmlDocument d = (browser == null) ? null : browser.Document;
+                                    if (d != null) pageErr = ReadPageError(All(d));
+                                    leftLogin = LeftLoginPage();
+                                }
+                                catch { }
+                            }));
+                        }
+                        catch { }
+
+                        // 1. 如果已连通（跃变或离开登录页），立即结算
+                        if (netOk && (!wasOnlineBefore || leftLogin))
+                        {
+                            break;
+                        }
+
+                        // 2. 如果网未通，且经过至少 600ms（避免提交事件未发出）：
+                        //    如果页面报错已出，或回传的新验证码已到手，说明本次提交已被拒，提前结算！
+                        if (step >= 2)
+                        {
+                            bool hasNewCaptcha = false;
                             try
                             {
-                                WinForms.HtmlDocument d = (browser == null) ? null : browser.Document;
-                                if (d != null) pageErr = ReadPageError(All(d));
+                                Dispatcher.Invoke(new Action(delegate()
+                                {
+                                    if (_captchaPng != null && _captchaKey.Length > 0
+                                        && !string.Equals(_captchaKey, _lastSubmittedCaptchaKey, StringComparison.Ordinal))
+                                    {
+                                        hasNewCaptcha = true;
+                                    }
+                                }));
                             }
                             catch { }
-                        }));
+
+                            if (pageErr.Length > 0 || hasNewCaptcha)
+                            {
+                                break;
+                            }
+                        }
                     }
-                    catch { }
 
                     try
                     {
@@ -1754,7 +1800,6 @@ namespace CampusNetHelper
                             // ⚠️ 假阳性防线（2026-10-13，详见方法注释）：
                             //    "网络通着"单独不足以证明这次登录成功 —— 提交前就可能已经通着。
                             //    要求"从不通到通"的跃变，或者"页面已经没有验证码了"（离开登录页）。
-                            bool leftLogin = false;
                             try { leftLogin = LeftLoginPage(); }
                             catch { }
 
@@ -1762,7 +1807,7 @@ namespace CampusNetHelper
                             {
                                 // ⚠️ 只让**最后一次提交**的检查者来报"成功"（2026-10-12 自测里发现）：
                                 //    失败后页面会重载并（由重试流程）再提交一次，而上一轮的检查者
-                                //    4 秒后才醒 —— 它会抢在新一轮前面报"成功（第 1 次提交）"，
+                                //    可能抢在新一轮前面报"成功（第 1 次提交）"，
                                 //    数字对不上，日志也会误导排查的人。
                                 if (attempt != _autoAuthAttempts) return;
 
@@ -1902,13 +1947,29 @@ namespace CampusNetHelper
             //      · 程序上一刻认的那张已经作废，填上去的就是"刷新前的"答案，必然失败。
             //    所以这里只**等**页面自己带来的那张新图（_autoAuthWaitNext 的钩子接力）；
             //    真等不到（看门狗到点）再主动换 —— 那条兜底写在 StartAutoAuthWatchdog 里。
-            _autoAuthWaitNext = true;
             if (submitted)
             {
+                // ⚠️ 2026-10-14 核心死锁修复（海辰真实日志现场）：
+                //    页面回传极快时（~0.5s），新图可能在 AfterSubmitAuto 醒来之前就已经抠出存入 _captchaKey。
+                //    若此时盲目设置 _autoAuthWaitNext = true，程序会傻等一张"已经到手"的新图，
+                //    直到 12 秒看门狗超时才动，造成极其严重的卡顿感。
+                //    因此若新图已在手，立即解除等待并无缝衔接下一次尝试！
+                if (_captchaPng != null && _captchaKey.Length > 0
+                    && !string.Equals(_captchaKey, _lastSubmittedCaptchaKey, StringComparison.Ordinal))
+                {
+                    Log.Info("自动登录：页面回传的新验证码已在手，立即继续下一次重试");
+                    _autoAuthWaitNext = false;
+                    ScheduleAutoAuthNext();
+                    return;
+                }
+
+                _autoAuthWaitNext = true;
                 Log.Info("自动登录：等页面回传时自己带来的那张新验证码（程序不主动换图）");
+                StartCaptchaPoll(15);
             }
             else
             {
+                _autoAuthWaitNext = true;
                 Log.Info("自动登录：这次压根没提交成功，主动让页面换一张验证码");
                 OnCaptchaRefresh();
             }
@@ -2063,7 +2124,7 @@ namespace CampusNetHelper
             {
                 try
                 {
-                    MainWindow mw = Owner as MainWindow;
+                    MainWindow mw = (Owner as MainWindow) ?? this.owner;
                     if (mw != null)
                         mw.NotifyBackgroundAuthFailed(why, _autoAuthLastFill);
                 }
