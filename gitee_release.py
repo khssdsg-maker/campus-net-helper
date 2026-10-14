@@ -158,8 +158,7 @@ def main():
     print('标签:', obj.get('tag_name'))
     for a in obj.get('assets', []):
         print('  ', a.get('name'))
-    print()
-    print('⚠️ Gitee 的 assets 不返回大小/哈希，要真正确认得把附件下回来比对 ——')
+    print('[提示] Gitee 的 assets 不返回大小/哈希，要真正确认得把附件下回来比对 ——')
     print('   下载地址: https://gitee.com/%s/%s/releases/download/v%s/<文件名>'
           % (OWNER, REPO, ver))
 
