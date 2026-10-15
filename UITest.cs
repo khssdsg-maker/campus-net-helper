@@ -1902,12 +1902,18 @@ namespace CampusNetHelper
                     + "窗口闸计数 " + sd.SubmitWindow + "（都必须 ≤ 5 —— 风暴是 60 次/天，必须被按住）");
                 bool ok4 = sd.Posts <= 5 && sd.SubmitWindow <= 5;   // 风暴兜住：不许超过窗口上限
 
-                // 轮 5：**识别信心不足** → 一次都不许提交（2026-10-13 新增的信心门控）。
-                //        用的是海辰 300 张标注样本里真的一张（cc-0158，margin=0.030）。
-                //        这一张其实认对了，但 margin 太低 —— 拿它提交就是拿学校端的
-                //        失败记录去赌，所以必须"换一张"而不是提交。
+                // 轮 5：**识别信心不足** → 一次都不许提交（信心门控）。
+                //        用的是海辰 300 张标注样本里真的一张（cc-0166）。
+                //        这一张**认错了**（认成 LEGT、真值是 LKGT），且四位里只有 3 位过闸 ——
+                //        拿它提交就是拿学校端的失败记录去赌，所以必须"换一张"而不是提交。
+                //
+                // ⚠️ 2026-10-15 换过夹具：门控判据从 MinMargin 改成 AcceptedCount 之后，
+                //    原来的 cc-0158 是 accepted=4（四位全过闸），新判据下**会被放行** ——
+                //    它没法再证明"没把握就不提交"了，留着这条断言就会红。
+                //    新夹具必须满足：accepted<4（新判据拦住）且能认出 4 位（走门控分支，
+                //    而不是走"压根认不出"那条支路）。
                 FakePortalResult e = RunFakePortalEpisode(LowConfidenceCaptchaPng(), 999, true, 0, "轮5/信心不足");
-                W("轮5（margin=0.030 的真样本，认出来了但没把握）：服务端收到 POST " + e.Posts
+                W("轮5（第 3 位没过闸的真样本，认出来了但没把握）：服务端收到 POST " + e.Posts
                     + " 次（期望 0 —— 没把握就不提交，换图是免费的）");
                 W("   状态 = \"" + e.Status + "\"");
                 W("   内部状态 = " + e.State);
@@ -2440,22 +2446,22 @@ namespace CampusNetHelper
         }
 
         /// <summary>
-        /// 一张**能认出来、但信心很低**的真实验证码（margin = 0.030）。
+        /// 一张**能认出来、但没把握**的真实验证码（四位里只有 3 位过了闸）。
         ///
-        /// 来源：海辰 10-12 人工判的 300 张样本里的 cc-0158.png
+        /// 来源：海辰 10-12 人工判的 300 张样本里的 cc-0166.png
         /// （`campus-net-helper-验证码质检\samples\`）。
-        /// 标定数据见 margin_calib_20261013.csv：这张 accepted=4、minmargin=0.030，
-        /// 程序猜 "63YS"、人工判定 "63YS" —— **其实是对的**，但 margin 低于 0.05。
+        /// 标定数据：这张 accepted=3、MinMargin=0.085，
+        /// 程序猜 "LEGT"、人工判定 "LKGT" —— **认错了**，第 3 位没过闸。
         ///
-        /// ⚠️ 用它做夹具，正好把"信心门控"这条新行为钉住：
-        ///    认出来了 ≠ 该提交。margin 0.030 意味着第一选择只比第二选择高 3%，
-        ///    这种提交基本必错，而每次失败学校端都要记一笔 —— 所以应当**换一张**而不是提交。
-        ///    （哪怕这一张恰好蒙对了，也不该拿学校端的失败记录去赌。）
+        /// ⚠️ 2026-10-15 换过夹具（原来是 cc-0158，accepted=4）：
+        ///    门控判据从 MinMargin 改成 AcceptedCount 之后，cc-0158 四位全过闸、
+        ///    会被**放行**，证明不了"没把握就不提交"了。新夹具必须 accepted&lt;4。
+        ///    它认错这一点还更有说服力：提交出去就是一次真实的登录失败。
         /// </summary>
         private static byte[] LowConfidenceCaptchaPng()
         {
             string b64 =
-                "iVBORw0KGgoAAAANSUhEUgAAAFAAAAAYCAYAAABtGnqsAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAANUSURBVFhH1Zc7ctswEEDRp3XjRp0zQxU+B2dcp1HvGXdpVLqIal+BpXQE1WqkG+gAGt2AJ0B2yV1gsQRI8KOM82Y2pih8nxafGLsAh/WanpYH2+b4jgwKNH+Mi0cjZU2SZpYfozFf9BRnVI9SphTaO9FDvAstqreNHBaQN2UMrtcp/WuhUiqjJXEsyVx3c8aU1XVu41guR+p3YY44ZvLsuHMZUSA9coQm6z+IOf3JjB8lcFBWJlpoTOrQ5j2VueNHeb0CDWbMzGAaMXiIcFxO9E0XL/PJfhaFm+hxf6cSmru9bny5w+5M7xXnnS8jo9hBC8PgdDjaf0K6bzqc7BYqNnLKyt7obR9N2TdoWsrj+KS2ovFFISQWL/b9R7fs6/OLl7F66nyPcd8JwYm4KO9QLYghDDaS5FbZEloxZgsaxwCljxU9AzU8O4nb9p0aXWfJyszZ7G1NrxGsenSCE5kk6xcr+9bMg+Jplf5OxRDJEsZ8UOaVtspJO0mtK8DnI8qDiCxjLY8HLzPIL+Vw6WIG6Xm2YsIyDJbFeH3eRL936EYTJEsZ8xMi/DUwtuNSseVaRuXxkuXn9q8c0tleXKZt7BUc1ns/8di+h+8RWQ7lY7NB05kM1Ul8fWomglFS+t2q0r3LlghLt3ZLt436t9i7EhEQLOVNcul26wr5FE2m4TgWJN4a7H1dWeIwGZuGl1CinDn3I5GTbkKJaN+pzyqwycMa6sXqYsD76N45knDkzGnbTgrCu7rZqiSBPaexcuG5w+HBAq+3th1VOHYfbAmzifdDXb+fbkY2kRKcCI2aAX0kgRi8hHMF9kKZeHsfM/EWt6fBXsjZN534DzKFxEz8HuiXqxfopSbgQ0ONq0Rx+F7cSYZEYH+IF1g0h8ls7vtmP4UO0pfwDJrRde5ggD806Boz5k4o9zy5XIXUWJ8xOEvcUqPTuBfoy2WYukM6SGBTZq7AFMb8ImkU2UsXFLNAF3SBzsSJo5BLOCkQ+yGC/4V0LtvhEo7eAzPxPUbIzRIJDghxWTcCN2ERTJZAwI85cWjomJp9NLfFBc4Rx8hnZkhg6gR39SIxJ/OYxQQuJU5+XoyR48qC2lxEIIrLmrjYoyQPE/cPWESgZPDHVhL/V3Et1v4FgNyeIOH1N8cAAAAASUVORK5CYII=";
+                "iVBORw0KGgoAAAANSUhEUgAAAFAAAAAYCAYAAABtGnqsAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAALqSURBVFhH5ZgxduMgEIbpt02dLk2KnEPv5Ryp06hMsX2q9CrXR3DtKjfYA/j5Bj4B+w8w0oAYJBnWTna/935LQgiYnwEpMfY/x1Q68M8aaH5eJ7RvZ6CpTZnGfCsDt5h3LaP/Qi9Ha/dodifVW3uCorLO2nN4ZAEyo8aQai8LDdQ2rfNJJkG/YSjYPT7iHKZR2cv6bquMwz64RjWoTx+HLsx8bw+hbBNs1ilcU2Z+4JqUwRmc4PpHgPJeGnxJNSw9b8y7P7rfDK0N3L/+wHWXNSpHlHnwvsMlFWmKwNizlbJCXbR/aaarT20xMJ0td80GPgfh/Pz6EGroRLFtUDTGTQYaO9CRkecBKtIm3hmf12SgLF/NmIEIjY5vh6gdXfgJHPDekfcGv52ORPd9IilgDFyxn6zmvtauihy+hQxaBvI4ltS9BAOdetuLezRgWdcLPxIRc8mc4zDVE94kxAb6uHDeALWVnIEu8KXNmQfGGcj6nKKTM07VfT98vqztyNm4qIEI6YHaWruXCHKHvwvHN/JkopYJ4zaWZB+//XLoS/FgD2yenqaOxQRJUGs3fQufsc5cJmLTEugBI05Uzxm4GtcfBNwkZQzUJm8tbkWG8xlNDZTXWMq+Xd+1ZmLJwPTlMuq59+0J43w/iIArLWTgVnxPGUoGlpbRSGogtULXUZmOtoQJ1UCR4DxBHt3ArUs2RX26eQYCE74HS0uXkSa5zxc2n8Xg3viR7Z6ZsntCN7CWtKeRycCScuYiovSfCXvsgbN/JkDizTxDxGyeBnUf3D38sk9cD+OhyZnr3p64sbv78GQb0GIeMpA690ZR36l5pAuzUyEN/O2O+n2H6IhUhunz+0JiCceI2fgKGUiD9+e6gbV7C6PudzkpBtJ4x0rXMvBLIfc5J85KlIu/RIzZQ3Qv1k0ysESr7LoImEDZz7jsWiBnqtQa0n54CGbNAEqUBrB2cLfGG8nH9aYSN0ylNohkdNQmxDas/QPwjh5f8sUj4AAAAABJRU5ErkJggg==";
             return Convert.FromBase64String(b64);
         }
 

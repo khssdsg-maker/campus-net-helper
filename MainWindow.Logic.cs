@@ -203,12 +203,35 @@ namespace CampusNetHelper
                         "开机自启已经启动了，但程序里没有任何已保存的账号。\n"
                         + "双击托盘图标打开主界面 →「管理账号」添加一个即可。");
                 }
-                else if (AutoReconnectEnabled() && string.IsNullOrEmpty(existing))
+                else if (AutoReconnectEnabled() && string.IsNullOrEmpty(existing)
+                         && !IsPortalMode())
                 {
                     // 开机时先确认网线接着再拨 —— 否则刚开机就白试一次，
                     // 网线没插好时应该直接待机等它
                     if (CheckLinkNow()) TryAutoReconnect();
                     else EnterWaitingLink();
+                }
+                // ⚠️ 2026-10-15：网页认证模式下**故意不在这里自动重连**。
+                //
+                //    这里原先会调 TryAutoReconnect() → StartPortalAutoReauth()，
+                //    在屏幕外开一个隐形认证窗口先跑一遍。而 App.xaml.cs 在构造完成
+                //    之后还会再走一次"开机自启开认证窗"（那条路会判断「开机自动连接」
+                //    开关和夜间免打扰时段）。两者撞在一起就出两个问题：
+                //
+                //      ① 隐形窗口先占了 _webAuthWindow 这个坑，2 秒后那条正路进来
+                //         发现窗口已存在、只 Activate() 就返回 —— **用户屏幕上永远
+                //         不出现窗口**（海辰 10-15 报的"开机静默登录不生效，
+                //         得我自己打开认证页才动"）。
+                //      ② 它绕过了「开机自动连接」这个开关：用户明明关掉了，
+                //         隐形登录照样在跑。
+                //
+                //    开认证窗这件事**只归 App.xaml.cs 那条路管**（它本来就负责
+                //    判断开关与免打扰），这里不再抢跑。掉线之后的重连完全不受影响 ——
+                //    那条路由 TickPortal 在判定掉线时触发，与本分支无关。
+                else if (IsPortalMode())
+                {
+                    Log.Info("静默启动（网页认证）：开机登录交给开机自启那条路处理"
+                             + "（本处不再抢跑，避免屏幕外窗口把可见窗口顶掉）");
                 }
             }
         }
@@ -683,6 +706,39 @@ namespace CampusNetHelper
         }
 
         /// <summary>
+        /// 设置「登录完成后」的行为：true = 窗口保持打开，false = 自动关窗。
+        ///
+        /// ⚠️ 2026-10-15 新增，修海辰报的「认证窗口里那个勾，第二次打开就自己没了」：
+        ///    认证窗口里的勾选框（chkAutoClose）原先只改内存变量、**从不写盘**，
+        ///    窗口一关那个选择就丢了 —— 同一个概念有两个控件，只有设置窗口里
+        ///    那个单选钮会写 PortalStartupBehavior。现在两边共用这一个配置项。
+        ///
+        /// ⚠️ 用「读-合并-写」而不是 SaveAll()：后者会把账号文件也重写一遍，
+        ///    只为改一个开关就动账号数据不划算（本项目对账号文件的写路径一向谨慎）。
+        ///    做法与 SettingsWindow.SavePortalAutoConnectFlag 完全一致。
+        /// </summary>
+        internal void SetPortalKeepOpen(bool keepOpen)
+        {
+            try
+            {
+                _settings["PortalStartupBehavior"] = keepOpen ? "keep" : "auto";
+
+                Dictionary<string, string> disk = ConfigStore.LoadSettings();
+                disk["PortalStartupBehavior"] = _settings["PortalStartupBehavior"];
+                string msg;
+                ConfigStore.SaveSettings(disk, out msg);
+                if (!string.IsNullOrEmpty(msg)) Log.Warn(msg);
+
+                Log.Info("「登录完成后」行为已保存 = "
+                         + (keepOpen ? "keep（窗口保持打开）" : "auto（自动关窗）"));
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("保存「登录完成后」行为失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 开机自动连接（网页认证）—— settings.txt 的 PortalAutoConnect，**默认开**。
         ///
         /// 2026-10-13 海辰要求：开机后程序自己把网页认证登录跑完（不用他动手），
@@ -825,11 +881,27 @@ namespace CampusNetHelper
         {
             if (_webAuthWindow != null && _webAuthWindow.IsLoaded)
             {
+                // ⚠️ 2026-10-15：同 OpenWebAuthWindowOnStartup 那个坑 ——
+                //    占坑的可能是一个屏幕外的后台隐形窗口（开机静默登录留下的），
+                //    那种情况下"激活"等于什么都没发生，用户点了按钮却看不见任何反应。
+                if (_webAuthWindow.IsBackgroundSilent())
+                {
+                    Log.Info("用户手动打开认证页：已存在屏幕外的后台窗口，把它拉回前台");
+                    _webAuthWindow.BringBackFromBackground();
+                    // ⚠️ 顺序要紧：先声明"用户接管了"（那会把身上跑着的自动关窗
+                    //    守护按住），再按存盘设置刷新那个勾的显示。
+                    //    反过来的话，守护会在两次调用之间把窗口关掉。
+                    _webAuthWindow.MarkUserTookOver();
+                    _webAuthWindow.InitAutoCloseFromSetting();
+                }
                 _webAuthWindow.Activate();
                 return;
             }
 
             _webAuthWindow = new WebAuthWindow(this);
+            // ⚠️ 2026-10-15：这里必须带上存盘里的"登录后行为"——
+            //    否则这个勾选框的初值永远是没勾，用户上次的选择看起来"自己没了"。
+            _webAuthWindow.InitAutoCloseFromSetting();
             try
             {
                 if (this.IsLoaded && this.IsVisible)
@@ -856,22 +928,54 @@ namespace CampusNetHelper
         /// </summary>
         internal void OpenWebAuthWindowOnStartup()
         {
+            bool reused = false;
+
             if (_webAuthWindow != null && _webAuthWindow.IsLoaded)
             {
-                _webAuthWindow.Activate();
-                return;
+                // ⚠️ 2026-10-15 修（海辰报的「开机静默登录不生效，得我自己打开认证页」）：
+                //    开机时程序会先后开**两次**认证窗口 ——
+                //      ① 主窗口构造里的"静默自动重连"先开一个摆到屏幕外的隐形窗口
+                //         （见构造函数末尾的 silent 分支）；
+                //      ② 2 秒后 App.xaml.cs 走开机那条路再开一次。
+                //    ②进来时①已经占了 _webAuthWindow 这个坑，而老代码只做 Activate()
+                //    就 return —— 用户屏幕上**永远不会出现窗口**。v2.4.7 时①在设置
+                //    Owner 那行抛异常挂掉了（窗口没 Show 成功、IsLoaded=false），
+                //    所以②照样能开；v2.4.8 把那个异常修好之后，①真的显示出来了，
+                //    反而把②顶掉 —— 修一个 bug 带出一个，就是这次的现象。
+                //    正确做法：若占坑的是"后台隐形"窗口，把它搬回屏幕内继续用，
+                //    而不是假装激活一下就完事。
+                if (!_webAuthWindow.IsBackgroundSilent())
+                {
+                    _webAuthWindow.Activate();
+                    return;
+                }
+
+                Log.Info("开机自启：已存在一个屏幕外的后台认证窗口，改为把它拉回前台继续用");
+                _webAuthWindow.BringBackFromBackground();
+                reused = true;
+            }
+            else
+            {
+                _webAuthWindow = new WebAuthWindow(this);
             }
 
             bool autoClose = PortalStartupBehavior() != "keep";
-
-            _webAuthWindow = new WebAuthWindow(this);
             _webAuthWindow.SetStartupAutoClose(autoClose);
-            _webAuthWindow.Closed += delegate(object s, EventArgs a)
+
+            // ⚠️ 复用旧窗口时**绝不能再挂一个 Closed**（那个窗口在静默重连那条路上
+            //    已经挂过一个了）：重复挂会导致关窗时 RefreshPortalOnlineNow 被跑两遍，
+            //    而且第一个回调把 _webAuthWindow 置空后，第二个回调里的判断会读到 null。
+            //    新窗口才需要挂。
+            if (!reused)
             {
-                _webAuthWindow = null;
-                // 认证窗口一关就立刻核对一次 —— 用户刚登完，主页该马上反映结果
-                RefreshPortalOnlineNow();
-            };
+                _webAuthWindow.Closed += delegate(object s, EventArgs a)
+                {
+                    _webAuthWindow = null;
+                    // 认证窗口一关就立刻核对一次 —— 用户刚登完，主页该马上反映结果
+                    RefreshPortalOnlineNow();
+                };
+            }
+
             _webAuthWindow.Show();
             _webAuthWindow.Activate();
         }

@@ -229,11 +229,59 @@ namespace CampusNetHelper
         /// </summary>
         private bool _startupAutoClose = false;
 
+        /// <summary>
+        /// 程序正在同步勾选框显示（不是用户的点击）—— 用来防止
+        /// "设 IsChecked → 触发 Checked 事件 → 又去写盘"的回环。
+        /// </summary>
+        private bool _syncingAutoClose = false;
+
+        /// <summary>
+        /// 这个窗口是**程序自己开的**吗（开机自启 / 后台自动重连），而不是用户点开的。
+        ///
+        /// ⚠️ 2026-10-15 新增：这个区别决定"能不能自己关掉"。
+        ///    用户手动打开认证页时通常本来就通着网，若允许自动关窗守护启动，
+        ///    窗口会开出来几秒就被自己关掉 —— 他根本没来得及看。
+        ///    （这个坑是本次改"记住那个勾"时新引入的，写在这里免得再踩。）
+        /// </summary>
+        private bool _programOpened = false;
+
+        /// <summary>
+        /// 用户在设置里明确选了「窗口保持打开」（PortalStartupBehavior=keep）。
+        ///
+        /// ⚠️ 单靠 _startupAutoClose=false 拦不住自动关窗守护 ——
+        ///    "自动重连"拉起来的窗口是 _reauthMode=true，守护线程也认它。
+        ///    开机那条路若复用了这种窗口，用户选"别关"就会被无视。见 SetStartupAutoClose。
+        /// </summary>
+        private bool _keepOpenBySetting = false;
+
+        /// <summary>
+        /// 自动关窗守护线程是不是已经起过了。
+        /// ⚠️ 2026-10-15：复用"后台隐形窗口"那条新路径上，同一个窗口会被
+        ///    SetReauthMode 与 SetStartupAutoClose 各调一次 StartAutoCloseGuard ——
+        ///    不加这道闸就会起两个线程同时轮询、连上后重复 Close。
+        /// </summary>
+        private bool _autoCloseGuardRunning = false;
+
         /// <summary>由 MainWindow 在开机自启场景调用，设置"登录成功后自动关闭"。</summary>
         internal void SetStartupAutoClose(bool autoClose)
         {
             _startupAutoClose = autoClose;
-            if (chkAutoClose != null) chkAutoClose.IsChecked = autoClose;
+
+            // ⚠️ 2026-10-15：走到这里说明窗口是**程序自己开的**（开机自启那条路），
+            //    可以起"连上就自己消失"的守护。用户手动打开的窗口绝不能起 ——
+            //    他很可能本来就通着网、只是想看一眼页面，一起守护就会开出来几秒被关掉。
+            _programOpened = true;
+
+            // ⚠️ 2026-10-15：用户在设置里选了「窗口保持打开」时，必须把**已经在跑**的
+            //    自动关窗守护也按住。开机那条路上，窗口可能是从"后台隐形"复用来的
+            //    （它带着 _reauthMode=true，守护线程早就起来了），光把 _startupAutoClose
+            //    置 false 拦不住它 —— 它只认 _reauthMode。用户选了"别关"，就得真的别关。
+            _keepOpenBySetting = !autoClose;
+
+            _syncingAutoClose = true;
+            try { if (chkAutoClose != null) chkAutoClose.IsChecked = autoClose; }
+            finally { _syncingAutoClose = false; }
+
             if (autoClose)
             {
                 SetStatus("开机自启：账号密码已自动填好，填完验证码点登录即可（成功后本窗口会自动关闭）。");
@@ -279,6 +327,45 @@ namespace CampusNetHelper
             catch { }
         }
 
+        /// <summary>
+        /// 把"后台隐形"的窗口搬回屏幕内，交还给用户。
+        ///
+        /// ⚠️ 2026-10-15 新增，修海辰报的「开机静默登录不生效，得我自己打开认证页才动」：
+        ///    开机时"静默自动重连"会先开一个摆到屏幕外的隐形窗口（用户看不见但 IE 在
+        ///    正常联网），2 秒后开机自启那条路再要开窗时，发现 _webAuthWindow 已经
+        ///    被占用了 —— 老代码只 Activate() 一下就返回，于是**用户屏幕上永远不出现
+        ///    任何窗口**。v2.4.7 时隐形窗口在设 Owner 那行抛异常没开成，所以没事；
+        ///    v2.4.8 修好那个异常之后它真的显示出来了，反而把可见窗口顶掉。
+        ///
+        ///    同一个坑还会让用户「手动点打开认证页却没反应」—— 那条路也是先看
+        ///    _webAuthWindow 在不在。所以这里给一个"把它拉回来"的出口，
+        ///    两条路都用它，而不是傻等或假装激活。
+        /// </summary>
+        internal void BringBackFromBackground()
+        {
+            try
+            {
+                _backgroundSilent = false;
+
+                // 摆回主屏工作区正中 —— 不引用 owner（静默启动时主窗口是隐藏的，
+                // 拿它当参照会算出屏幕外的坐标）。
+                WindowStartupLocation = WindowStartupLocation.Manual;
+                Rect wa = SystemParameters.WorkArea;
+                Left = wa.Left + (wa.Width - Width) / 2;
+                Top = wa.Top + (wa.Height - Height) / 2;
+                if (Left < wa.Left) Left = wa.Left;
+                if (Top < wa.Top) Top = wa.Top;
+
+                ShowInTaskbar = true;
+                ShowActivated = true;
+                if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("认证窗口拉回前台失败: " + ex.Message);
+            }
+        }
+
         /// <summary>是不是"后台静默"跑着的（决定了收尾时要不要发托盘气泡告知）。</summary>
         private bool _backgroundSilent = false;
         internal bool IsBackgroundSilent() { return _backgroundSilent; }
@@ -298,10 +385,27 @@ namespace CampusNetHelper
             }
         }
 
-        /// <summary>用户手动勾/取消「登录成功后自动关闭」时调用。</summary>
+        /// <summary>
+        /// 用户手动勾/取消「登录成功后自动关闭」时调用。
+        ///
+        /// ⚠️ 2026-10-15 修（海辰报的「第二次打开页面那个勾就取消了」）：
+        ///    这里原先只改内存里的 _startupAutoClose，**从不写盘** —— 窗口一关，
+        ///    用户的选择就没了，下次打开是全新窗口、勾选框回到出厂默认。
+        ///    全项目搜过，chkAutoClose 从来没有落过盘。
+        ///    现在把它写回 PortalStartupBehavior（和设置窗口里那个单选钮**同一个键**），
+        ///    两个入口从此共用一个存盘值，不会再各说各话。
+        /// </summary>
         private void ApplyAutoCloseToggle(bool on)
         {
+            if (_syncingAutoClose) return;      // 程序自己在同步显示，不是用户的动作
+
             _startupAutoClose = on;
+            _keepOpenBySetting = !on;
+
+            // 写盘：勾 = auto（登录后自动关），不勾 = keep（保持打开）
+            try { owner.SetPortalKeepOpen(!on); }
+            catch (Exception ex) { Log.Warn("保存「登录后行为」失败: " + ex.Message); }
+
             if (on)
             {
                 SetStatus("已开启：检测到网络真的连通后，本窗口会自动关闭。");
@@ -309,11 +413,64 @@ namespace CampusNetHelper
             }
             else
             {
-                SetStatus("已关闭自动关闭。");
+                SetStatus("已关闭自动关闭 —— 登录成功后本窗口会留着。");
             }
         }
 
-        /// <summary>把界面上的勾选框状态同步成当前配置（防止界面与实际不一致）。</summary>
+        /// <summary>
+        /// 按存盘的设置初始化「登录成功后自动关闭」那个勾 —— 用户手动打开认证页时调。
+        ///
+        /// ⚠️ 2026-10-15 新增，正面回应海辰报的「我点过后第二次打开页面那个选项就会取消打勾」：
+        ///    以前这个勾选框的初值恒为 false（写死），既不看存盘、也不写盘，
+        ///    所以用户勾了它，关掉窗口再打开就"自己变回没勾"。
+        ///    现在勾选框直接反映 PortalStartupBehavior（与设置窗口里那个单选钮同一个键）。
+        ///
+        /// ⚠️ 只能在**用户看得见**的那两条路（手动打开 / 开机自启）里调。
+        ///    绝不能在构造函数里无条件调 —— 后台自动重连也会构造本窗口，
+        ///    那条路的窗口必须"连上就自己消失"；若被设置了 keep，它就会一直赖在
+        ///    屏幕外不走，还会把名字占住（下次重连会说"认证页已经开着"而不再重试）。
+        /// </summary>
+        internal void InitAutoCloseFromSetting()
+        {
+            bool autoClose;
+            try { autoClose = owner.PortalStartupBehavior() != "keep"; }
+            catch { autoClose = true; }
+
+            _startupAutoClose = autoClose;
+            _keepOpenBySetting = !autoClose;
+            SyncAutoCloseCheckbox();
+
+            // ⚠️ 这里**故意不起**自动关窗守护。
+            //    那个守护是"程序自己开的窗口，连上就自己消失"用的；用户手动打开认证页时
+            //    他很可能本来就通着网（只是想看一眼页面），一起守护就会**开出来 3 秒
+            //    就被自己关掉** —— 那比不记住勾还糟。
+            //    勾选框本身的语义（"登录成功后自动关闭本窗口"）由提交成功那条路负责
+            //    （见 AfterSubmitAuto 里的 _startupAutoClose 判断），不靠这个轮询。
+            //    _keepOpenBySetting 仍然要设：若接手的正是那个后台隐形窗口，
+            //    它已经跑着的守护会因为这一位而停下（用户选了"别关"就该真的别关）。
+        }
+
+        /// <summary>
+        /// 用户接管了这个窗口（它原本是后台自动重连开的隐形窗口，现在被拉回前台给人看）。
+        ///
+        /// ⚠️ 2026-10-15：必须把"这是程序自己开的窗口"这两个标记都清掉 ——
+        ///    否则它身上那个**已经在跑**的自动关窗守护不会停，用户刚看到窗口
+        ///    就会被它关掉（他现在多半本来就通着网，下一次轮询立刻命中）。
+        ///    接管之后它就是一个"用户看着的窗口"，该由勾选框决定去留。
+        /// </summary>
+        internal void MarkUserTookOver()
+        {
+            _reauthMode = false;
+            _programOpened = false;
+        }
+
+        /// <summary>
+        /// 把界面上的勾选框状态同步成当前配置（防止界面与实际不一致）。
+        ///
+        /// ⚠️ 2026-10-15：赋值前必须置 _syncingAutoClose —— 直接设 IsChecked 会触发
+        ///    Checked/Unchecked 事件，而 ApplyAutoCloseToggle 现在会**写盘**，
+        ///    那条回环会把配置反复覆盖（用户的选择被"显示同步"这个动作抹掉）。
+        /// </summary>
         private void SyncAutoCloseCheckbox()
         {
             if (chkAutoClose == null) return;
@@ -321,10 +478,9 @@ namespace CampusNetHelper
             {
                 if (chkAutoClose.IsChecked != _startupAutoClose)
                 {
-                    // 用 suppress 思路：直接设值会触发 Checked/Unchecked 事件，
-                    // 那次事件里又会去 StartAutoCloseGuard —— 这里只想同步显示。
-                    // 为简单起见，只在确实不一致时才写，且写之前把标记设好，事件里会走同一条路径。
-                    chkAutoClose.IsChecked = _startupAutoClose;
+                    _syncingAutoClose = true;
+                    try { chkAutoClose.IsChecked = _startupAutoClose; }
+                    finally { _syncingAutoClose = false; }
                 }
             }
             catch { }
@@ -1497,27 +1653,44 @@ namespace CampusNetHelper
                 return true;
             }
 
-            // ⚠️⚠️ 信心门控（2026-10-13，直接回应海辰「提交次数有限」）：
-            //    认出了 4 位 **不等于** 值得提交。margin 低意味着"第一选择只比第二选择
-            //    高一点点"，这种提交基本必错 —— 而每一次失败学校端都会记一笔登录失败，
-            //    还占掉 3 次额度里的一次。
-            //    实测（300 张人工标注）：margin<0.05 → 整图只有 69.0% 对；
-            //    margin>=0.05 → 96.8% 对。所以低信心时**不提交，改换一张**（换图免费）。
-            if (_lastOcrResult != null && _lastOcrResult.MinMargin < AutoAuthSubmitMinMargin)
+            // ⚠️⚠️ 信心门控（2026-10-13 首版；**2026-10-15 换成"四位全过闸"**）：
+            //    认出了 4 位 **不等于** 值得提交 —— 提交失败学校端会记一笔登录失败，
+            //    还占掉 3 次额度里的一次。所以没把握时**不提交，改换一张**（换图免费）。
+            //
+            //    【为什么把判据从 MinMargin 换成 AcceptedCount】
+            //    老代码看的是 `MinMargin < 0.05`。但 MinMargin 的算法是
+            //    （CaptchaOcr.cs:387-395）**只在"已经过闸的那几位"里取最小值**，
+            //    没过闸的位根本不参与 —— 于是它的语义是"过关的几位里最差的一位"，
+            //    **不是**"这张图最可疑的一位"。拿它当整图信心用是语义错位。
+            //
+            //    实测后果（300 张真样本）：在 MinMargin>=0.05 被放行的 197 张里，
+            //    有 111 张其实**有位没过闸**（accepted<4），那批的全对率只有 47.7%。
+            //    也就是说这道闸放行了大量"某一位根本没把握"的图 —— 它拦的依据是错的。
+            //
+            //    【新判据】AcceptedCount == 4：四位**每一位**都过了逐位闸
+            //    （每位 margin >= CaptchaOcr.MinMargin = 0.03）。这才是"整张图有把握"。
+            //
+            //    300 张真样本实测 + 8 万轮流程仿真（含"抽到不合格图也要花时间"的成本）：
+            //      现在线上(MinMargin>=0.05)：放行 65.7%，一次就成 67.1%，失败 0.47 次/轮
+            //      新判据(AcceptedCount==4)  ：放行 48.7%，一次就成 90.4%，失败 0.11 次/轮
+            //      → 一次就成 +23.3 个百分点；学校端失败减少 78%；平均换图 2.19→2.27 张
+            //        （只多 0.08 张，因为换图快而提交失败要重来）。
+            //    详细数据与脚本：验证码质检目录，以及交接文档 2026-10-15 那一节。
+            if (_lastOcrResult != null
+                && _lastOcrResult.AcceptedCount < AutoAuthRequiredAcceptedSlots)
             {
                 _autoAuthRefreshCount++;
                 if (_autoAuthRefreshCount > AutoAuthMaxRefresh)
                 {
                     AutoAuthGiveUp("换了 " + AutoAuthMaxRefresh
-                                   + " 张验证码都没碰到有把握的（最小 margin 一直低于 "
-                                   + AutoAuthSubmitMinMargin.ToString("0.###") + "）");
+                                   + " 张验证码都没碰到四位全有把握的");
                     SetStatus("换了 " + AutoAuthMaxRefresh + " 张验证码都没认出有把握的 —— "
                         + "请手动填一下验证码，再点页面上的「登录」。");
                     return true;
                 }
-                Log.Info("自动登录：这次识别信心不足（最小 margin="
-                         + _lastOcrResult.MinMargin.ToString("0.###") + " < "
-                         + AutoAuthSubmitMinMargin.ToString("0.###")
+                Log.Info("自动登录：这次识别信心不足（四位里只有 "
+                         + _lastOcrResult.AcceptedCount + "/4 位过了闸，最弱一位 margin="
+                         + _lastOcrResult.WeakestMargin.ToString("0.###")
                          + "）—— 不提交，换一张再试（提交失败学校端要记一次，换图免费）");
                 SetStatus("这张验证码没把握，换一张再试…");
                 SetCaptchaHint("没把握，换一张重试…");
@@ -1636,31 +1809,37 @@ namespace CampusNetHelper
         private const int AutoAuthWatchdogSeconds = 12;
 
         /// <summary>
-        /// 整张图的「最小 margin」要到多少才值得提交。
+        /// 提交的门槛：**四位必须每一位都过了逐位闸**（AcceptedCount == 4）。
         ///
-        /// ⚠️ 2026-10-13 用海辰 10-12 人工判的 **300 张真样本**标定出来的
-        ///    （数据与脚本：`campus-net-helper-验证码质检\90/91/92_*.py`）：
-        ///      margin &lt; 0.05 的图，整图 4 位全对只有 **69.0%**；
-        ///      margin &gt;= 0.05 的图，整图全对 **96.8%**（62 张样本）。
+        /// ⚠️ 2026-10-15 换掉了原来那个 `AutoAuthSubmitMinMargin = 0.05` 常量。
+        ///    老判据用的是 MinMargin，而它的算法只在"已过闸的位"里取最小值
+        ///    （CaptchaOcr.cs:387-395），**不是**整张图最可疑的那一位 —— 语义错位。
+        ///    实测：MinMargin>=0.05 放行的 197 张里，111 张其实有位没过闸，
+        ///    那批全对率只有 47.7%。故改用 AcceptedCount。
         ///
-        ///    为什么要卡这一道：**换一张图是免费的，而提交失败学校端会记一次登录失败**，
-        ///    还用掉 3 次额度里的一次。海辰原话「提交次数有限」—— 这道门就是为此设的。
+        ///    为什么定"四位全过闸"而不是更松（如 >=3）：
+        ///    300 张真样本 + 8 万轮仿真，
+        ///      accepted>=3：一次就成 75.0%、学校端失败 0.33 次/轮
+        ///      accepted==4：一次就成 90.4%、学校端失败 0.11 次/轮  ← 选它
+        ///    代价只是平均多换 0.08 张图（换图快，而提交失败要整轮重来）。
         ///
-        ///    成本模型（二项分布，每轮 B=3 次提交 / R 次换图）：
-        ///      现状 T=0.03, R=3  → 一轮成功率 72.1%、学校端失败 0.180 次/轮、
-        ///                          "一轮一次都提交不了" 20.9%
-        ///      本组 T=0.05, R=10 → 一轮成功率 89.3%、学校端失败 0.061 次/轮、
-        ///                          "一轮一次都提交不了" 9.9%
-        ///    （更激进可看 T=0.05/R=15：成功率 96.5%、失败 0.079 次/轮，代价是更慢）
+        ///    逐位闸本身的门槛在 CaptchaOcr.MinMargin = 0.03，不在本文件里。
+        ///    所以「四位全过闸」等价于「每一位的 margin 都 >= 0.03」。
+        ///
+        ///    ⚠️ 别改成判断 `MinMargin >= 0.03` —— 那不是同一个集合：
+        ///       实测 300 张里 `MinMargin>=0.03` 恒为真（没过闸的位不参与计算），
+        ///       那样写等于把门控整个关掉。
         /// </summary>
-        private const double AutoAuthSubmitMinMargin = 0.05;
+        private const int AutoAuthRequiredAcceptedSlots = 4;
 
         /// <summary>
-        /// 一轮里「换一张验证码」的上限。3 → 10（2026-10-13，与上面的门槛配套）。
+        /// 一轮里「换一张验证码」的上限。3 → 10（2026-10-13，与门槛配套）。
         ///
-        /// 为什么必须一起涨：门槛提到 0.05 之后，一张图"能提交"的概率从 40.7% 掉到 20.7%。
+        /// 为什么必须放宽：门槛卡严之后，单张图"能提交"的概率会明显下降，
         /// 换图上限还停在 3 的话，**大多数轮次会"换了 3 张都没碰到有把握的"就停手** ——
         /// 那反而是倒退。换图不产生登录失败，所以这个上限可以放宽。
+        /// （2026-10-15 实测：accepted==4 时放行率 48.7%，连着 10 张都被拦的概率约 0.1%，
+        ///   所以 10 这个上限仍然够用。）
         /// </summary>
         private const int AutoAuthMaxRefresh = 10;
 
@@ -1818,7 +1997,10 @@ namespace CampusNetHelper
                                          + "（跃变=" + (!wasOnlineBefore)
                                          + "，已离开登录页=" + leftLogin + "）");
                                 NotifyOwnerOnline();
-                                if (_startupAutoClose || _reauthMode)
+                                // ⚠️ 2026-10-15：用户选了「窗口保持打开」就不关
+                                //    （_keepOpenBySetting 只在开机/主动打开那条路上被置位；
+                                //      纯后台自动重连的窗口它恒为 false，照旧自己消失）。
+                                if (!_keepOpenBySetting && (_startupAutoClose || _reauthMode))
                                 {
                                     try { Close(); } catch { }
                                 }
@@ -2938,6 +3120,19 @@ namespace CampusNetHelper
         }
 
         /// <summary>
+        /// 现在这一刻，这个窗口还该不该"连上就自己关掉"。
+        ///
+        /// ⚠️ 2026-10-15 新增：把判据收成**一个**函数，供守护线程启动时和每次
+        ///    轮询命中时共用。散在两处写必然漂移（本项目反复踩过的"判据分叉"）。
+        /// </summary>
+        private bool ShouldAutoCloseNow()
+        {
+            if (_keepOpenBySetting) return false;             // 用户选了"保持打开"
+            if (!_programOpened && !_reauthMode) return false; // 用户自己开的窗口，不自动关
+            return true;
+        }
+
+        /// <summary>
         /// 开机自启场景专用的"登录成功即关闭"守护。
         ///
         /// 为什么需要单独一个：网页认证页有验证码，程序不会自动提交 ——
@@ -2949,9 +3144,17 @@ namespace CampusNetHelper
         /// </summary>
         private void StartAutoCloseGuard()
         {
-            // 开机自启 或 自动重连 —— 这两种都是"程序自己开的窗口"，
-            // 连上之后都该自己消失。用户手动开的窗口绝不自作主张关闭。
-            if (!_startupAutoClose && !_reauthMode) return;
+            // ⚠️ 2026-10-15：判据统一走 ShouldAutoCloseNow()（见它的注释）——
+            //    它同时管住三件事：用户选了"保持打开"、窗口是用户自己开的、
+            //    以及程序自己开的窗口才该连上就关。
+            if (!ShouldAutoCloseNow()) return;
+
+            // ⚠️ 2026-10-15：这个守护线程**只能有一个**。
+            //    复用后台窗口这条新路径上，SetReauthMode 和 SetStartupAutoClose 会对
+            //    **同一个**窗口各调一次本方法 —— 不加这道闸就会起两个线程同时轮询，
+            //    连上后两个都去 Close()，状态文案也会互相打架。
+            if (_autoCloseGuardRunning) return;
+            _autoCloseGuardRunning = true;
 
             Thread t = new Thread(delegate()
             {
@@ -2969,6 +3172,14 @@ namespace CampusNetHelper
                     //    就会出现"认证窗口说成功了，主页还显示尚未连接"这种互相打脸。
                     bool netOk = NetProbe.Online(true);   // 这里必须穿透缓存要一个实时答案
                     if (!netOk) continue;
+
+                    // ⚠️ 2026-10-15：连上的那一刻再确认一次"还该不该关" ——
+                    //    守护线程启动之后、连上之前，情况可能已经变了：
+                    //      · 用户刚取消了那个勾（_keepOpenBySetting）
+                    //      · 或者用户接管了这个窗口（MarkUserTookOver：
+                    //        它从"后台自动重连的隐形窗口"变成了"用户正看着的窗口"）
+                    //    光在启动时判断一次会漏掉这些（用户会看到"我明明取消了它还关"）。
+                    if (!ShouldAutoCloseNow()) return;
 
                     Dispatcher.Invoke(new Action(delegate()
                     {
