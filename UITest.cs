@@ -69,6 +69,8 @@ namespace CampusNetHelper
                 TestAutoAuthTimeoutRetries();
                 TestSubmitButtonPicking();
                 TestAutostartStateLogic();
+                TestSaveLoginAndIdentityHints();
+                TestHintShownOnRealPage();
                 TestCaptchaOcr();
 
                 W("================ 界面自测 结束 ================");
@@ -2129,6 +2131,156 @@ namespace CampusNetHelper
             return c;
         }
 
+        /// <summary>
+        /// 2026-10-15 新增：「保存登录信息」提示 + 学工号缺失提醒的判据。
+        ///
+        /// 为什么要自测这两条 ——
+        ///   它们都是"该说的时候没说 / 不该说的时候乱说"的问题，而这两种毛病
+        ///   在真机上**都不会报错**，只会让用户默默卡住（本项目最贵的一类 bug）。
+        ///   判据抽成纯函数（IsBlankIdentityField / ShouldWarnMissingIdentity /
+        ///   LooksLikeSaveLogin），这里直接断言它们。
+        ///
+        /// 夹具取自**海辰学校的真实登录页**（2026-10-15 抓的 HTML）：
+        ///   学(工)号   = ctl00$MainContent$SSOGUITID / MainContent_SSOGUITID
+        ///   上网账号   = ctl00$MainContent$SSOACC    / MainContent_SSOACC
+        ///   密码       = ctl00$MainContent$SSOPWD    / MainContent_SSOPWD
+        ///   验证码     = ctl00$MainContent$TextBoxCC / MainContent_TextBoxCC
+        ///   保存登录信息 = ctl00$MainContent$CheckBoxSaveMe / MainContent_CheckBoxSaveMe
+        ///   运营商     = ctl00$MainContent$TextBoxISP（readonly）
+        /// </summary>
+        private static void TestSaveLoginAndIdentityHints()
+        {
+            W("---- 用例：「保存登录信息」提示 + 学工号缺失提醒（2026-10-15）----");
+            bool ok = true;
+
+            // ---------- A. 认「保存登录信息」那个勾 ----------
+            W("A. 认勾选框（按语义特征认，不写死某一所学校的 id）");
+
+            bool a1 = WebAuthWindow.LooksLikeSaveLogin("maincontent_checkboxsaveme ctl00$maincontent$checkboxsaveme 保存登录信息");
+            W("  A1 学校真实那个（id=CheckBoxSaveMe + 文字「保存登录信息」）-> " + a1 + "（期望 True）");
+            ok = ok && a1;
+
+            bool a2 = WebAuthWindow.LooksLikeSaveLogin("ctl00$maincontent$chkrememberme 记住我");
+            W("  A2 别的学校常见写法（chkRememberMe / 记住我）-> " + a2 + "（期望 True）");
+            ok = ok && a2;
+
+            bool a3 = WebAuthWindow.LooksLikeSaveLogin("ctl00$maincontent$checkbox1 我已阅读并同意用户协议");
+            W("  A3 不相干的勾（同意协议）-> " + a3 + "（期望 False，不许乱提示）");
+            ok = ok && !a3;
+
+            bool a4 = WebAuthWindow.LooksLikeSaveLogin("ctl00$maincontent$textboxisp 运营商");
+            W("  A4 普通输入框 -> " + a4 + "（期望 False）");
+            ok = ok && !a4;
+
+            // ---------- B. 认「该有值却空着」的身份号框 ----------
+            W("");
+            W("B. 认学工号框（只认空着的、且确实是身份号的）");
+
+            bool b1 = WebAuthWindow.IsBlankIdentityField(
+                "input", "text", "MainContent_SSOGUITID ctl00$MainContent$SSOGUITID", "", false);
+            W("  B1 学校真实的学工号框、值为空 -> " + b1 + "（期望 True = 要提醒）");
+            ok = ok && b1;
+
+            bool b2 = WebAuthWindow.IsBlankIdentityField(
+                "input", "text", "MainContent_SSOGUITID ctl00$MainContent$SSOGUITID", "2453600312", false);
+            W("  B2 同一个框，但已经有值（学校回填了）-> " + b2 + "（期望 False = 别烦人）");
+            ok = ok && !b2;
+
+            bool b3 = WebAuthWindow.IsBlankIdentityField(
+                "input", "text", "MainContent_SSOACC ctl00$MainContent$SSOACC", "", false);
+            W("  B3 上网账号框（不是身份号框）-> " + b3 + "（期望 False）");
+            ok = ok && !b3;
+
+            bool b4 = WebAuthWindow.IsBlankIdentityField(
+                "input", "password", "MainContent_SSOPWD ctl00$MainContent$SSOPWD", "", false);
+            W("  B4 密码框 -> " + b4 + "（期望 False）");
+            ok = ok && !b4;
+
+            bool b5 = WebAuthWindow.IsBlankIdentityField(
+                "input", "text", "MainContent_SSOGUITID", "", true);
+            W("  B5 学工号框但被禁用 -> " + b5 + "（期望 False，禁用的不该提醒）");
+            ok = ok && !b5;
+
+            // ---------- C. 该不该提醒 ----------
+            W("");
+            W("C. 提醒的开关（两个条件同时成立才提醒）");
+
+            bool c1 = WebAuthWindow.ShouldWarnMissingIdentity(false, true);
+            W("  C1 我们没值 + 页面上有空身份框 -> " + c1 + "（期望 True = 提醒）");
+            ok = ok && c1;
+
+            bool c2 = WebAuthWindow.ShouldWarnMissingIdentity(true, true);
+            W("  C2 我们有值可填 + 页面上有空身份框 -> " + c2 + "（期望 False，待会儿会填上）");
+            ok = ok && !c2;
+
+            bool c3 = WebAuthWindow.ShouldWarnMissingIdentity(false, false);
+            W("  C3 我们没值 + 页面上没有空身份框 -> " + c3 + "（期望 False）");
+            ok = ok && !c3;
+
+            bool c4 = WebAuthWindow.ShouldWarnMissingIdentity(true, false);
+            W("  C4 都有 -> " + c4 + "（期望 False）");
+            ok = ok && !c4;
+
+            // ---------- D. 用真实页面结构走一遍 ----------
+            W("");
+            W("D. 拿海辰学校登录页的真实字段名走一遍完整判定");
+            // 页面上的字段（照抓下来的 HTML）
+            string[,] page = new string[,] {
+                { "input", "text",     "MainContent_TextBoxISP ctl00$MainContent$TextBoxISP", "自动选择" },  // readonly 运营商
+                { "input", "text",     "MainContent_SSOGUITID ctl00$MainContent$SSOGUITID",  "" },          // 学工号（空）
+                { "input", "text",     "MainContent_SSOACC ctl00$MainContent$SSOACC",        "" },          // 上网账号
+                { "input", "password", "MainContent_SSOPWD ctl00$MainContent$SSOPWD",        "" },          // 密码
+                { "input", "text",     "MainContent_TextBoxCC ctl00$MainContent$TextBoxCC",  "" },          // 验证码
+                { "input", "checkbox", "MainContent_CheckBoxSaveMe ctl00$MainContent$CheckBoxSaveMe", "" }, // 保存登录信息
+            };
+
+            // D1：账号里**没填**学工号（= 海辰现在的真实状态）-> 应该正好认出 SSOGUITID
+            string hit1 = "";
+            for (int i = 0; i < page.GetLength(0); i++)
+            {
+                bool isReadonly = (i == 0);   // 运营商那个是 readonly，IsDisabled 会算作禁用
+                if (WebAuthWindow.IsBlankIdentityField(page[i, 0], page[i, 1], page[i, 2], page[i, 3], isReadonly))
+                {
+                    hit1 = page[i, 2].Split(' ')[0];
+                    break;
+                }
+            }
+            W("  D1 账号没填学工号时，认出的框 = 「" + hit1 + "」（期望 MainContent_SSOGUITID）");
+            ok = ok && hit1 == "MainContent_SSOGUITID";
+
+            // D2：学校凭 cookie 回填了学工号 -> 不该再认出它
+            string hit2 = "";
+            for (int i = 0; i < page.GetLength(0); i++)
+            {
+                bool isReadonly = (i == 0);
+                string val = page[i, 3];
+                if (i == 1) val = "2453600312";   // 模拟学校回填
+                if (WebAuthWindow.IsBlankIdentityField(page[i, 0], page[i, 1], page[i, 2], val, isReadonly))
+                {
+                    hit2 = page[i, 2].Split(' ')[0];
+                    break;
+                }
+            }
+            W("  D2 学校回填了学工号之后，认出的框 = 「" + hit2 + "」（期望空 = 不提醒）");
+            ok = ok && hit2 == "";
+
+            // D3：那个勾必须恰好被认出来，且只认出一个
+            int cbCount = 0;
+            for (int i = 0; i < page.GetLength(0); i++)
+            {
+                string blob = (page[i, 2] + " " + (i == 5 ? "保存登录信息" : "")).ToLowerInvariant();
+                if (WebAuthWindow.LooksLikeSaveLogin(blob)) cbCount++;
+            }
+            W("  D3 整页里被认成「保存登录信息」的控件数 = " + cbCount + "（期望 1）");
+            ok = ok && cbCount == 1;
+
+            W("");
+            W("结果：" + (ok
+                ? "通过 —— 该提示的会提示（学校那个勾认得出）、该闭嘴的会闭嘴"
+                  + "（有值/禁用/不相干的勾都不乱说）；学工号缺失能精确指出是哪一格。"
+                : "不通过 —— 见上面逐项。"));
+        }
+
         private static WebAuthWindow.ButtonCand CandH(int idx, string tag, string type, string label, string href)
         {
             WebAuthWindow.ButtonCand c = new WebAuthWindow.ButtonCand();
@@ -2520,6 +2672,199 @@ namespace CampusNetHelper
                     return Uri.UnescapeDataString(parts[i].Substring(eq + 1).Replace("+", " "));
             }
             return "";
+        }
+
+        /// <summary>
+        /// 2026-10-15 新增：把**海辰学校的真实登录页**喂进真窗口，断言两条提示
+        /// 真的"显示出来了"（而不只是判据函数返回了 True）。
+        ///
+        /// ⚠️ 为什么非要走真窗口 ——
+        ///    上面那组纯判据断言只证明"算法对"，证明不了"界面真的显示了"。
+        ///    本项目吃过这个亏：判据抽出来测过，但赋值给 Visibility 那条路写歪了，
+        ///    自测照样全绿，用户却什么都看不见。
+        ///    HTML 用的是 2026-10-15 抓下来的真实页面结构（含学校新加的保存登录信息）。
+        /// </summary>
+        private static void TestHintShownOnRealPage()
+        {
+            W("");
+            W("---- 用例：真实学校登录页上，两条提示真的显示出来（2026-10-15）----");
+
+            System.Net.HttpListener srv = null;
+            MainWindow mw = null;
+            WebAuthWindow wa = null;
+            int port = 0;
+
+            try
+            {
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    int p = 18700 + attempt;
+                    System.Net.HttpListener l = new System.Net.HttpListener();
+                    l.Prefixes.Add("http://127.0.0.1:" + p + "/");
+                    try { l.Start(); srv = l; port = p; break; }
+                    catch { try { l.Close(); } catch { } }
+                }
+                if (srv == null)
+                {
+                    W("结果：跳过 —— 本机起不了监听端口（环境问题）。");
+                    return;
+                }
+
+                // 海辰学校真实登录页的**结构**（照 2026-10-15 抓的 HTML 复刻）：
+                //   学(工)号 SSOGUITID 空着、上网账号 SSOACC、密码 SSOPWD、
+                //   验证码 TextBoxCC、以及新增的「保存登录信息」CheckBoxSaveMe。
+                //   运营商 TextBoxISP 是 readonly 的（IsDisabled 会排除它）。
+                string realPage =
+                    "<html><body><form method='post' action='/login'>"
+                    + "<table>"
+                    + "<tr><td>运营商:</td><td><input type='text' value='自动选择' readonly='readonly'"
+                    + " id='MainContent_TextBoxISP' name='ctl00$MainContent$TextBoxISP'></td></tr>"
+                    + "<tr><td>学(工)号:</td><td><input type='text' maxlength='12'"
+                    + " id='MainContent_SSOGUITID' name='ctl00$MainContent$SSOGUITID'></td></tr>"
+                    + "<tr><td>上网账号:</td><td><input type='text' maxlength='12'"
+                    + " id='MainContent_SSOACC' name='ctl00$MainContent$SSOACC'></td></tr>"
+                    + "<tr><td>密码:</td><td><input type='password' maxlength='16'"
+                    + " id='MainContent_SSOPWD' name='ctl00$MainContent$SSOPWD'></td></tr>"
+                    + "<tr><td>验证码:</td><td><img id='MainContent_ImageCC' src='/CheckCode'>"
+                    + "<input type='text' maxlength='4' id='MainContent_TextBoxCC'"
+                    + " name='ctl00$MainContent$TextBoxCC'></td></tr>"
+                    + "<tr id='MainContent_EnableSaveMe'><td colspan='2'>"
+                    + "<input id='MainContent_CheckBoxSaveMe' type='checkbox'"
+                    + " name='ctl00$MainContent$CheckBoxSaveMe'>"
+                    + "<label for='MainContent_CheckBoxSaveMe'>保存登录信息</label></td></tr>"
+                    + "<tr><td colspan='2'><input type='submit' value='登录'"
+                    + " id='MainContent_LoginBtn' name='ctl00$MainContent$LoginBtn'></td></tr>"
+                    + "</table></form></body></html>";
+
+                bool stop = false;
+                // ⚠️ 两个页面用**路径**区分，不靠"重新赋值给同一个变量"——
+                //    同一个变量被服务线程和 UI 线程同时读写属于竞态，
+                //    测试代码里留竞态最坑：偶发红会让人怀疑产品代码。
+                string pageWithSave = realPage;
+                string pageNoSave = "<html><body><form method='post' action='/login'>"
+                    + "<div>上网账号: <input type='text' id='MainContent_SSOACC'"
+                    + " name='ctl00$MainContent$SSOACC'></div>"
+                    + "<div>密码: <input type='password' id='MainContent_SSOPWD'"
+                    + " name='ctl00$MainContent$SSOPWD'></div>"
+                    + "<div>验证码: <img id='MainContent_ImageCC' src='/CheckCode'>"
+                    + "<input type='text' maxlength='4' id='MainContent_TextBoxCC'"
+                    + " name='ctl00$MainContent$TextBoxCC'></div>"
+                    + "<div><input type='submit' value='登录' id='MainContent_LoginBtn'"
+                    + " name='ctl00$MainContent$LoginBtn'></div>"
+                    + "</form></body></html>";
+
+                System.Threading.Thread th = new System.Threading.Thread(delegate()
+                {
+                    while (!stop)
+                    {
+                        try
+                        {
+                            System.Net.HttpListenerContext ctx = srv.GetContext();
+                            string path = ctx.Request.Url.AbsolutePath;
+                            if (path.IndexOf("CheckCode", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                byte[] png = RealCaptchaPng();
+                                ctx.Response.ContentType = "image/png";
+                                ctx.Response.ContentLength64 = png.Length;
+                                ctx.Response.OutputStream.Write(png, 0, png.Length);
+                                ctx.Response.Close();
+                                continue;
+                            }
+                            // /login2 = 没有「保存登录信息」那个勾的页面
+                            Serve(ctx, path.IndexOf("login2", StringComparison.OrdinalIgnoreCase) >= 0
+                                ? pageNoSave : pageWithSave);
+                        }
+                        catch { if (stop) break; }
+                    }
+                });
+                th.IsBackground = true;
+                th.Start();
+
+                mw = new MainWindow(false);
+                mw.Left = -4000; mw.Top = -4000; mw.ShowInTaskbar = false;
+                mw.Show();
+                Pump();
+
+                wa = new WebAuthWindow(mw);
+                wa.Left = -4000; wa.Top = -4000; wa.ShowInTaskbar = false;
+                wa.LoadUrlForTest("http://127.0.0.1:" + port + "/login");
+                wa.Show();
+
+                // 等 DocumentCompleted 跑完并把提示刷新出来
+                for (int i = 0; i < 48; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(250);
+                    if (wa.SaveHintForTest().Length > 0) break;
+                }
+
+                string saveHint = wa.SaveHintForTest();
+                string idHint = wa.IdentityHintForTest();
+
+                W("① 「保存登录信息」提示显示 = " + (saveHint.Length > 0) + "（期望 True）");
+                if (saveHint.Length > 0) W("   显示的文字：\"" + saveHint + "\"");
+                W("② 提示里提到了「保存登录信息」= "
+                    + (saveHint.IndexOf("保存登录信息", StringComparison.Ordinal) >= 0) + "（期望 True）");
+                W("③ 明确说了程序不会替你勾 = "
+                    + (saveHint.IndexOf("不会替你勾", StringComparison.Ordinal) >= 0) + "（期望 True —— 方案 B：只提示）");
+
+                W("④ 学工号缺失警告显示 = " + (idHint.Length > 0) + "（期望 True，账号里没存学工号）");
+                if (idHint.Length > 0) W("   显示的文字：\"" + idHint + "\"");
+                W("⑤ 警告里点名了「学(工)号」那个框 = "
+                    + (idHint.IndexOf("学(工)号", StringComparison.Ordinal) >= 0) + "（期望 True）");
+                W("⑥ 警告里告诉了去哪填（管理账号 / 附加账号）= "
+                    + ((idHint.IndexOf("管理账号", StringComparison.Ordinal) >= 0)
+                       || (idHint.IndexOf("附加账号", StringComparison.Ordinal) >= 0))
+                    + "（期望 True —— 只说「有问题」没用，得指路）");
+
+                bool ok = saveHint.Length > 0
+                    && saveHint.IndexOf("保存登录信息", StringComparison.Ordinal) >= 0
+                    && saveHint.IndexOf("不会替你勾", StringComparison.Ordinal) >= 0
+                    && idHint.Length > 0
+                    && idHint.IndexOf("学(工)号", StringComparison.Ordinal) >= 0
+                    && ((idHint.IndexOf("管理账号", StringComparison.Ordinal) >= 0)
+                        || (idHint.IndexOf("附加账号", StringComparison.Ordinal) >= 0));
+
+                // ---------- 反向：**没有**那个勾的页面，绝不许乱提示 ----------
+                // ⚠️ 这一条和上面同样重要：别的学校的认证页没有「保存登录信息」，
+                //    如果我们在人家页面上也弹这句话，用户会去找一个根本不存在的勾，
+                //    比不提示更糟。所以必须实测"整行折叠"。
+                W("");
+                W("--- 反向验证：换成没有那个勾的页面（模拟别的学校）---");
+                wa.LoadUrlForTest("http://127.0.0.1:" + port + "/login2");
+                for (int i = 0; i < 40; i++)
+                {
+                    Pump();
+                    System.Threading.Thread.Sleep(250);
+                    if (wa.CaptchaRowVisibleForTest()) break;
+                }
+                Pump();
+                System.Threading.Thread.Sleep(500);
+                Pump();
+
+                string saveHint2 = wa.SaveHintForTest();
+                W("没有「保存登录信息」的页面上，提示显示 = " + (saveHint2.Length > 0)
+                    + "（期望 False —— 不许让用户去找一个不存在的勾）");
+                if (saveHint2.Length > 0) W("   !! 却显示了：\"" + saveHint2 + "\"");
+                ok = ok && saveHint2.Length == 0;
+
+                W("");
+                W("结果：" + (ok
+                    ? "通过 —— 有那个勾时两条提示都真的显示出来了（文案含该有的信息）；"
+                      + "没有那个勾时一个字都不提，不去烦用户；程序不替用户勾（方案 B）。"
+                    : "不通过 —— 见上面逐项。"));
+            }
+            catch (Exception ex)
+            {
+                W("结果：异常 —— " + ex.Message);
+                return;
+            }
+            finally
+            {
+                try { if (wa != null) wa.Close(); } catch { }
+                try { if (mw != null) mw.Close(); } catch { }
+                try { if (srv != null) srv.Stop(); } catch { }
+            }
         }
 
         private static void TestFirstRunTip()

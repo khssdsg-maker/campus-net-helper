@@ -60,6 +60,10 @@ namespace CampusNetHelper
         private Button btnLogin;
         private TextBlock lblStatus;
         private TextBlock lblFound;
+        // 「保存登录信息」提示行（页面有那个勾时才显示）。见 UpdateSaveLoginHint。
+        private TextBlock lblSaveHint;
+        // 学工号缺失警告行（页面有两个身份框、但我们没有第二个号时显示）。见 UpdateIdentityHint。
+        private TextBlock lblIdentityHint;
 
         private bool _autoDoneThisLoad = false;
         private int _loadToken = 0;
@@ -773,6 +777,36 @@ namespace CampusNetHelper
             lblStatus = MakeHint("");
             statusBox.Children.Add(lblFound);
             statusBox.Children.Add(lblStatus);
+
+            // ---------- 第 5.5 行：「保存登录信息」提示（页面没这个勾时整行折叠） ----------
+            // ⚠️ 为什么要有它（2026-10-15）——
+            //    学校认证页新加了「保存登录信息」勾选框（id=MainContent_CheckBoxSaveMe）。
+            //    勾上并登录成功后，**学校服务器会下发一个 7 天有效的持久 cookie**
+            //    （实测名字叫 GUITNETSSO2026_Cookie），之后学校就会自己把账号密码回填进页面。
+            //
+            // ⚠️⚠️ 关键：那个 cookie 是**按浏览器**存的，不是全校通用的。
+            //    实测：海辰在 Edge 里勾过 -> Edge 有这条 cookie；
+            //          我们的窗口用的是 IE 内核 -> 一条都没有（err=259）。
+            //    所以"学校已经帮我们保存了"这句话**对我们窗口不成立** ——
+            //    用户必须在**我们这个窗口里**勾一次，这张卡才会进我们的卡包。
+            //
+            // ⚠️ 程序**绝不替用户勾**（2026-10-15 海辰拍板选的方案 B）——
+            //    勾它等于把上网账号信息存到学校服务器上，该由用户自己知情决定。
+            //    这里只做"告诉他有这么个东西"。
+            lblSaveHint = MakeHint("");
+            lblSaveHint.Foreground = new SolidColorBrush(Theme.Accent);
+            lblSaveHint.Visibility = Visibility.Collapsed;
+            statusBox.Children.Add(lblSaveHint);
+
+            // ---------- 第 5.6 行：学工号缺失警告（没问题时整行折叠） ----------
+            // ⚠️ 为什么单独一个标签、而不是拼进 SetStatus ——
+            //    SetStatus 在后面的分支里会被反复覆盖（"正在提交…"/"换一张重试…"），
+            //    警告拼进去会被冲掉，用户就看不到了。这条必须**一直留着**。
+            lblIdentityHint = MakeHint("");
+            lblIdentityHint.Foreground = new SolidColorBrush(Theme.Warn);
+            lblIdentityHint.Visibility = Visibility.Collapsed;
+            statusBox.Children.Add(lblIdentityHint);
+
             Grid.SetRow(statusBox, 4);
             root.Children.Add(statusBox);
 
@@ -1169,6 +1203,207 @@ namespace CampusNetHelper
         private void SetStatus(string text)
         {
             if (lblStatus != null) lblStatus.Text = text;
+        }
+
+        // ==================================================================
+        // 「保存登录信息」提示（2026-10-15）
+        //
+        // 背景（实测，见交接文档 2026-10-15 那节）：
+        //   学校认证页新加了 <input id="MainContent_CheckBoxSaveMe" type="checkbox">。
+        //   勾上并登录成功后，学校下发一个 **7 天有效的持久 cookie**
+        //   （实测名 GUITNETSSO2026_Cookie，过期 10-22），之后学校自己就把
+        //   账号密码回填进页面 —— 用户不用再手填，我们也就不用再操心学工号。
+        //
+        // ⚠️ 但它**按浏览器**存：Edge 里有，我们的 IE 内核窗口里没有（都实测过）。
+        //    所以必须让用户**在我们这个窗口里**勾一次，卡才办到我们这边。
+        //
+        // 方案 B（海辰 2026-10-15 拍板）：**只提示，绝不替用户勾** ——
+        //   勾它 = 把上网账号信息存到学校服务器上，该由用户知情后自己决定。
+        // ==================================================================
+
+        /// <summary>页面上有没有「保存登录信息」那种勾选框。只读，不改任何东西。</summary>
+        internal static WinForms.HtmlElement FindSaveLoginCheckbox(List<WinForms.HtmlElement> all)
+        {
+            foreach (WinForms.HtmlElement el in all)
+            {
+                if (TagOf(el) != "input") continue;
+                if (!"checkbox".Equals(AttrOf(el, "type"), StringComparison.OrdinalIgnoreCase)) continue;
+                if (IsDisabled(el)) continue;
+
+                string blob = (AttrOf(el, "id") + " " + AttrOf(el, "name") + " " + NearestText(all, el))
+                    .ToLowerInvariant();
+                if (LooksLikeSaveLogin(blob)) return el;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 从 id/name/旁边的文字判断"这是不是保存登录信息那个勾"。
+        ///
+        /// ⚠️ 为什么不能只认硬编码的 CheckBoxSaveMe ——
+        ///    别的学校可能用别的 id；而写死一个 id 属于"把某所学校的实现当通用规则"，
+        ///    换一所学校就失效。这里按语义特征认，认不出就不显示提示（宁可不说）。
+        /// </summary>
+        internal static bool LooksLikeSaveLogin(string blob)
+        {
+            // 中文：保存登录信息 / 记住我 / 记住密码 / 自动登录 / 下次自动登录 …
+            if (blob.IndexOf("保存", StringComparison.Ordinal) >= 0
+                && blob.IndexOf("登录", StringComparison.Ordinal) >= 0) return true;
+            if (blob.IndexOf("记住", StringComparison.Ordinal) >= 0) return true;
+
+            // 英文：saveme / savepwd / rememberme / keepmealive / autologin …
+            if (blob.IndexOf("saveme", StringComparison.Ordinal) >= 0) return true;
+            if (blob.IndexOf("savepwd", StringComparison.Ordinal) >= 0) return true;
+            if (blob.IndexOf("savelogin", StringComparison.Ordinal) >= 0) return true;
+            if (blob.IndexOf("remember", StringComparison.Ordinal) >= 0) return true;
+            return false;
+        }
+
+        // ==================================================================
+        // 学工号缺失提醒（2026-10-15）
+        //
+        // 真实场景（海辰学校，实测）：
+        //   认证页有两个身份框 —— 「学(工)号」SSOGUITID 和 「上网账号」SSOACC。
+        //   而账号里「附加账号（学工号）」那格**是空的**，
+        //   FindSecondUserInput 只在 User2 非空时才被调用 ——
+        //   于是第二个框**一个字都不填**，界面却说"档案已生效/已填好"，
+        //   提交必然被学校拒（两个号只填了一个）。用户完全不知道为什么。
+        //
+        // 所以这里：认出一个"看着是身份号、但现在空着、我们又没值可填"的框，
+        // **明确告诉用户去哪填**。绝不自己瞎猜一个值填进去
+        //（跟着本项目一贯的红线：宁可少填，也不要填错框）。
+        // ==================================================================
+
+        /// <summary>
+        /// 第二个身份号输入框的特征词。
+        /// ⚠️ 与 FindSecondUserInput 里那份列表**保持同步** ——
+        ///    两处漂移会导致"程序认得出、却提醒不到"（本项目踩过判据分叉的坑）。
+        /// </summary>
+        internal static readonly string[] IdentityKeys = new string[]
+        {
+            "guitid", "studentid", "studentno", "stuid", "stuno", "schoolid", "jobid",
+            "xh", "sno", "xuehao", "gonghao", "idcard", "identity"
+        };
+
+        /// <summary>
+        /// 【纯判据】这个输入框是不是"该有值、现在却空着"的身份号框？
+        ///
+        /// ⚠️ 为什么抽成纯函数（只吃字符串，不碰 HtmlElement）——
+        ///    判据留在"遍历真实 DOM"的循环里就没法被自测断言，
+        ///    而"该提醒却没提醒"这种事恰恰只能靠断言发现（本项目
+        ///    ButtonCand 的注释里写过同样的理由，这里沿用）。
+        /// </summary>
+        internal static bool IsBlankIdentityField(
+            string tag, string type, string idOrName, string value, bool disabled)
+        {
+            if (disabled) return false;
+            if (!"input".Equals(tag, StringComparison.OrdinalIgnoreCase)) return false;
+
+            string t = (type ?? "").ToLowerInvariant();
+            if (t != "" && t != "text" && t != "tel" && t != "search") return false;
+
+            string blob = (idOrName ?? "").ToLowerInvariant();
+            if (blob.Length == 0) return false;
+
+            bool looksIdentity = false;
+            foreach (string k in IdentityKeys)
+            {
+                if (blob.IndexOf(k, StringComparison.Ordinal) >= 0) { looksIdentity = true; break; }
+            }
+            if (!looksIdentity) return false;
+
+            // 已经有值了（学校凭 cookie 回填了、或用户自己填了）-> 不用提醒。
+            // ⚠️ 只认 getAttribute("value")：学校回填是在服务端 HTML 里写 value 属性，
+            //    所以这条路一定能看到；不需要（也不该）去读 DOM 的当前值。
+            return (value ?? "").Trim().Length == 0;
+        }
+
+        /// <summary>
+        /// 【纯判据】该不该弹"学工号没填"的警告？
+        ///
+        /// 两个条件同时成立才提醒：
+        ///   ① 我们自己**没有**值可填（账号里「附加账号」是空的）
+        ///   ② 页面上**确实有一个**空着的身份号框
+        /// 只要有值可填（待会儿会填上），或页面上压根没这种框，都不该打扰用户。
+        /// </summary>
+        internal static bool ShouldWarnMissingIdentity(bool hasOurValue, bool pageHasBlankIdentityField)
+        {
+            return !hasOurValue && pageHasBlankIdentityField;
+        }
+
+        /// <summary>
+        /// 找一个"像是第二个身份号、当前却是空的"输入框。
+        /// 找不到（或它已经有值）就返回 null —— 调用方据此决定要不要提醒。
+        /// </summary>
+        internal static WinForms.HtmlElement FindEmptyIdentityInput(
+            List<WinForms.HtmlElement> all, WinForms.HtmlElement mainUser, WinForms.HtmlElement pw)
+        {
+            foreach (WinForms.HtmlElement el in all)
+            {
+                if (el == mainUser || el == pw) continue;
+
+                string idName = AttrOf(el, "id") + " " + AttrOf(el, "name");
+                if (!IsBlankIdentityField(TagOf(el), AttrOf(el, "type"), idName,
+                        AttrOf(el, "value"), IsDisabled(el)))
+                {
+                    continue;
+                }
+                return el;
+            }
+            return null;
+        }
+
+        /// <summary>按当前页面刷新「学工号缺失」警告。不需要提醒时整行折叠。</summary>
+        private void UpdateIdentityHint(List<WinForms.HtmlElement> all, WinForms.HtmlElement mainUser, WinForms.HtmlElement pw)
+        {
+            if (lblIdentityHint == null) return;
+
+            // 我们自己有值可填 -> 待会儿会填上，不用提醒
+            string user2 = GetUser2();
+            WinForms.HtmlElement missing = (user2.Length > 0)
+                ? null
+                : FindEmptyIdentityInput(all, mainUser, pw);
+
+            if (!ShouldWarnMissingIdentity(user2.Length > 0, missing != null))
+            {
+                lblIdentityHint.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            string label = NearestText(all, missing);
+            if (label.Length == 0) label = AttrOf(missing, "id");
+            if (label.Length > 16) label = label.Substring(0, 16);
+
+            lblIdentityHint.Text = "⚠️ 页面上的「" + label + "」还空着，而账号里没存这一项 —— "
+                + "两个号只填一个登不上。请点右边「管理账号」，把它填进「附加账号（可空）」，再回来登录。";
+            lblIdentityHint.Visibility = Visibility.Visible;
+
+            Log.Warn("学工号缺失：「" + label + "」（" + Describe(missing)
+                     + "）现在是空的，而账号的「附加账号」没填 —— 已提示用户去管理账号里补。");
+        }
+
+        /// <summary>
+        /// 按当前页面刷新「保存登录信息」提示。
+        /// 页面上没这个勾 -> 整行折叠（绝大多数学校页面不会有，等于没加东西）。
+        /// </summary>
+        private void UpdateSaveLoginHint(List<WinForms.HtmlElement> all)
+        {
+            if (lblSaveHint == null) return;
+
+            WinForms.HtmlElement cb = FindSaveLoginCheckbox(all);
+            if (cb == null)
+            {
+                lblSaveHint.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            // 已经勾着了 -> 改成"已生效"的说法，别继续劝他勾
+            bool alreadyChecked = AttrTrue(cb, "checked");
+            lblSaveHint.Text = alreadyChecked
+                ? "已勾选「保存登录信息」—— 下次学校会自己把账号密码填好，你只要管验证码。"
+                : "提示：页面上那个「保存登录信息」勾上再登录，以后学校会自己帮你记住账号密码"
+                  + "（信息存在学校服务器上，是否勾选由你决定；本程序不会替你勾）。";
+            lblSaveHint.Visibility = Visibility.Visible;
         }
 
         // ==================================================================
@@ -2364,6 +2599,22 @@ namespace CampusNetHelper
         internal void SetAutoSubmitForTest(bool on) { _autoSubmit = on; }
         internal void ClickLoginForTest() { OnLoginClick(); }
         internal string StatusForTest() { return (lblStatus == null) ? "" : lblStatus.Text; }
+
+        /// <summary>自测用：「保存登录信息」提示**实际显示出来的**文字（折叠时返回空串）。</summary>
+        internal string SaveHintForTest()
+        {
+            if (lblSaveHint == null) return "";
+            if (lblSaveHint.Visibility != Visibility.Visible) return "";
+            return lblSaveHint.Text ?? "";
+        }
+
+        /// <summary>自测用：学工号缺失警告**实际显示出来的**文字（折叠时返回空串）。</summary>
+        internal string IdentityHintForTest()
+        {
+            if (lblIdentityHint == null) return "";
+            if (lblIdentityHint.Visibility != Visibility.Visible) return "";
+            return lblIdentityHint.Text ?? "";
+        }
         internal int AutoAuthAttemptsForTest() { return _autoAuthAttempts; }
 
         /// <summary>自测用：自动登录流程是不是还在跑（true = 没停手）。</summary>
@@ -3055,6 +3306,20 @@ namespace CampusNetHelper
             // 每次文档加载完都刷一下页面上「登录成功自动关闭」那个勾选框的实际状态，
             // 让界面和配置保持一致。
             SyncAutoCloseCheckbox();
+
+            // 「保存登录信息」提示：页面有那个勾才显示（见 UpdateSaveLoginHint）。
+            // ⚠️ 必须放在"抠图/填表"之前 —— 它只读页面、不动任何状态，
+            //    放这里是为了让用户**在自动登录跑起来之前**就看见这句话。
+            //    万一它抛异常也绝不能挡住后面的填表（这是纯提示，坏了不该影响功能）。
+            try
+            {
+                WinForms.HtmlDocument d = browser.Document;
+                if (d != null) UpdateSaveLoginHint(All(d));
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("刷新「保存登录信息」提示失败（不影响登录）: " + ex.Message);
+            }
 
             // ⚠️ 顺序要紧：这里判定的是**上一轮**填的验证码（页面刚刚跳走了，
             //    说明用户点过登录）。必须排在"重新抠本页的图"之前 ——
@@ -3917,6 +4182,12 @@ namespace CampusNetHelper
                     us2 = FindSecondUserInput(all, us, pw);
                     if (us2 != null) SetValue(us2, user2);
                 }
+
+                // ⚠️ 没有值可填、而页面上那个身份框还空着 -> 明确警告（2026-10-15）。
+                //    真实血案：账号里「附加账号（学工号）」是空的，于是这个框一个字都不填，
+                //    界面却说"已填好"，提交被学校拒 —— 用户完全不知道为什么。
+                //    这里绝不自己猜一个值填进去（宁可少填，也不要填错框），只负责说清楚。
+                UpdateIdentityHint(all, us, pw);
 
                 WinForms.HtmlElement submit = FindSubmit(all);
 
