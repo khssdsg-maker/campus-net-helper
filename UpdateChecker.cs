@@ -17,26 +17,52 @@ namespace CampusNetHelper
     ///   所以：发现新版就弹个气泡，用户自己点开页面去下。
     ///
     /// 边界（任务书要求）：
-    ///   · GitHub 不可达（校园网很常见）→ **完全静默**，不报错、不打扰
+    ///   · 更新源不可达（校园网很常见）→ **完全静默**，不报错、不打扰
     ///   · 版本号解析不出来 → 不提示（宁可漏报，不可误报）
     ///   · 24 小时内只查一次（时间戳存 settings.txt）
+    ///
+    /// ⚠️⚠️ 2026-10-15：更新源从 **GitHub 换成 Gitee**。
+    ///    原因：海辰实测 GitHub **连不上**（校园网环境），
+    ///    也就是说原来那套检查更新在他那儿**从来没成功过**，形同虚设。
+    ///    Gitee 实测匿名可访问（不用 token），返回 JSON 里 `tag_name` 就是版本号。
     /// </summary>
     internal static class UpdateChecker
     {
-        /// <summary>GitHub 的"最新发行版"接口。</summary>
-        private const string ApiUrl =
-            "https://api.github.com/repos/khssdsg-maker/campus-net-helper/releases/latest";
+        private const string Owner = "khssdsg";
+        private const string Repo = "campus-net-helper";
 
-        /// <summary>给用户点开的页面（用 releases 页而不是 API 地址）。</summary>
+        /// <summary>
+        /// Gitee 的"最新发行版"接口。
+        ///
+        /// ⚠️ 为什么用 `/releases/latest` 而不是 `/releases` 列表取第一条 ——
+        ///    `latest` 是服务端定义的"最新正式版"，语义明确；
+        ///    列表第一条只是"最近创建"的，万一以后发了个旧版本的补丁，
+        ///    列表第一条就会是那个旧的，从而**漏报**真正的新版。
+        ///
+        /// ⚠️ 实测（2026-10-15）：这个接口**不带 access_token 也能用**，
+        ///    返回 200 + 完整 JSON。这正是我们要的 —— 用户端不该存任何令牌。
+        /// </summary>
+        private const string ApiUrl =
+            "https://gitee.com/api/v5/repos/" + Owner + "/" + Repo + "/releases/latest";
+
+        /// <summary>
+        /// 给用户点开的页面。
+        ///
+        /// ⚠️ 用 releases 页而不是 API 地址：API 返回的是一坨 JSON，
+        ///    用户看到会懵。实测这个地址匿名可开（HTTP 200）。
+        /// </summary>
         public const string ReleasesPage =
-            "https://github.com/khssdsg-maker/campus-net-helper/releases/latest";
+            "https://gitee.com/" + Owner + "/" + Repo + "/releases";
 
         /// <summary>settings.txt 里的键名。</summary>
         public const string LastCheckKey = "LastUpdateCheck";
         public const string EnabledKey = "CheckUpdate";
 
-        /// <summary>检查完成后回调：是否有新版 / 最新版本号 / 错误消息（空串表示成功）。</summary>
-        public delegate void CheckedHandler(bool hasNew, string latest, string error);
+        /// <summary>
+        /// 检查完成后回调：是否有新版 / 最新版本号 / 错误消息（空串表示成功）/
+        /// 主程序安装包的直链（拿不到就是空串）。
+        /// </summary>
+        public delegate void CheckedHandler(bool hasNew, string latest, string error, string assetUrl);
 
         public static string CurrentVersion()
         {
@@ -82,12 +108,13 @@ namespace CampusNetHelper
             {
                 string err = "";
                 string latest = "";
+                string assetUrl = "";
 
                 try
                 {
                     HttpWebRequest req = (HttpWebRequest)WebRequest.Create(ApiUrl);
                     req.Method = "GET";
-                    // ⚠️ GitHub 的 API **必须**带 UserAgent，否则直接 403。
+                    // ⚠️ Gitee 的 API 也要求 UserAgent（不带会被拒）。
                     req.UserAgent = "CampusNetHelper/" + CurrentVersion();
                     req.Timeout = 5000;
                     req.ReadWriteTimeout = 5000;
@@ -100,12 +127,14 @@ namespace CampusNetHelper
                     using (Stream s = resp.GetResponseStream())
                     using (StreamReader sr = new StreamReader(s, Encoding.UTF8))
                     {
-                        latest = ExtractTagName(sr.ReadToEnd());
+                        string json = sr.ReadToEnd();
+                        latest = ExtractTagName(json);
+                        assetUrl = ExtractExeAssetUrl(json);
                     }
                 }
                 catch (Exception ex)
                 {
-                    // 校园网连不上 GitHub 是家常便饭 —— 完全静默，只把消息交给回调由它决定
+                    // 校园网连不上更新源是家常便饭 —— 完全静默，只把消息交给回调由它决定
                     err = ex.Message;
                 }
 
@@ -118,7 +147,7 @@ namespace CampusNetHelper
 
                 if (done != null)
                 {
-                    try { done(hasNew, latest, err); }
+                    try { done(hasNew, latest, err, assetUrl); }
                     catch { }
                 }
             });
@@ -143,6 +172,20 @@ namespace CampusNetHelper
                 if (pa[i] != pb[i]) return pa[i] > pb[i] ? 1 : -1;
             }
             return 0;
+        }
+
+        /// <summary>自测用：暴露 tag_name 解析（私有方法的测试缝）。</summary>
+        internal static string TagNameForTest(string json)
+        {
+            try { return ExtractTagName(json); }
+            catch { return ""; }
+        }
+
+        /// <summary>自测用：暴露安装包直链解析（私有方法的测试缝）。</summary>
+        internal static string ExeAssetUrlForTest(string json)
+        {
+            try { return ExtractExeAssetUrl(json); }
+            catch { return ""; }
         }
 
         private static int[] ParseVersion(string v)
@@ -171,7 +214,7 @@ namespace CampusNetHelper
         }
 
         /// <summary>
-        /// 从 GitHub 的 JSON 里抠 tag_name。
+        /// 从 Gitee 的 JSON 里抠 tag_name。
         ///
         /// ⚠️ 故意不引 JSON 库 —— 项目硬约束是"零外部依赖、单文件绿色软件"。
         ///    这里只需要一个字段，手工定位足够；找不到就返回空串（调用方当检查失败处理）。
@@ -190,6 +233,55 @@ namespace CampusNetHelper
             if (q2 < 0) return "";
 
             return json.Substring(q1 + 1, q2 - q1 - 1).Trim();
+        }
+
+        /// <summary>
+        /// 从 Gitee 的 JSON 里抠出**主程序安装包**的直链。
+        ///
+        /// 为什么要它：一个 release 底下有 4 个附件（exe、zip、源码 zip、源码 tar.gz），
+        /// 把不懂电脑的同学扔到那一页上，他很可能**下错**（下成源码包就完全没法用）。
+        /// 所以宁可在这里多认一步，直接把 exe 的地址给他。
+        ///
+        /// 认法：把所有 browser_download_url 扫一遍，取**以 .exe 结尾**的那个。
+        ///   · 源码包的地址长这样：.../archive/refs/tags/v2.4.8.zip —— 不以 .exe 结尾，天然排除
+        ///   · 主程序地址长这样：.../releases/download/v2.4.8/CampusNetHelper_v2.4.8.exe
+        ///
+        /// ⚠️ 找不到就返回空串，调用方退回"打开发行版页面"——
+        ///    宁可让用户自己挑，也不能给一个假地址。
+        /// ⚠️ 同样不引 JSON 库（项目硬约束：零外部依赖、单文件绿色软件）。
+        /// </summary>
+        private static string ExtractExeAssetUrl(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return "";
+
+            const string Key = "\"browser_download_url\"";
+            string found = "";
+            int from = 0;
+
+            while (true)
+            {
+                int i = json.IndexOf(Key, from, StringComparison.Ordinal);
+                if (i < 0) break;
+                from = i + Key.Length;
+
+                int colon = json.IndexOf(':', from);
+                if (colon < 0) break;
+                int q1 = json.IndexOf('"', colon + 1);
+                if (q1 < 0) break;
+                int q2 = json.IndexOf('"', q1 + 1);
+                if (q2 < 0) break;
+
+                string url = json.Substring(q1 + 1, q2 - q1 - 1).Trim();
+                if (url.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                    && url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                {
+                    // ⚠️ 取**第一个**以 .exe 结尾的 —— 我们的发版脚本里 exe 排在 zip 前面，
+                    //    而且一个版本只有一个 exe。若将来有多个，这里取第一个也不会错得离谱。
+                    found = url;
+                    break;
+                }
+            }
+            return found;
         }
     }
 }

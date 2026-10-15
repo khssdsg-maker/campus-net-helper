@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text;
 using System.Windows;
@@ -63,6 +63,7 @@ namespace CampusNetHelper
                 TestAccountDeleteNoResurrect();
                 TestSettingRoundTrip();
                 TestVersionCompare();
+                TestUpdateSourceReachable();
                 TestCaptchaAssist();
                 TestCaptchaPipeline();
                 TestAutoLoginFlow();
@@ -1351,10 +1352,131 @@ namespace CampusNetHelper
             bool h = UpdateChecker.Compare("2.2", "2.2.0") == 0;
             W("2.2 vs 2.2.0 → " + h + "（期望 True，缺的段按 0 算）");
 
-            bool ok = a && b && c && d && e && f && g && h;
+            // ---- 2026-10-15 新增：更新源换成 Gitee 后，JSON 解析必须验 ----
+            // ⚠️ 为什么必须测：解析错了**不会报错**，只会"静默地查不到新版本"，
+            //    表现和"网络不通"一模一样，极难发现。这正是最该被断言的一类。
+            W("");
+            W("-- Gitee 返回内容的解析（2026-10-15 换源）--");
+
+            // 真实的 Gitee 返回（结构照 2026-10-15 实测的那份裁出来的）
+            string realJson =
+                "{\"id\":1205281,\"tag_name\":\"v2.4.8\",\"name\":\"校园网助手 v2.4.8\","
+                + "\"prerelease\":false,\"created_at\":\"2026-10-14T17:53:44+08:00\","
+                + "\"assets\":["
+                + "{\"name\":\"CampusNetHelper_v2.4.8.exe\",\"browser_download_url\":"
+                + "\"https://gitee.com/khssdsg/campus-net-helper/releases/download/v2.4.8/CampusNetHelper_v2.4.8.exe\"},"
+                + "{\"name\":\"CampusNetHelper_v2.4.8.zip\",\"browser_download_url\":"
+                + "\"https://gitee.com/khssdsg/campus-net-helper/releases/download/v2.4.8/CampusNetHelper_v2.4.8.zip\"},"
+                + "{\"name\":\"v2.4.8.zip\",\"browser_download_url\":"
+                + "\"https://gitee.com/khssdsg/campus-net-helper/archive/refs/tags/v2.4.8.zip\"}"
+                + "]}";
+
+            string tag = UpdateChecker.TagNameForTest(realJson);
+            W("i  tag_name 解析 = \"" + tag + "\"（期望 v2.4.8）");
+            bool i1 = tag == "v2.4.8";
+
+            string exe = UpdateChecker.ExeAssetUrlForTest(realJson);
+            bool i2 = exe.EndsWith("CampusNetHelper_v2.4.8.exe", StringComparison.Ordinal);
+            W("ii 安装包直链 = \"" + exe + "\"");
+            W("   （期望以 CampusNetHelper_v2.4.8.exe 结尾 —— 不能挑到源码 zip）");
+
+            // ⚠️ 关键反向：源码包的地址**绝不能**被当成安装包。
+            //    Gitee 的源码包地址是 .../archive/refs/tags/v2.4.8.zip，
+            //    用户下到源码包是完全没法用的 —— 这条断言就是防这个。
+            bool i3 = exe.IndexOf("/archive/", StringComparison.Ordinal) < 0;
+            W("iii 直链不是源码包（不含 /archive/）= " + i3 + "（期望 True）");
+
+            // assets 里没有 exe（比如发版时漏传）-> 必须返回空串，让调用方退回发行版页面
+            string noExe = "{\"tag_name\":\"v9.9.9\",\"assets\":[{\"name\":\"x.zip\","
+                + "\"browser_download_url\":\"https://gitee.com/a/b/archive/refs/tags/v9.9.9.zip\"}]}";
+            string exe2 = UpdateChecker.ExeAssetUrlForTest(noExe);
+            bool i4 = exe2.Length == 0;
+            W("iv 没有 exe 附件时 = \"" + exe2 + "\"（期望空串 —— 宁可让用户自己挑，也不给假地址）");
+            bool i5 = UpdateChecker.TagNameForTest(noExe) == "v9.9.9";
+            W("v  同一份里 tag_name 仍能解析 = " + i5 + "（期望 True）");
+
+            // 空/垃圾输入不许抛异常
+            bool i6 = UpdateChecker.TagNameForTest("") == ""
+                   && UpdateChecker.ExeAssetUrlForTest("") == ""
+                   && UpdateChecker.TagNameForTest("{}") == "";
+            W("vi 空串 / 空对象输入不抛异常且返回空 = " + i6 + "（期望 True）");
+
+            bool ok = a && b && c && d && e && f && g && h
+                   && i1 && i2 && i3 && i4 && i5 && i6;
             W("结果：" + (ok
-                ? "通过 —— 按数值段比较、能吃 v 前缀与后缀、解析失败不当成新版本。"
-                : "不通过 —— 版本比较逻辑有问题。"));
+                ? "通过 —— 按数值段比较、能吃 v 前缀与后缀、解析失败不当成新版本；"
+                  + "Gitee 的 tag 与安装包直链都能正确抠出，且不会把源码包当安装包。"
+                : "不通过 —— 版本比较或 Gitee 解析有问题。"));
+        }
+
+        /// <summary>
+        /// 2026-10-15 新增：**真联网**查一次更新，证明"换成 Gitee"这件事真的通了。
+        ///
+        /// 为什么非要有这一条 ——
+        ///   上面那些解析测试全是喂字符串，证明不了"程序能不能连上 Gitee"。
+        ///   而这次换源的全部理由就是"GitHub 在校园网连不上"，
+        ///   所以**唯一有意义的验证就是真发一次请求**。
+        ///
+        /// 断网时不算失败（报"跳过"）—— 校园网刚开机时不通是常态，
+        /// 拿它当红灯会天天误报。
+        /// </summary>
+        private static void TestUpdateSourceReachable()
+        {
+            W("");
+            W("---- 用例：真连更新源（Gitee）查一次（2026-10-15 换源）----");
+
+            bool done = false;
+            bool hasNew = false;
+            string latest = "", err = "", asset = "";
+
+            UpdateChecker.CheckAsync(delegate(bool h, string l, string e, string a)
+            {
+                hasNew = h; latest = l; err = e; asset = a;
+                done = true;
+            });
+
+            // 最多等 15 秒（程序里超时设的是 5 秒 + 排队余量）
+            for (int i = 0; i < 60 && !done; i++) System.Threading.Thread.Sleep(250);
+
+            if (!done)
+            {
+                W("结果：跳过 —— 请求 15 秒内没回来（网络慢或不通）。");
+                return;
+            }
+
+            if (err.Length > 0)
+            {
+                W("连接失败：" + err);
+                W("结果：跳过 —— 当前网络连不上 Gitee（不是代码问题；断网/校园网未登录时正常）。");
+                return;
+            }
+
+            W("① 连上了 Gitee，读到最新版本号 = \"" + latest + "\"");
+            W("② 当前程序版本 = " + UpdateChecker.CurrentVersion());
+            W("③ 判定有新版本 = " + hasNew
+                + "（=" + latest + " 比 " + UpdateChecker.CurrentVersion() + " 新）");
+            W("④ 拿到的安装包直链 = " + (asset.Length > 0 ? asset : "(无)"));
+            W("   判定依据：Gitee 的 tag_name 格式必须是 vX.Y.Z —— 读出来是 " + latest);
+            W("   ⚠️ 本地版本若已是最新，③ 为 False 是**正确的**，不算失败。");
+
+            bool okTag = latest.Length > 1 && (latest[0] == 'v' || latest[0] == 'V');
+            // 直链可以没有（比如发布时没传 exe），但如果有就必须是 .exe 且不是源码包
+            bool okAsset = asset.Length == 0
+                || (asset.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                    && asset.IndexOf("/archive/", StringComparison.Ordinal) < 0);
+
+            // 版本号必须能被解析（解析不出来程序会当成"检查失败"）
+            bool okParse = UpdateChecker.Compare(latest, "0.0.1") > 0;
+
+            W("");
+            W("① 版本号带 v 前缀 = " + okTag + "（期望 True）");
+            W("② 版本号可解析且大于 0.0.1 = " + okParse + "（期望 True —— 解析不出来等于永远查不到新版）");
+            W("③ 直链若存在则必须是 exe 且非源码包 = " + okAsset + "（期望 True）");
+
+            bool ok = okTag && okParse && okAsset;
+            W("结果：" + (ok
+                ? "通过 —— 真的连上了 Gitee 并读出版本号（GitHub 连不上的问题已绕过）。"
+                : "不通过 —— 连上了但解析不对，见上面逐项。"));
         }
 
         /// <summary>

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net.NetworkInformation;
@@ -3701,7 +3701,7 @@ namespace CampusNetHelper
                 SetSaveHintSafe("正在检查更新…");
             }
 
-            UpdateChecker.CheckAsync(delegate(bool hasNew, string latest, string err)
+            UpdateChecker.CheckAsync(delegate(bool hasNew, string latest, string err, string assetUrl)
             {
                 // 回调在线程池线程上 —— 记时间戳和后续 UI 都要回主线程
                 Dispatcher.BeginInvoke(new Action(delegate()
@@ -3716,8 +3716,10 @@ namespace CampusNetHelper
                             if (manual)
                             {
                                 MessageBox.Show(
-                                    "没能连上更新服务器（校园网访问 GitHub 经常不通，这是正常的）。\n\n"
-                                    + "想知道有没有新版，可以自己打开：\n" + UpdateChecker.ReleasesPage,
+                                    "没能连上更新服务器。\n\n"
+                                    + "可能是当前网络不通（校园网刚连上时常见），"
+                                    + "过一会儿再点「立即检查」试试。\n\n"
+                                    + "也可以自己打开下载页看看：\n" + UpdateChecker.ReleasesPage,
                                     "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
                             }
                             return;
@@ -3725,18 +3727,24 @@ namespace CampusNetHelper
 
                         if (hasNew)
                         {
-                            _pendingUpdateUrl = UpdateChecker.ReleasesPage;
-                            Log.Info("发现新版本: " + latest + "（当前 " + UpdateChecker.CurrentVersion() + "）");
+                            // ⚠️ 优先用**安装包直链**，拿不到才退回发行版页面。
+                            //    发行版页面底下有好几个附件（exe / zip / 源码包），
+                            //    不懂电脑的同学很容易下错（下成源码包就完全没法用）。
+                            bool hasDirect = assetUrl.Length > 0;
+                            string target = hasDirect ? assetUrl : UpdateChecker.ReleasesPage;
+                            _pendingUpdateUrl = target;
+
+                            Log.Info("发现新版本: " + latest + "（当前 " + UpdateChecker.CurrentVersion()
+                                     + "），下载地址 = " + target
+                                     + (hasDirect ? "（安装包直链）" : "（发行版页面）"));
                             ShowBalloon("发现新版本 " + latest,
                                 "当前是 v" + UpdateChecker.CurrentVersion() + "。点这里打开下载页。");
 
-                            if (manual)
-                            {
-                                MessageBox.Show("发现新版本 " + latest + "。\n\n"
-                                    + "点托盘的气泡可以打开下载页，或者直接访问：\n"
-                                    + UpdateChecker.ReleasesPage,
-                                    "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
-                            }
+                            // 手动检查：弹窗让用户**自己选**要不要去下载页。
+                            // ⚠️ 不问就直接开浏览器是很讨厌的行为 ——
+                            //    用户可能正在全屏看视频/打游戏，突然被浏览器顶掉。
+                            //    自动检查（开机后那次）连弹窗都不弹，只留托盘气泡。
+                            if (manual) AskOpenDownloadPage(latest, target, hasDirect);
                         }
                         else
                         {
@@ -3754,6 +3762,40 @@ namespace CampusNetHelper
                     }
                 }), System.Windows.Threading.DispatcherPriority.Background);
             });
+        }
+
+        /// <summary>
+        /// 问用户要不要去下载页（2026-10-15 新增：海辰要求"用户可以选择是否打开下载页"）。
+        ///
+        /// 为什么要问而不是直接开：直接弹浏览器会把正在全屏看视频/打游戏的人顶出来，
+        /// 而"有新版本"并不是急事 —— 让用户自己决定什么时候去下。
+        /// 说"否"也不是丢掉：托盘气泡还在，点它照样能打开。
+        /// </summary>
+        private void AskOpenDownloadPage(string latest, string target, bool hasDirect)
+        {
+            string msg = "发现新版本 " + latest + "（当前 v" + UpdateChecker.CurrentVersion() + "）。\n\n"
+                + (hasDirect
+                    ? "要现在打开下载页吗？打开后点那个 exe 文件即可下载。\n\n"
+                    : "要现在打开下载页吗？\n\n")
+                + "选「否」也没关系 —— 托盘里的气泡还留着，随时点它就能打开。\n\n"
+                + target;
+
+            MessageBoxResult r = MessageBox.Show(msg, "发现新版本",
+                MessageBoxButton.YesNo, MessageBoxImage.Information);
+
+            if (r == MessageBoxResult.Yes)
+            {
+                _pendingUpdateUrl = "";
+                Log.Info("用户选择打开下载页: " + target);
+                OpenUrl(target);
+            }
+            else
+            {
+                // ⚠️ 这里**故意不清空** _pendingUpdateUrl —— 用户说了"待会儿"，
+                //    不是"不要"。留着它，点托盘气泡仍然能打开。
+                Log.Info("用户选择暂不打开下载页（托盘气泡保留，可随时点开）");
+                SetSaveHintSafe("发现新版本 " + latest + " —— 点托盘气泡可打开下载页。");
+            }
         }
 
         /// <summary>给设置窗口用的"正在检查更新…"提示（设置窗口可能没开着，所以要判空）。</summary>

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
@@ -474,13 +474,16 @@ namespace CampusNetHelper
             // ---------- 检查更新（C5）----------
             // 放在「关于」里最自然：用户想找版本信息时，顺手就能检查一下。
             // 说明写清楚"只提示、不自动装"—— 这是绿色软件的克制，也是用户的安心点。
+            // ⚠️ 2026-10-15：更新源已从 GitHub 换成 **Gitee**（GitHub 在校园网里连不上，
+            //    原来那套等于形同虚设）。发现新版后会**问用户要不要打开下载页**，
+            //    不替他决定、也不悄悄弹浏览器。
             var rowUpd = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
                 Margin = new Thickness(0, 12, 0, 0)
             };
 
-            chkCheckUpdate = MakeCheck("自动检查更新（只提示，不会自己下载安装）", true);
+            chkCheckUpdate = MakeCheck("自动检查更新（发现新版会问你要不要打开下载页）", true);
             chkCheckUpdate.Margin = new Thickness(0, 0, 0, 0);
             chkCheckUpdate.VerticalAlignment = VerticalAlignment.Center;
             rowUpd.Children.Add(chkCheckUpdate);
